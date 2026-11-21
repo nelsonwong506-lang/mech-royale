@@ -1,8 +1,8 @@
 # Mech Royale
 
-Placement-focused C++20 bot for the Builders Buildathon. It rotates early into the next safe zone, explicitly picks up and upgrades secondary weapons (`take`/`drop`, prioritizing lightning > laser > mortar), uses each weapon's real mechanics (30° auto-hit lightning cones with chain clustering, charge-and-release laser with mortar cook-off, and low/high-arc mortar over cover), and snowballs up to 10 power cubes via crates, NPC drones, and supply drops.
+Placement-focused C++20 bot for the Builders Buildathon. Each observation selects a destination for one of four modes. COMBAT compares expected damage traded at reachable positions. REGEN seeks enough time in cover to recover to 98% HP. SNOWBALL looks for weapons, cubes and unexplored roofs. ROTATE follows a route to the safe zone.
 
-In multi-enemy engagements, it dynamically repositions and cover-splits to isolate 1v1 angles, keeps exposed threats inside its 180° front armor arc to prevent 1.5× rear-armor hits, and holds fire behind cover when low HP to trigger out-of-combat regeneration. It handles rooftop drop-offs, wide-building A* routing without thrashing, and 2D grid-DDA raycasting with strict per-tick time budgets well under the 50 ms limit.
+At startup the bot indexes roof interiors, edges, nearby landings and canopy geometry. During a match it checks the current mech size, energy, zone and reported opponents before moving. The legs and weapons act independently, including on takeoff and in flight. Lightning shares energy with the jets and a charging laser affects movement.
 
 Build the competition image from the repository root:
 
@@ -20,6 +20,15 @@ python3 check/check.py --map-dir /arena -- docker run --rm -i \
 ```
 
 The checker replays recorded observations. Submit the public repository URL on the [Mech Royale track page](https://www.joinbuilders.org/buildathon/tracks/builders) to get a practice score.
+
+Run the mechanism scenarios and the existing firing regressions from the repository root. Replace `/path/to/mechfight-kit` with the unpacked kit directory.
+
+```sh
+python3 tests/vnext_scenarios.py /path/to/mechfight-kit mech-royale
+python3 tests/firing_replay.py /path/to/mechfight-kit mech-royale
+```
+
+For a paired comparison, add `--baseline OLD_IMAGE --report actions.json` to the first command. The comparison runs both images on the same 300 observations. It records the chosen mode, movement reason, destination and airborne firing decisions. Local tools can also request this per-observation JSON on stderr by setting `MECH_TRACE=1` in the bot container.
 
 ## Reinforcement-learning reward design
 

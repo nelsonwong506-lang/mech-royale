@@ -97,6 +97,20 @@ std::array<double, 4> Motion::shape() const {
     return {radius, height, step, slope};
 }
 
+std::pair<Vec2, bool> Flight::steer(const Vec3& pos, const Vec3& velocity, const Motion& motion,
+                                   double remainingEnergy) {
+    if (stage == Stage::Climb && pos[2] >= apex - 0.4) stage = Stage::Cross;
+    const double offset = distanceXY(pos, landing);
+    if (stage == Stage::Cross && offset <= 1.1 && std::hypot(velocity[0], velocity[1]) < 4.)
+        stage = Stage::Descend;
+    const auto& target = stage == Stage::Climb ? climbToward : landing;
+    const double distance = std::max(0., distanceXY(pos, target) - (stage == Stage::Climb ? 0. : 0.35));
+    const double speed = std::min(1., std::sqrt(2 * motion.airAcceleration * distance) / std::max(1., motion.walk));
+    const bool jet = stage != Stage::Descend && remainingEnergy > 0.2 * motion.jetDrain &&
+        pos[2] + velocity[2] * 0.16 < apex + 0.4;
+    return {direction(pos, target, speed), jet};
+}
+
 std::size_t Navigator::PointHash::operator()(const Vec3& point) const noexcept {
     std::size_t hash = 0;
     for (const double component : point) {
@@ -371,7 +385,9 @@ std::optional<Flight> Navigator::checkedFlight(const Vec3& takeoff, const Vec3& 
             const double fraction = magnitude > 0 ? std::min(1., motion.airAcceleration*dt/magnitude) : 0.;
             speed[0] += fraction * change[0];
             speed[1] += fraction * change[1];
-            vz = std::min(motion.rise, vz + (motion.jet - motion.gravity) * dt);
+            // The initial action jumps without boosting; jet thrust starts at the next decision.
+            vz = elapsed == 0. ? vz - motion.gravity * dt
+                               : std::min(motion.rise, vz + (motion.jet - motion.gravity) * dt);
             if (vz <= 0) { clear = false; break; }
             const Vec3 next{p[0] + speed[0]*dt, p[1] + speed[1]*dt, std::min(apex, p[2] + vz*dt)};
             if (!arena_.flightSegment(p, next, motion.radius, motion.height) ||
@@ -484,6 +500,65 @@ std::optional<Flight> Navigator::flightToRoof(const Vec3& from, const Vec3& land
         if (flight) return flight;
     }
     return std::nullopt;
+}
+
+bool Navigator::landingFits(const Vec3& landing, const Motion& motion) const {
+    const auto point = support(horizontal(landing), motion, landing[2] + 0.15);
+    if (!point || std::abs((*point)[2] - landing[2]) > 0.15) return false;
+    return std::abs(landing[2] - arena_.ground(landing[0], landing[1])) <= 0.15 ||
+           arena_.roofFits(landing, motion.radius, motion.height);
+}
+
+std::optional<Flight> Navigator::revalidateLaunch(const Vec3& start, const Vec3& landing, const Zone& zone,
+                                                const Motion& motion, double energy, double maximum,
+                                                Vec2 velocity, Clock::time_point deadline) const {
+    if (!landingFits(landing, motion)) return {};
+    return checkedFlight(start, landing, motion, zone, zone.now, velocity, energy - 0.2 * maximum, deadline);
+}
+
+std::optional<Flight> Navigator::emergencyLanding(const Vec3& start, const Vec3& velocity, const Zone& zone,
+                                                 const Motion& motion, Clock::time_point deadline) const {
+    const double gravity = std::max(1., motion.gravity), acceleration = std::max(1., motion.airAcceleration);
+    const double stopTime = std::hypot(velocity[0], velocity[1]) / acceleration;
+    const Vec2 stopping{start[0] + velocity[0] * stopTime * 0.5, start[1] + velocity[1] * stopTime * 0.5};
+    const double ceiling = start[2] + std::pow(std::max(0., velocity[2]), 2) / (2 * gravity);
+    const Vec2 inward = direction(start, zone.circle(zone.now + 1.).first);
+    const std::array<Vec2, 6> candidates{{{stopping[0] + 8*inward[0], stopping[1] + 8*inward[1]},
+        stopping, horizontal(start), {start[0] + 4*inward[0], start[1] + 4*inward[1]},
+        {stopping[0] - inward[1]*5, stopping[1] + inward[0]*5},
+        {stopping[0] + inward[1]*5, stopping[1] - inward[0]*5}}};
+    // Simulate an unpowered descent. A replacement cannot spend the reserve or cross a wall.
+    for (const auto& xy : candidates) {
+        const auto landing = support(xy, motion, ceiling);
+        if (!landing || !landingFits(*landing, motion)) continue;
+        Flight descent{start, *landing, ceiling, 0., 0., true, start, Flight::Stage::Descend};
+        Vec3 p = start, v = velocity;
+        for (int tick = 0; tick < 120; ++tick) {
+            if (Clock::now() >= deadline) return {};
+            constexpr double dt = 0.05;
+            const auto move = descent.steer(p, v, motion, 0.).first;
+            const double dx = move[0]*motion.walk - v[0], dy = move[1]*motion.walk - v[1];
+            const double dv = std::hypot(dx, dy);
+            const double scale = dv > 0 ? std::min(1., acceleration*dt/dv) : 0.;
+            v[0] += dx*scale;
+            v[1] += dy*scale;
+            v[2] -= gravity*dt;
+            Vec3 next{p[0]+v[0]*dt, p[1]+v[1]*dt, p[2]+v[2]*dt};
+            const bool touch = v[2] < 0 && next[2] <= (*landing)[2];
+            if (touch) next[2] = (*landing)[2];
+            if (!zone.segment(p, next, zone.now + tick*dt, dt) ||
+                !arena_.flightSegment(p, next, motion.radius, motion.height)) break;
+            if (touch) {
+                if (distanceXY(next, *landing) <= 1.2 && landingFits(next, motion)) {
+                    descent.seconds = (tick + 1)*dt;
+                    return descent;
+                }
+                break;
+            }
+            p = next;
+        }
+    }
+    return {};
 }
 
 bool Navigator::guard(const Vec2& move, bool boost, const Json& me, const Zone& zone,

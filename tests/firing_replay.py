@@ -26,9 +26,11 @@ DOCKER_LIMITS = [
 
 
 @contextmanager
-def docker_bot(image, arena, diagnostics=None):
-    command = ["docker", "run", "--rm", "-i", *DOCKER_LIMITS,
-               "--mount", f"type=bind,source={arena.resolve()},target=/arena,readonly", image]
+def docker_bot(image, arena, diagnostics=None, *, trace=False):
+    command = ["docker", "run", "--rm", "-i", *DOCKER_LIMITS]
+    if trace:
+        command.extend(["--env", "MECH_TRACE=1"])
+    command.extend(["--mount", f"type=bind,source={arena.resolve()},target=/arena,readonly", image])
     with TemporaryFile(mode="w+", encoding="utf-8") as errors:
         with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                               stderr=errors, text=True, encoding="utf-8") as bot:
@@ -87,8 +89,8 @@ def ask(send, receive, obs):
     return action
 
 
-def replay(image, arena, hello, observations, end, diagnostics=None):
-    with docker_bot(image, arena, diagnostics) as (send, receive):
+def replay(image, arena, hello, observations, end, diagnostics=None, *, trace=False):
+    with docker_bot(image, arena, diagnostics, trace=trace) as (send, receive):
         start_bot(send, receive, hello)
         actions = [ask(send, receive, obs) for obs in observations]
         send(end)
@@ -194,8 +196,13 @@ def focused_cases(image, hello, sample, end):
             verify(send, receive, "selects the clear opponent when the nearer one is obstructed",
                    scenario([target, other], aimed_at(other)), True, aimed_at(other))
             yaw, pitch = aimed_at(other)
-            verify(send, receive, "obstruction on the actual firing line blocks the trigger",
-                   scenario([other], [yaw - 0.012, pitch]), False, aimed_at(other))
+            # At 4 rad/s the first 0.05 s step can turn 0.2 rad. In the
+            # first case the remaining 0.012 rad intersects the thin wall.
+            turn_step = 0.05 * sample["self"]["stats"]["turn_rate"]
+            verify(send, receive, "obstruction on the first simulation tick blocks the trigger",
+                   scenario([other], [yaw - turn_step - 0.012, pitch]), False, aimed_at(other))
+            verify(send, receive, "first-step rotation clears an initially obstructed line",
+                   scenario([other], [yaw - 0.012, pitch]), True, aimed_at(other))
             send(end)
 
     with TemporaryDirectory() as directory:

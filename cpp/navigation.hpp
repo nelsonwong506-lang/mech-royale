@@ -58,6 +58,8 @@ struct Motion {
 };
 
 struct Flight {
+    enum class Stage { Climb, Cross, Descend };
+
     Vec3 takeoff;
     Vec3 landing;
     double apex;
@@ -65,6 +67,9 @@ struct Flight {
     double seconds;
     bool airborne = false;
     Vec3 climbToward{};
+    Stage stage = Stage::Climb;
+    std::pair<Vec2, bool> steer(const Vec3& pos, const Vec3& velocity, const Motion& motion,
+                               double remainingEnergy);
 };
 
 struct RouteResult {
@@ -95,6 +100,12 @@ public:
     std::optional<Flight> flightToRoof(const Vec3& from, const Vec3& landing, const Zone& zone,
                                        const Motion& motion, double energy, double maximum,
                                        Clock::time_point deadline, Vec2 velocity = {});
+    bool landingFits(const Vec3& landing, const Motion& motion) const;
+    std::optional<Flight> revalidateLaunch(const Vec3& start, const Vec3& landing, const Zone& zone,
+                                          const Motion& motion, double energy, double maximum,
+                                          Vec2 velocity, Clock::time_point deadline) const;
+    std::optional<Flight> emergencyLanding(const Vec3& start, const Vec3& velocity, const Zone& zone,
+                                          const Motion& motion, Clock::time_point deadline) const;
     bool guard(const Vec2& move, bool boost, const Json& me, const Zone& zone,
                const Motion& motion, bool jet = false);
 
