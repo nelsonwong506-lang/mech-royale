@@ -45,7 +45,6 @@ struct CombatContext {
     Vec2 velocity{};
     std::optional<Vec2> bulletDodge;
     std::optional<Vec2> coverPull;
-    std::vector<SoundContact> blindSounds;
 };
 
 struct CombatMove {

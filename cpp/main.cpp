@@ -223,14 +223,24 @@ public:
             }
         }
 
-        // Hysteresis for out-of-combat health regeneration: NEVER abandon a finishable or winning 1v1!
-        const bool finishableClose = threat && threat->position && threat->hp <= 480.0 &&
-            distanceXY(start, *threat->position) <= 75.0 && hpFrac >= 0.22;
-        const bool winning1v1 = close80 <= 1 && threat && threat->position &&
-            threat->hp < hp * 0.85 && hpFrac >= 0.25;
-        if (!inZone || window.urgent || hpFrac >= 0.85 || finishableClose || winning1v1) {
+        const auto& weapons = me.contains("weapons") && me["weapons"].is_array() ? me["weapons"] : Json::array();
+        const double lightRng = equippedLightningRange(weapons);
+
+        // Dynamic fight-first vs regen-to-100%:
+        // - Finish winning 1v1s or low-HP targets BEFORE disengaging to heal (no hard-locked 42% retreat!);
+        // - Once safely regenerating, hold until 98-100% HP unless zone/time pressure, guaranteed kill, or clear enemy opening!
+        const bool finishableClose = threat && threat->position && threat->hp <= 520.0 &&
+            distanceXY(start, *threat->position) <= 75.0 && hp >= 240.0;
+        const bool winning1v1 = close80 <= 1 && threat && threat->position && hp >= 260.0 &&
+            (threat->hp < hp * 0.95 ||
+             (hasWeaponKind(weapons, "lightning") && distanceXY(start, *threat->position) <= lightRng + 4.0 && threat->hp <= 750.0));
+        const bool enemyOpening = close80 <= 1 && threat && threat->position && hpFrac >= 0.58 &&
+            !threat->facing_us && distanceXY(start, *threat->position) <= 130.0 &&
+            (exposedNow > 0 || (hasWeaponKind(weapons, "laser") && threat->has_mortar && hpFrac >= 0.65));
+        if (!inZone || window.urgent || hpFrac >= 0.98 || finishableClose || winning1v1 || enemyOpening) {
             regenMode_ = false;
-        } else if (hpFrac < 0.42 || (hpFrac < 0.65 && (onRoof || exposedNow == 0 || hasNanites))) {
+        } else if ((exposedNow >= 2 && hpFrac < 0.55) || (hpFrac < 0.36 && !winning1v1) ||
+                   (hpFrac < 0.62 && exposedNow == 0) || (hasNanites && hpFrac < 0.68 && (onRoof || exposedNow == 0))) {
             regenMode_ = true;
         }
 
@@ -243,7 +253,7 @@ public:
             (now - threats_.last_damage_time() <= 0.35);
 
         const auto decision = choose(obs, start, zone, motion, muzzleHeight, threat, enemies, enemyInfos,
-                                     projDodge, soundAlert, blindSounds, onRoof, close80, exposedNow,
+                                     projDodge, soundAlert, onRoof, close80, exposedNow,
                                      needReposition, tickStarted, hardDeadline);
         const auto& command = decision.command;
 
@@ -253,7 +263,6 @@ public:
             {"jump", command.jump},
         };
 
-        const auto& weapons = me.contains("weapons") && me["weapons"].is_array() ? me["weapons"] : Json::array();
         const bool laserCharging = isLaserCharging(weapons);
         const bool holdFireForRegen = regenMode_ && exposedNow == 0 && !laserCharging;
         const bool effectiveFireAllowed = decision.fireAllowed && !holdFireForRegen;
@@ -270,14 +279,14 @@ public:
         const int close35 = static_cast<int>(std::count_if(enemyInfos.begin(), enemyInfos.end(), [&](const EnemyInfo& e) {
             return distanceXY(start, e.pos) <= 35.0;
         }));
-        const bool allowLaserCharge = !window.urgent && inZone && !(threat && threat->laser_charging) &&
-            (onRoof || close35 == 0) && !regenMode_;
+        const bool allowLaserCharge = !threats_.laser_shorted(now) && !window.urgent && inZone &&
+            !(threat && threat->laser_charging) && (onRoof || close35 == 0) && !regenMode_;
 
         const auto shotDeadline = std::min(tickStarted + 34ms, Clock::now() + 5ms);
         std::optional<GunShot> shot;
         if ((effectiveFireAllowed || laserCharging) && !joining) {
             shot = threats_.visible_shot(obs, arena_, threat, shotDeadline, allowCrates, allowNpcs,
-                                         allowLaserCharge, lastTargetId_, false);
+                                         allowLaserCharge, lastTargetId_);
         }
         if (shot && !shot->crate && !shot->npc && shot->target_id >= 0) {
             lastTargetId_ = shot->target_id;
@@ -285,7 +294,7 @@ public:
         const bool defending = effectiveFireAllowed && !joining && !(shot && shot->firing()) && !laserCharging &&
             return_fire(obs, threat, command.move, arena_, decision.returningToCover);
 
-        // Aim priority: active shot > duel > visible front-armor facing (NEVER sell 1.5x rear armor!) > weapon-aware blind-spot sound > threat > scan.
+        // Aim priority: active shot > duel > visible front-armor facing > rear-hit event snap > blind-spot sound > threat > scan.
         std::optional<Vec2> aim;
         if (shot) {
             aim = shot->aim;
@@ -293,6 +302,8 @@ public:
             aim = retreat_aim(obs, duel);
         } else if (const auto armorYaw = frontArmorYaw(start, enemyInfos, motion.height, arena_)) {
             aim = Vec2{*armorYaw, 0.0};
+        } else if (const auto rearYaw = threats_.rear_hit_bearing(now)) {
+            aim = Vec2{*rearYaw, 0.0};
         } else if (!blindSounds.empty()) {
             const bool haveLaser = hasWeaponKind(weapons, "laser");
             const SoundContact* bestSc = nullptr;
@@ -630,7 +641,6 @@ private:
                     const std::vector<Vec3>& enemies, const std::vector<EnemyInfo>& enemyInfos,
                     const std::optional<ProjectileDodge>& projDodge,
                     const std::optional<SoundAlert>& soundAlert,
-                    const std::vector<SoundContact>& blindSounds,
                     bool onRoof, int close80, int exposedNow, bool needReposition,
                     Clock::time_point tickStarted, Clock::time_point hardDeadline) {
         const auto& me = obs.contains("self") && obs["self"].is_object() ? obs["self"] : Json::object();
@@ -723,15 +733,7 @@ private:
              (insideNext && !underThreat && !regenMode_ && countHeldWeapons(weapons) >= 2 && me.value("cubes", 0.0) >= 4.0));
         if (wantRoof) {
             considerRoofAt_ = zone.now + 1.5;
-            // Query all 6-26 m campus roofs, preferring golden 6-16.5 m height first (no -0.7 rad dead zone)
-            // without ever skipping reachable 16.5-26 m buildings!
-            auto roofs = arena_.nearbyRooftops(start, 38.0, 6.0, 26.0, motion.radius, motion.height);
-            std::stable_sort(roofs.begin(), roofs.end(), [&](const Vec3& a, const Vec3& b) {
-                const bool aGold = (a[2] - start[2]) <= 16.5;
-                const bool bGold = (b[2] - start[2]) <= 16.5;
-                if (aGold != bGold) return aGold;
-                return distanceXY(start, a) < distanceXY(start, b);
-            });
+            const auto roofs = arena_.nearbyRooftops(start, 38.0, 6.0, 26.0, motion.radius, motion.height);
             const auto roofDeadline = std::min(hardDeadline, Clock::now() + 4ms);
             for (const auto& roof : roofs) {
                 if (Clock::now() >= roofDeadline) break;
@@ -753,7 +755,15 @@ private:
             }
         }
 
-        if (threat && threat->position && !window.urgent && inZone) {
+        // Allow tanking light/mid storm (dps <= 60) briefly to finish a close 1v1 kill before rotating in!
+        const double zoneDps = obs.contains("zone") && obs["zone"].is_object() ? obs["zone"].value("dps", 20.0) : 20.0;
+        const double distToSafe = std::max(0.0, distanceXY(start, zone.nextCenter) - zone.nextRadius);
+        const double estReturnSec = distToSafe / std::max(1.0, motion.walk);
+        const bool canFinishInStorm = zoneDps <= 60.0 && close80 <= 1 && threat && threat->position &&
+            threat->hp <= 480.0 && distanceXY(start, *threat->position) <= 75.0 &&
+            hp > zoneDps * (estReturnSec + 3.0) + 320.0;
+
+        if (threat && threat->position && ((!window.urgent && inZone) || canFinishInStorm)) {
             const double threatDist = distanceXY(start, *threat->position);
             const bool activeCombat = threat->hostile || threat->damaged_recently ||
                 threat->laser_charging || threatDist <= 70.0 || regenMode_;
@@ -795,7 +805,6 @@ private:
                 ctx.anchor = combatAnchor_.value_or(start);
                 const auto vel3 = safeVec3(me, "vel");
                 ctx.velocity = {vel3[0], vel3[1]};
-                ctx.blindSounds = blindSounds;
                 if (projDodge && !projDodge->urgent_mortar) {
                     ctx.bulletDodge = projDodge->direction;
                 }
@@ -1541,8 +1550,8 @@ private:
                 flight_.reset();
                 return {};
             }
-            if (distanceXY(start, flight.takeoff) > 1.0 || std::hypot(velocity[0], velocity[1]) > 2) {
-                return groundCommand(start, flight.takeoff, me, zone, motion, false);
+            if (distanceXY(start, flight.takeoff) > 1.6 || std::hypot(velocity[0], velocity[1]) > 6.5) {
+                return groundCommand(start, flight.takeoff, me, zone, motion, energy > 0.72 * maximum);
             }
             const Vec3 vertical{start[0], start[1], flight.apex};
             if (!arena_.flightSegment(start, vertical, motion.radius, motion.height) ||

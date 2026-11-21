@@ -104,8 +104,7 @@ public:
                                         bool allow_crates = false,
                                         bool allow_npcs = false,
                                         bool allow_laser_charge = true,
-                                        std::optional<int> sticky_target_id = std::nullopt,
-                                        bool precharge_laser = false) const;
+                                        std::optional<int> sticky_target_id = std::nullopt) const;
     std::vector<EnemyInfo> visible_enemies(const Json& obs, const Arena& arena) const;
     std::optional<ProjectileDodge> projectile_dodge(const Json& obs, const Arena& arena) const;
     std::optional<SoundAlert> sound_alert(double now) const;
@@ -114,6 +113,8 @@ public:
     bool can_collect_cubes(const Json& obs) const;
     double last_combat_time() const;
     double last_damage_time() const;
+    bool laser_shorted(double now) const;
+    std::optional<double> rear_hit_bearing(double now) const;
     std::optional<double> sound_heading(double now) const;
 
 private:
@@ -145,6 +146,9 @@ private:
     double last_hit_dealt_at_ = -std::numeric_limits<double>::infinity();
     double last_hostile_damage_at_ = -std::numeric_limits<double>::infinity();
     double last_duel_at_ = -std::numeric_limits<double>::infinity();
+    double laser_shorted_until_ = -std::numeric_limits<double>::infinity();
+    std::optional<double> rear_hit_bearing_;
+    double rear_hit_until_ = -std::numeric_limits<double>::infinity();
     double mech_radius_;
     double mech_height_;
     double muzzle_height_;

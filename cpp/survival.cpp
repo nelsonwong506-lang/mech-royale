@@ -519,22 +519,6 @@ std::optional<CombatMove> planCombatPosition(const Vec3& from, const Threat& pri
             }
         }
 
-        // Blind-spot weapon-aware sound localization: stay out of unseen lightning ambushes & step into cover from unseen lasers!
-        double soundBonus = 0.0;
-        for (const auto& sc : ctx.blindSounds) {
-            const Vec3 sPos{from[0] + sc.est_dist * std::cos(sc.bearing),
-                            from[1] + sc.est_dist * std::sin(sc.bearing), from[2]};
-            const double toward = std::cos(moveYaw - sc.bearing);
-            const bool coveredFromSound = wallCover(*point, sPos, motion.height, arena) == 3;
-            if (sc.laser_charging) {
-                soundBonus += (coveredFromSound ? 18.0 : 0.0) + 10.0 * std::abs(std::sin(moveYaw - sc.bearing));
-            } else if (sc.near && sc.weapon == "lightning") {
-                soundBonus += (coveredFromSound ? 12.0 : 0.0) - 18.0 * std::max(0.0, toward);
-            } else if (sc.near) {
-                soundBonus -= 9.0 * std::max(0.0, toward);
-            }
-        }
-
         // Rooftop high-ground retention: don't accidentally step off a roof while fighting ground bots!
         const bool staysElevated = ctx.onRoof && (*point)[2] >= from[2] - 1.5;
         const double roofBonus = ctx.onRoof ? (staysElevated ? 22.0 : -26.0) : 0.0;
@@ -561,11 +545,12 @@ std::optional<CombatMove> planCombatPosition(const Vec3& from, const Threat& pri
             }
         }
 
+        const double progressWeight = zone.inNext(from, motion.radius + 8.0) ? 0.04 : 0.32;
         const double score = exposureScore + pinchBonus + repositionBonus + momentumBonus + dodgeBonus +
-            soundBonus + roofBonus + pullBonus +
+            roofBonus + pullBonus +
             (defensive ? 3.5 : 8.0) * lateral + (preferredSide ? 2.5 : 0.0) -
             (defensive ? 0.15 : 0.45) * rangeError - weaponDangerPenalty - rearRiskPenalty -
-            0.55 * otherApproachPenalty + 0.32 * progress + 0.025 * std::min(40.0, clearance);
+            0.55 * otherApproachPenalty + progressWeight * progress + 0.025 * std::min(40.0, clearance);
 
         if (score > bestScore) {
             bestScore = score;
@@ -578,7 +563,7 @@ std::optional<CombatMove> planCombatPosition(const Vec3& from, const Threat& pri
     };
 
     const std::array<double, 4> roofLengths{2.8, 5.5, 9.0, 14.0};
-    const std::array<double, 4> groundLengths{9.0, 15.0, 21.0, 5.5};
+    const std::array<double, 4> groundLengths{3.2, 6.5, 11.5, 18.0};
     const auto& stepLengths = ctx.onRoof ? roofLengths : groundLengths;
     for (const double length : stepLengths) {
         for (const int offset : baseOffsets) {
