@@ -534,7 +534,10 @@ std::optional<CombatMove> planCombatPosition(const Vec3& from, const Threat& pri
         }
     };
 
-    for (const double length : {9.0, 15.0, 21.0, 5.5}) {
+    const std::array<double, 4> roofLengths{2.8, 5.5, 9.0, 14.0};
+    const std::array<double, 4> groundLengths{9.0, 15.0, 21.0, 5.5};
+    const auto& stepLengths = ctx.onRoof ? roofLengths : groundLengths;
+    for (const double length : stepLengths) {
         for (const int offset : baseOffsets) {
             if (Clock::now() >= deadline) {
                 return best;

@@ -72,6 +72,14 @@ struct ProjectileDodge {
     bool urgent_mortar = false;
 };
 
+struct SoundAlert {
+    double bearing = 0.0;
+    bool laser_charge = false;
+    bool near_hostile = false;
+    bool near_jet = false;
+    bool near_reload = false;
+};
+
 class ThreatTracker {
 public:
     explicit ThreatTracker(const Json& config);
@@ -85,9 +93,11 @@ public:
                                         Clock::time_point deadline = Clock::time_point::max(),
                                         bool allow_crates = false,
                                         bool allow_npcs = false,
-                                        bool allow_laser_charge = true) const;
+                                        bool allow_laser_charge = true,
+                                        std::optional<int> sticky_target_id = std::nullopt) const;
     std::vector<EnemyInfo> visible_enemies(const Json& obs, const Arena& arena) const;
     std::optional<ProjectileDodge> projectile_dodge(const Json& obs, const Arena& arena) const;
+    std::optional<SoundAlert> sound_alert(double now) const;
     bool can_collect_cubes(const Json& obs) const;
     double last_combat_time() const;
     double last_damage_time() const;
@@ -115,6 +125,8 @@ private:
     double unknown_until_ = -std::numeric_limits<double>::infinity();
     std::optional<double> sound_heading_;
     double sound_until_ = -std::numeric_limits<double>::infinity();
+    std::optional<SoundAlert> sound_alert_;
+    double sound_alert_until_ = -std::numeric_limits<double>::infinity();
     double last_damage_at_ = -std::numeric_limits<double>::infinity();
     double last_hit_dealt_at_ = -std::numeric_limits<double>::infinity();
     double last_hostile_damage_at_ = -std::numeric_limits<double>::infinity();

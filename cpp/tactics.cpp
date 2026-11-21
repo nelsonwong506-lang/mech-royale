@@ -304,27 +304,27 @@ std::optional<Vec3> mortar_impact(const Vec3& origin, double yaw, double pitch,
         if (arena.blocksPrismLine(prev, next)) {
             return prev;
         }
-        const double floor_z = arena.ground(next[0], next[1]);
-        if (next[2] <= floor_z) {
-            return Vec3{next[0], next[1], floor_z};
+        const double surf_z = arena.surface(next[0], next[1], std::max(prev[2], next[2]) + 0.5);
+        if (next[2] <= surf_z) {
+            return Vec3{next[0], next[1], surf_z};
         }
         prev = next;
     }
     return std::nullopt;
 }
 
-std::optional<Vec2> mortar_solution(const Vec3& origin, const Vec3& raw_target, const Vec3& vel,
-                                    double speed, double gravity, const Arena& arena) {
+Vec3 mortar_lead_target(const Vec3& origin, const Vec3& raw_target, const Vec3& vel, double speed) {
     const double base_horiz = distanceXY(origin, raw_target);
-    if (base_horiz < 14.0 || speed <= 1.0 || gravity <= 0.1) {
-        return std::nullopt;
-    }
-    const double est_flight = std::min(2.2, base_horiz / (speed * 0.78));
-    const Vec3 target{raw_target[0] + vel[0] * est_flight * 0.55,
-                      raw_target[1] + vel[1] * est_flight * 0.55,
-                      raw_target[2]};
+    const double est_flight = std::min(2.2, base_horiz / std::max(1.0, speed * 0.78));
+    return Vec3{raw_target[0] + vel[0] * est_flight * 0.55,
+                raw_target[1] + vel[1] * est_flight * 0.55,
+                raw_target[2]};
+}
+
+std::optional<Vec2> mortar_solution(const Vec3& origin, const Vec3& target,
+                                    double speed, double gravity, const Arena& arena) {
     const double horiz = distanceXY(origin, target);
-    if (horiz < 14.0) {
+    if (horiz < 14.0 || speed <= 1.0 || gravity <= 0.1) {
         return std::nullopt;
     }
     const double dz = target[2] - origin[2];
@@ -620,6 +620,13 @@ std::optional<double> ThreatTracker::sound_heading(double now) const {
     return std::nullopt;
 }
 
+std::optional<SoundAlert> ThreatTracker::sound_alert(double now) const {
+    if (sound_alert_ && now <= sound_alert_until_) {
+        return sound_alert_;
+    }
+    return std::nullopt;
+}
+
 std::vector<EnemyInfo> ThreatTracker::visible_enemies(const Json& obs, const Arena& arena) const {
     std::vector<EnemyInfo> list;
     const auto& me = field(obs, "self");
@@ -783,27 +790,75 @@ std::optional<Threat> ThreatTracker::update(const Json& obs, const Arena& arena,
     }
 
     const auto& sounds = field(obs, "sounds");
-    if (sounds.is_array()) {
+    if (sounds.is_array() && !sounds.empty()) {
         int best_priority = -1;
+        std::optional<SoundAlert> fresh_alert;
+        int best_alert_prio = -1;
         for (const auto& sound : sounds) {
             const auto skind = text(field(sound, "kind"));
             if (skind == "death" || skind == "drop") continue;
-            const auto dist_str = text(field(sound, "dist"));
-            int prio = (dist_str == "near" ? 3 : dist_str == "mid" ? 1 : 0);
-            if (skind == "laser_charge" || skind == "lightning") prio += 3;
-            else if (skind == "gun" || skind == "laser" || skind == "mortar") prio += 1;
-            if (prio <= best_priority) continue;
+            std::optional<double> bearing;
             if (const auto p = try_point(field(sound, "pos"))) {
                 if (distanceXY(position, *p) > 3.0) {
-                    best_priority = prio;
-                    sound_heading_ = std::atan2((*p)[1] - position[1], (*p)[0] - position[0]);
-                    sound_until_ = now + SoundMemorySeconds;
+                    bearing = std::atan2((*p)[1] - position[1], (*p)[0] - position[0]);
                 }
             } else if (const auto& b = field(sound, "bearing"); b.is_number()) {
+                bearing = finiteOr(b.get<double>());
+            }
+            if (!bearing) continue;
+
+            const auto dist_str = text(field(sound, "dist"));
+            const bool is_near = dist_str == "near";
+            const bool is_mid = dist_str == "mid";
+            int prio = (is_near ? 3 : is_mid ? 1 : 0);
+            if (skind == "laser_charge" || skind == "lightning") prio += 4;
+            else if (skind == "jet" || skind == "boost" || skind == "step") prio += 3;
+            else if (skind == "gun" || skind == "laser" || skind == "mortar" || skind == "reload") prio += 2;
+            if (prio > best_priority) {
                 best_priority = prio;
-                sound_heading_ = finiteOr(b.get<double>());
+                // Smooth bearing slightly if consistent with recent sound to cut ±7 deg noise.
+                double smoothed = *bearing;
+                if (sound_heading_ && now <= sound_until_ &&
+                    std::abs(std::remainder(*bearing - *sound_heading_, Tau)) <= radians(25.0)) {
+                    smoothed = std::remainder(*sound_heading_ + 0.55 * std::remainder(*bearing - *sound_heading_, Tau), Tau);
+                }
+                sound_heading_ = smoothed;
                 sound_until_ = now + SoundMemorySeconds;
             }
+
+            // Build structured tactical sound alerts (blind-spot laser charge, roof jet ambush, near flankers, reloads).
+            SoundAlert alert;
+            alert.bearing = *bearing;
+            int aprio = -1;
+            if (skind == "laser_charge" && (is_near || is_mid)) {
+                alert.laser_charge = true;
+                alert.near_hostile = true;
+                aprio = is_near ? 10 : 8;
+            } else if (skind == "jet" && is_near) {
+                alert.near_jet = true;
+                alert.near_hostile = true;
+                aprio = 7;
+            } else if (is_near && (skind == "lightning" || skind == "boost" || skind == "step" ||
+                                   skind == "gun" || skind == "laser" || skind == "mortar")) {
+                alert.near_hostile = true;
+                aprio = (skind == "lightning" || skind == "boost") ? 6 : 5;
+            } else if (skind == "reload" && is_near) {
+                alert.near_reload = true;
+                aprio = 4;
+            }
+            if (aprio > best_alert_prio) {
+                best_alert_prio = aprio;
+                fresh_alert = alert;
+            }
+        }
+        if (fresh_alert) {
+            if (sound_alert_ && now <= sound_alert_until_ &&
+                std::abs(std::remainder(fresh_alert->bearing - sound_alert_->bearing, Tau)) <= radians(25.0)) {
+                fresh_alert->bearing = std::remainder(
+                    sound_alert_->bearing + 0.55 * std::remainder(fresh_alert->bearing - sound_alert_->bearing, Tau), Tau);
+            }
+            sound_alert_ = fresh_alert;
+            sound_alert_until_ = now + (fresh_alert->laser_charge ? 1.1 : fresh_alert->near_reload ? 1.8 : 1.0);
         }
     }
 
@@ -1178,7 +1233,8 @@ std::optional<GunShot> ThreatTracker::visible_shot(const Json& obs, const Arena&
                                                    Clock::time_point deadline,
                                                    bool allow_crates,
                                                    bool allow_npcs,
-                                                   bool allow_laser_charge) const {
+                                                   bool allow_laser_charge,
+                                                   std::optional<int> sticky_target_id) const {
     const auto& me = field(obs, "self");
     const auto& weapons = field(me, "weapons");
     if (!weapons.is_array() || weapons.empty()) {
@@ -1281,6 +1337,8 @@ std::optional<GunShot> ThreatTracker::visible_shot(const Json& obs, const Arena&
             const double hp_bonus = (is_npc && !attacking_npc)
                 ? -450.0  // Only farm passive NPCs when no real enemy mech can be shot.
                 : ((hp <= 350.0 ? 240.0 : 0.0) + std::max(0.0, 1400.0 - hp) * 0.15);
+            const double sticky_bonus = (!is_npc && sticky_target_id && *sticky_target_id == *id && hp < 1150.0)
+                ? 65.0 : 0.0;
             const double threat_bonus = is_primary && primary_threat->hostile
                 ? (primary_threat->laser_charging ? 200.0 : 95.0) : 0.0;
 
@@ -1299,6 +1357,7 @@ std::optional<GunShot> ThreatTracker::visible_shot(const Json& obs, const Arena&
             std::optional<Vec2> laser_aim;
             bool laser_trigger = false;
             bool laser_releasing = false;
+            bool laser_is_charging = false;
             int laser_slot = -1;
             double laser_dist = std::numeric_limits<double>::infinity();
             double laser_bonus = 0.0;
@@ -1363,6 +1422,7 @@ std::optional<GunShot> ThreatTracker::visible_shot(const Json& obs, const Arena&
                                          clear_aim_line(shot.origin, actual, dist, arena);
 
                     if (slot.charge > 0.0) {
+                        laser_is_charging = true;
                         const double frac = std::clamp(slot.charge / full_charge, 0.0, 1.0);
                         const double est_dmg = base_dmg * cube_mult * (0.35 + 0.65 * frac) * cookoff;
                         const bool ready_to_release = (slot.charge >= full_charge - 0.03) ||
@@ -1405,20 +1465,21 @@ std::optional<GunShot> ThreatTracker::visible_shot(const Json& obs, const Arena&
                         (target.has_lightning && dist >= 18.0 && dist <= 58.0) ||
                         (target_speed < 4.5 && dist >= 22.0 && dist <= 130.0);
                     if (!high_value_mortar) continue;
-                    if (const auto m_aim = mortar_solution(mortar_origin, aim_target, *target.attack_velocity,
-                                                           speed, grav, arena)) {
+                    const Vec3 lead_target = mortar_lead_target(mortar_origin, aim_target, *target.attack_velocity, speed);
+                    if (const auto m_aim = mortar_solution(mortar_origin, lead_target, speed, grav, arena)) {
+                        const double lead_dist = distanceXY(mortar_origin, lead_target);
                         // Compute exact ballistic pitch tolerance from range sensitivity dR/dpitch!
                         const double dR_dpitch = std::abs(2.0 * (speed * speed / std::max(1.0, grav)) * std::cos(2.0 * (*m_aim)[1]));
                         const double pitch_tol = std::clamp(0.45 * splash_r / std::max(35.0, dR_dpitch), 0.012, 0.045);
-                        const double yaw_tol = std::clamp(std::atan2(0.75 * splash_r, dist), 0.02, 0.14);
+                        const double yaw_tol = std::clamp(std::atan2(0.75 * splash_r, std::max(14.0, lead_dist)), 0.02, 0.14);
                         const bool mortar_aligned = std::abs(std::remainder((*m_aim)[0] - actual[0], Tau)) <= yaw_tol &&
                                                     std::abs((*m_aim)[1] - actual[1]) <= pitch_tol;
                         bool safe_actual_shot = false;
                         if (mortar_aligned) {
-                            // Verify the actual shell won't clip a near wall and blow ourselves up!
+                            // Verify the actual shell won't clip a near wall and lands on the LEADED target!
                             if (const auto impact = mortar_impact(mortar_origin, actual[0], actual[1], speed, grav, arena)) {
                                 const double self_dist = distanceXY(self_pos, *impact);
-                                const double target_err = distanceXY(aim_target, *impact);
+                                const double target_err = distanceXY(lead_target, *impact);
                                 safe_actual_shot = self_dist > splash_r + self_radius + 3.0 && target_err <= splash_r + 3.5;
                             }
                         }
@@ -1440,7 +1501,7 @@ std::optional<GunShot> ThreatTracker::visible_shot(const Json& obs, const Arena&
                 !gun_aim || !gun_is_ready || mortar_bonus >= 95.0);
 
             // Combine weapons intelligently on the chosen target.
-            if (laser_aim && (laser_releasing || (laser_slot >= 0 && slots[static_cast<std::size_t>(laser_slot)].charge > 0.0))) {
+            if (laser_aim && (laser_releasing || laser_is_charging)) {
                 GunShot gs;
                 gs.aim = *laser_aim;
                 gs.fire[static_cast<std::size_t>(laser_slot)] = laser_trigger;
@@ -1511,7 +1572,7 @@ std::optional<GunShot> ThreatTracker::visible_shot(const Json& obs, const Arena&
                 continue;
             }
             const double fire_bonus = (candidate->firing() || laser_releasing) ? 85.0 : 0.0;
-            const double score = fire_bonus + hp_bonus + threat_bonus + weapon_bonus - candidate_dist;
+            const double score = fire_bonus + hp_bonus + sticky_bonus + threat_bonus + weapon_bonus - candidate_dist;
             if (score > best_score) {
                 best_score = score;
                 best = candidate;
