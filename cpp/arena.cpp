@@ -686,6 +686,13 @@ bool Arena::walkSegment(const Vec3& start, const Vec3& end, double radius, doubl
         const bool bothOnTerrain = z == previousGround && support == terrainZ;
         const double maxClimb = (bothOnTerrain ? maxRise : stepUp) + supportEpsilon;
         const bool steepDrop = rise < -(bothOnTerrain ? maxRise : stepUp) - supportEpsilon;
+        if (steepDrop && !bothOnTerrain && rise >= -24.0 &&
+            !prismClear(x, y, support, radius, height, stepUp) &&
+            prismClear(x, y, z, radius, height, 0.0)) {
+            // Still overhanging the rooftop edge we are stepping off of: remain at ledge height z
+            // until our cylinder radius clears the building face, then drop to ground support!
+            continue;
+        }
         if (rise > maxClimb || !prismClear(x, y, support, radius, height, stepUp)) {
             return false;
         }
@@ -898,21 +905,44 @@ std::optional<Vec2> Arena::nearestTreeCover(const Vec3& from, const Vec3& threat
 std::vector<Vec3> Arena::nearbyRooftops(const Vec3& from, double maxRange, double minRise,
                                         double maxRise, double radius, double height) const {
     std::vector<Vec3> roofs;
-    const auto nodes = nearbyRoofNodes(from, maxRange, minRise, maxRise);
-    roofs.reserve(nodes.size());
-    for (const auto* node : nodes) {
-        // Pick the closest valid edge or center landing spot on this precomputed roof node.
-        const Vec3* bestPt = &node->center;
-        double bestDist = distanceXY(from, node->center);
-        for (const auto& edge : node->edgeSpots) {
-            const double d = distanceXY(from, edge.pos);
-            if (d < bestDist && bodyClear(edge.pos[0], edge.pos[1], node->topZ, radius, height)) {
-                bestDist = d;
-                bestPt = &edge.pos;
+    const int firstX = bin(from[0] - maxRange), lastX = bin(from[0] + maxRange);
+    const int firstY = bin(from[1] - maxRange), lastY = bin(from[1] + maxRange);
+    std::vector<std::size_t> visited;
+    visited.reserve(32);
+
+    for (int bx = firstX; bx <= lastX; ++bx) {
+        for (int by = firstY; by <= lastY; ++by) {
+            const auto cell = bins_.find(binKey(bx, by));
+            if (cell == bins_.end()) continue;
+            for (const auto idx : cell->second) {
+                if (std::find(visited.begin(), visited.end(), idx) != visited.end()) continue;
+                visited.push_back(idx);
+                const auto& prism = prisms_[idx];
+                const double rise = prism.top - from[2];
+                if (rise < minRise || rise > maxRise) continue;
+                const double minX = prism.bounds[0], minY = prism.bounds[1];
+                const double maxX = prism.bounds[2], maxY = prism.bounds[3];
+                if (maxX - minX < 9.5 || maxY - minY < 9.5) continue;
+                const double cx = 0.5 * (minX + maxX), cy = 0.5 * (minY + maxY);
+                const double inset = radius + 1.4;
+                // Sample a point near the closest climbable edge of the roof plus its center.
+                const double nearX = std::clamp(from[0], minX + inset, maxX - inset);
+                const double nearY = std::clamp(from[1], minY + inset, maxY - inset);
+                const std::array<Vec2, 3> samples{{
+                    {nearX, nearY},
+                    {0.5 * (nearX + cx), 0.5 * (nearY + cy)},
+                    {cx, cy}
+                }};
+                for (const auto& s : samples) {
+                    if (distanceXY(from, s) > maxRange) continue;
+                    if (!prism.contains(s[0], s[1])) continue;
+                    if (bodyClear(s[0], s[1], prism.top, radius, height) &&
+                        std::abs(surface(s[0], s[1], prism.top + 0.5) - prism.top) <= 0.2) {
+                        roofs.push_back(Vec3{s[0], s[1], prism.top});
+                        break;
+                    }
+                }
             }
-        }
-        if (bestDist <= maxRange && bodyClear((*bestPt)[0], (*bestPt)[1], node->topZ, radius, height)) {
-            roofs.push_back(*bestPt);
         }
     }
     std::sort(roofs.begin(), roofs.end(), [&](const Vec3& a, const Vec3& b) {

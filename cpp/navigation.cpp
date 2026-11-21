@@ -206,35 +206,45 @@ void Navigator::advance(Search& search, const Zone& zone, const Motion& motion, 
         }
 
         const Vec2 gridPoint{std::nearbyint(entry.point[0] / gridSize), std::nearbyint(entry.point[1] / gridSize)};
+        const bool entryOnRoof = entry.point[2] > arena_.ground(entry.point[0], entry.point[1]) + motion.step + 1.0;
         for (const auto& offset : offsets) {
-            const Vec2 point{(gridPoint[0] + offset[0]) * gridSize, (gridPoint[1] + offset[1]) * gridSize};
-            const double length = distanceXY(entry.point, point);
-            if (length < 0.3) {
-                continue;
+            if (offset[0] == 0.0 && offset[1] == 0.0) continue;
+            for (const double stepMult : {1.0, 2.0}) {
+                if (stepMult > 1.0 && !entryOnRoof) break;
+                const Vec2 point{(gridPoint[0] + offset[0] * stepMult) * gridSize,
+                                 (gridPoint[1] + offset[1] * stepMult) * gridSize};
+                const double length = distanceXY(entry.point, point);
+                if (length < 0.3) {
+                    continue;
+                }
+                const double duration = length / motion.walk;
+                const double endClearance = zone.clearance(point, at + duration);
+                if (!zone.segment(horizontal(entry.point), point, at, duration) && endClearance < -28.0) {
+                    continue;
+                }
+                const double maxClimb = std::max(motion.step * 3.0, std::tan(radians(motion.slope)) * length + 0.2);
+                const auto next = support(point, motion, entry.point[2] + maxClimb);
+                if (!next || (*next)[2] > entry.point[2] + maxClimb || (*next)[2] < entry.point[2] - 24.0) {
+                    continue;
+                }
+                const double clearance = zone.clearance(*next, at + duration);
+                const double exposure = clearance < 0.0
+                    ? std::min(14.0, 3.0 + (-clearance) / 4.0)
+                    : 0.0;
+                const double cost = node.cost + length * (1 + exposure);
+                const auto old = search.nodes.find(*next);
+                if ((old != search.nodes.end() && cost >= old->second.cost) || !walkable(entry.point, *next, motion)) {
+                    continue;
+                }
+                search.nodes.insert_or_assign(*next, SearchNode{cost, node.traveled + length, entry.point});
+                const double heuristic = search.heuristic(*next);
+                if (heuristic + std::max(0.0, -clearance)
+                    < search.heuristic(search.best) + std::max(0.0, -zone.clearance(search.best, at))) {
+                    search.best = *next;
+                }
+                search.queue.push({cost + heuristic, search.serial++, *next, cost});
+                break;
             }
-            const double duration = length / motion.walk;
-            if (!zone.segment(horizontal(entry.point), point, at, duration)) {
-                continue;
-            }
-            const double maxClimb = std::max(motion.step * 3.0, std::tan(radians(motion.slope)) * length + 0.2);
-            const auto next = support(point, motion, entry.point[2] + maxClimb);
-            if (!next || (*next)[2] > entry.point[2] + maxClimb || (*next)[2] < entry.point[2] - 24.0) {
-                continue;
-            }
-            const double clearance = zone.clearance(*next, at + duration);
-            const double exposure = std::min(8.0, std::max(0.0, -clearance) / 8);
-            const double cost = node.cost + length * (1 + exposure);
-            const auto old = search.nodes.find(*next);
-            if ((old != search.nodes.end() && cost >= old->second.cost) || !walkable(entry.point, *next, motion)) {
-                continue;
-            }
-            search.nodes.insert_or_assign(*next, SearchNode{cost, node.traveled + length, entry.point});
-            const double heuristic = search.heuristic(*next);
-            if (heuristic + std::max(0.0, -clearance)
-                < search.heuristic(search.best) + std::max(0.0, -zone.clearance(search.best, at))) {
-                search.best = *next;
-            }
-            search.queue.push({cost + heuristic, search.serial++, *next, cost});
         }
     }
     search.exhausted = search.queue.empty();
@@ -275,7 +285,7 @@ std::vector<Vec3> Navigator::usable(const Vec3& from, const std::vector<Vec3>& p
                                     const Zone& zone, const Motion& motion) {
     for (std::size_t end = std::min<std::size_t>(6, path.size()); end > 0; --end) {
         const auto& point = path[end - 1];
-        if (distanceXY(from, point) <= 12.0 && direct(from, point, zone, motion)) {
+        if (distanceXY(from, point) <= 16.0 && direct(from, point, zone, motion)) {
             return {path.begin() + static_cast<std::ptrdiff_t>(end - 1), path.end()};
         }
     }
@@ -362,8 +372,10 @@ std::optional<Flight> Navigator::flightPlan(const Vec3& from, const std::vector<
             }
             const Vec2 xy{center[0] + 6 * offset[0], center[1] + 6 * offset[1]};
             const bool insideNext = zone.inNext(xy);
+            const double startClearance = zone.clearance(from, zone.now + 3.0);
+            const double xyClearance = zone.clearance(xy, zone.now + 3.0);
             const bool intermediateSafe = distanceXY(xy, zone.nextCenter) < startToNext - 4.0
-                && zone.clearance(xy, zone.now + 3.0) >= 0.0;
+                && (xyClearance >= 0.0 || (startClearance < 0.0 && xyClearance > startClearance + 6.0));
             if (xy[0] <= minX || xy[0] >= maxX || xy[1] <= minY || xy[1] >= maxY
                 || distanceXY(from, xy) > 55.0 || (!insideNext && !intermediateSafe)) {
                 continue;
@@ -393,8 +405,7 @@ std::optional<Flight> Navigator::flightPlan(const Vec3& from, const std::vector<
                     continue;
                 }
                 const double at = zone.now + distanceXY(from, *takeoff) / motion.walk;
-                if ((insideNext && at + seconds > zone.end && zone.nextRadius > 0.0)
-                    || !zone.segment(*takeoff, *takeoff, at, climb)
+                if (!zone.segment(*takeoff, *takeoff, at, climb)
                     || !zone.segment(*takeoff, *landing, at + climb, across)
                     || !zone.segment(*landing, *landing, at + climb + across, down)) {
                     continue;
@@ -495,7 +506,25 @@ bool Navigator::guard(const Vec2& move, bool boost, const Json& me, const Zone& 
         return arena_.flightSegment(start, {step[0], step[1], z}, motion.radius, motion.height);
     }
     const auto end = support(step, motion, start[2] + motion.step + 0.1);
-    return end && walkable(start, *end, motion);
+    if (end && walkable(start, *end, motion)) {
+        return true;
+    }
+    // Allow stepping across the overhang band off a rooftop edge when the ground landing ahead is clear.
+    const double moveNorm = std::hypot(move[0], move[1]);
+    if (!end && moveNorm > 0.1 && start[2] > arena_.ground(start[0], start[1]) + motion.step + 0.5 &&
+        arena_.bodyClear(step[0], step[1], start[2], motion.radius, motion.height)) {
+        for (const double probeDist : {motion.radius + 1.2, motion.radius + 2.8}) {
+            const Vec2 dropProbe{step[0] + (move[0] / moveNorm) * probeDist,
+                                 step[1] + (move[1] / moveNorm) * probeDist};
+            const auto dropEnd = support(dropProbe, motion, start[2] - 0.5);
+            if (dropEnd && start[2] - (*dropEnd)[2] <= 24.0 &&
+                zone.segment(step, dropProbe, zone.now + 0.1, probeDist / std::max(1.0, speed)) &&
+                walkable(start, *dropEnd, motion)) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 }  // namespace mr

@@ -489,14 +489,7 @@ std::optional<CombatMove> planCombatPosition(const Vec3& from, const Threat& pri
             }
         }
     }
-
-    // Dispatch to specialized Rooftop Guerrilla Edge-Peek-and-Tuck planner when standing on a rooftop node!
-    if (ctx.currentRoof != nullptr) {
-        if (const auto roofMove = planRooftopCombat(from, *ctx.currentRoof, primary, nearby, closeCount,
-                                                    ctx, zone, motion, arena, navigator, deadline)) {
-            return roofMove;
-        }
-    }
+    (void)planRooftopCombat;
 
     const bool multiEnemy = closeCount >= 2;
     const double hpFrac = ctx.hp / std::max(1.0, ctx.maxHp);
@@ -555,16 +548,20 @@ std::optional<CombatMove> planCombatPosition(const Vec3& from, const Threat& pri
     const double toFocus = std::atan2(focusPos[1] - from[1], focusPos[0] - from[0]);
     const double distanceToNext = distanceXY(from, zone.nextCenter);
 
-    // Check if staying put in hard cover is ideal (during regen or reload).
+    // Check if staying put in hard cover is ideal (during regen or reload), unless an enemy is rushing < 28m!
     if (defensive && !ctx.needReposition) {
         int exposedHere = 0;
+        double closestEnemyHere = infinity;
         for (const auto* e : nearby) {
+            closestEnemyHere = std::min(closestEnemyHere, distanceXY(from, e->pos));
             if (wallCover(from, e->pos, motion.height, arena) < 3) {
                 ++exposedHere;
             }
         }
-        if (exposedHere == 0 && zone.clearance(from, zone.now + 1.5) > motion.radius + 1.5) {
-            return CombatMove{from, false, true, 0, ctx.wantRegen ? "regen-cover" : "reload-cover"};
+        if (exposedHere == 0 && (ctx.onRoof || closestEnemyHere >= 28.0) &&
+            zone.clearance(from, zone.now + 1.5) > motion.radius + 1.5) {
+            return CombatMove{from, false, true, 0,
+                              ctx.onRoof ? "roof-tuck" : (ctx.wantRegen ? "regen-cover" : "reload-cover")};
         }
     }
 
@@ -599,7 +596,6 @@ std::optional<CombatMove> planCombatPosition(const Vec3& from, const Threat& pri
         int exposedCount = 0;
         int lightningCluster = 0;
         double minEnemyDist = infinity;
-        double expectedDpsIn = 0.0;
         double weaponDangerPenalty = 0.0;
         double treeStealthBonus = 0.0;
         exposedYaws.clear();
@@ -613,26 +609,19 @@ std::optional<CombatMove> planCombatPosition(const Vec3& from, const Threat& pri
             if (exposed) {
                 ++exposedCount;
                 exposedYaws.push_back(std::atan2(e->pos[1] - (*point)[1], e->pos[0] - (*point)[0]));
-                const double eMult = 1.0 + 0.04 * std::min(10.0, e->cubes);
-                const double covFactor = (cov == 2) ? 0.55 : (cov == 1 ? 0.82 : 1.0);
-                double eDps = e->has_gun ? 85.0 * eMult * std::clamp(1.15 - d / 220.0, 0.35, 1.0) : 25.0;
                 if (e->has_lightning && d < 47.0 && !(ctx.hasLightning && e->hp < 350.0)) {
                     weaponDangerPenalty += (47.0 - d) * 1.3;
-                    eDps += 110.0 * eMult;
                 }
                 if (e->charging) {
                     weaponDangerPenalty += 30.0;
-                    eDps += 150.0 * eMult;
                 }
-                // Check if OSU Oval tree canopy breaks enemy vision (> 46m) while we can still shoot!
-                if (d > 46.0 && !e->facing_us) {
+                // Check if OSU Oval tree canopy breaks enemy vision (> 48m) while we can still shoot!
+                if (d > 48.0 && !e->facing_us) {
                     const Vec3 eEye{e->pos[0], e->pos[1], e->pos[2] + 8.0};
                     if (arena.blocksVisionTree(eEye, ptEye)) {
-                        eDps *= 0.55;
-                        treeStealthBonus += 6.5;
+                        treeStealthBonus += 5.0;
                     }
                 }
-                expectedDpsIn += eDps * covFactor * (e->facing_us ? 1.25 : 0.78);
             }
             if (ctx.hasLightning && d <= 42.0 && distanceXY(e->pos, focusPos) <= 14.0) {
                 ++lightningCluster;
@@ -657,20 +646,7 @@ std::optional<CombatMove> planCombatPosition(const Vec3& from, const Threat& pri
         const double progress = distanceToNext - distanceXY(xy, zone.nextCenter);
         const double anchorShift = distanceXY(*point, ctx.anchor);
         const double repositionBonus = ctx.needReposition ? std::min(12.0, anchorShift * 0.65) : 0.0;
-
-        // Expected outgoing DPS contribution from this position.
-        double expectedDpsOut = 0.0;
-        if (!defensive && hasFocusLos) {
-            expectedDpsOut += 95.0 * myCubeMult * std::clamp(1.15 - focusDist / 220.0, 0.4, 1.0);
-            if (ctx.hasLightning && focusDist <= 43.0 && ctx.energy >= 12.0) {
-                expectedDpsOut += 135.0 * myCubeMult * (1.0 + 0.35 * std::max(0, lightningCluster - 1));
-            } else if (ctx.hasLaser && focusDist >= 48.0) {
-                expectedDpsOut += 90.0 * myCubeMult;
-            }
-        } else if (!defensive && !hasFocusLos && ctx.hasMortar && exposedCount == 0 && focusDist >= 18.0) {
-            expectedDpsOut += 105.0 * myCubeMult;
-        }
-        const double tradeUtility = 0.055 * (expectedDpsOut - (defensive ? 1.8 : multiEnemy ? 1.35 : 0.95) * expectedDpsIn);
+        (void)myCubeMult;
 
         double exposureScore = 0.0;
         const char* label = "engage";
@@ -678,13 +654,13 @@ std::optional<CombatMove> planCombatPosition(const Vec3& from, const Threat& pri
             // Regen or reload: strongly prefer full cover (0 exposed) or breaking LOS.
             if (exposedCount == 0) {
                 exposureScore = 48.0;
-                label = ctx.wantRegen ? "regen-cover" : "reload-cover";
+                label = ctx.onRoof ? "roof-tuck" : (ctx.wantRegen ? "regen-cover" : "reload-cover");
             } else if (exposedCount == 1) {
                 exposureScore = 10.0;
-                label = "kite-defend";
+                label = ctx.onRoof ? "roof-tuck" : "kite-defend";
             } else {
                 exposureScore = -24.0 * exposedCount;
-                label = "split-out";
+                label = ctx.onRoof ? "roof-tuck" : "split-out";
             }
         } else if (multiEnemy) {
             // 1vMany core tactic: isolate EXACTLY 1 exposed enemy via cover-splitting!
@@ -760,7 +736,7 @@ std::optional<CombatMove> planCombatPosition(const Vec3& from, const Threat& pri
             }
         }
 
-        const double score = exposureScore + tradeUtility + treeStealthBonus + pinchBonus +
+        const double score = exposureScore + treeStealthBonus + pinchBonus +
             repositionBonus + momentumBonus + dodgeBonus + roofBonus + pullBonus +
             (defensive ? 3.5 : 8.0) * lateral + (preferredSide ? 2.5 : 0.0) -
             (defensive ? 0.15 : 0.45) * rangeError - weaponDangerPenalty - rearRiskPenalty -

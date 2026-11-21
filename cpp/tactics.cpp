@@ -13,7 +13,7 @@ namespace {
 constexpr double RetaliationSeconds = 3.0;
 constexpr double FreshHostileDamageSeconds = 0.35;
 constexpr double ProjectileLookahead = 0.45;
-constexpr double CubeDetourMeters = 24.0;
+constexpr double CubeDetourMeters = 36.0;
 constexpr double DuelEvidenceSeconds = 0.25;
 constexpr double DuelMemorySeconds = 1.2;
 constexpr double SoundMemorySeconds = 1.8;
@@ -85,26 +85,11 @@ double distance_3d(const Vec3& first, const Vec3& second) {
     return std::hypot(first[0] - second[0], first[1] - second[1], first[2] - second[2]);
 }
 
-Vec2 angles(const Vec3& origin, const Vec3& target, double min_pitch = -0.70, double max_pitch = 1.30) {
+Vec2 angles(const Vec3& origin, const Vec3& target) {
     const double horiz = distanceXY(origin, target);
     const double yaw = horiz > 1e-9 ? std::atan2(target[1] - origin[1], target[0] - origin[0]) : 0.0;
-    const double pitch = std::clamp(std::atan2(target[2] - origin[2], std::max(horiz, 1e-6)), min_pitch, max_pitch);
+    const double pitch = std::clamp(std::atan2(target[2] - origin[2], std::max(horiz, 1e-6)), -1.50, 1.50);
     return {finiteOr(yaw), finiteOr(pitch)};
-}
-
-// Verify that a ray clamped to [min_pitch, max_pitch] from the 3.0m forward barrel (protocol.md §5)
-// still intersects the target's vertical cylinder [feet_z, feet_z + height].
-bool pitch_reaches_cylinder(const Vec3& origin, const Vec3& target_feet, double target_height,
-                            double self_radius, double min_pitch, double max_pitch) {
-    const double horiz = distanceXY(origin, target_feet);
-    if (horiz <= self_radius + 1.0) {
-        return true;
-    }
-    const double barrel_offset = self_radius + 0.5;
-    const double rem_horiz = std::max(0.5, horiz - barrel_offset * std::cos(min_pitch));
-    const double min_ray_z = origin[2] + barrel_offset * std::sin(min_pitch) + rem_horiz * std::tan(min_pitch);
-    const double max_ray_z = origin[2] + barrel_offset * std::sin(max_pitch) + rem_horiz * std::tan(max_pitch);
-    return (target_feet[2] + target_height >= min_ray_z - 0.35) && (target_feet[2] <= max_ray_z + 0.35);
 }
 
 double match_time(const Json& obs) {
@@ -1396,8 +1381,8 @@ std::optional<GunShot> ThreatTracker::visible_shot(const Json& obs, const Arena&
             }
             const auto kind = text(field(actor, "kind"));
             const bool is_npc = kind == "npc";
-            const bool attacking_npc = is_npc && primary_threat && primary_threat->is_npc
-                && primary_threat->actor_id && *primary_threat->actor_id == *id;
+            const bool attacking_npc = is_npc && (attacks_.count(*id) > 0 ||
+                (primary_threat && primary_threat->is_npc && primary_threat->actor_id && *primary_threat->actor_id == *id));
             const bool farm_npc = is_npc && allow_npcs && distanceXY(self_pos, point_or(actor, "pos")) <= 65.0;
             if (kind != "mech" && !attacking_npc && !farm_npc) {
                 continue;
@@ -1456,11 +1441,7 @@ std::optional<GunShot> ThreatTracker::visible_shot(const Json& obs, const Arena&
                     if (!aim_pt) continue;
                     const double dist = distance_3d(shot.origin, *aim_pt);
                     if (dist > slot.range) continue;
-                    if (!pitch_reaches_cylinder(shot.origin, *target.position, target.attack_height,
-                                                self_radius, min_pitch_, max_pitch_)) {
-                        continue;
-                    }
-                    const Vec2 aim = angles(shot.lead_origin, *aim_pt, min_pitch_, max_pitch_);
+                    const Vec2 aim = angles(shot.lead_origin, *aim_pt);
                     const double slack = dist > 90.0 ? 0.012 : 0.025;
                     const bool fire = slot.ready && aim_aligned(aim, actual, dist, target.attack_radius, slack) &&
                                       clear_aim_line(shot.origin, actual, dist, arena);
@@ -1476,7 +1457,7 @@ std::optional<GunShot> ThreatTracker::visible_shot(const Json& obs, const Arena&
                     if (arena.blocksLine(shot.origin, shot.target)) continue;
                     const double dist = distance_3d(shot.origin, shot.target);
                     if (dist > slot.range) continue;
-                    const Vec2 aim = angles(shot.origin, shot.intercept, min_pitch_, max_pitch_);
+                    const Vec2 aim = angles(shot.origin, shot.intercept);
                     const bool in_cone = std::abs(std::remainder(aim[0] - actual[0], Tau)) <= radians(cone_deg * 0.45);
                     const double energy_floor = (is_npc && !attacking_npc) ? 35.0 : (hp <= 90.0 ? 0.0 : 1.5);
                     const bool has_energy = my_energy >= e_cost + energy_floor;
@@ -1494,11 +1475,7 @@ std::optional<GunShot> ThreatTracker::visible_shot(const Json& obs, const Arena&
                     if (arena.blocksLine(shot.origin, shot.target)) continue;
                     const double dist = distance_3d(shot.origin, shot.target);
                     if (dist > slot.range) continue;
-                    if (!pitch_reaches_cylinder(shot.origin, *target.position, target.attack_height,
-                                                self_radius, min_pitch_, max_pitch_)) {
-                        continue;
-                    }
-                    const Vec2 aim = angles(shot.origin, shot.intercept, min_pitch_, max_pitch_);
+                    const Vec2 aim = angles(shot.origin, shot.intercept);
                     const double full_charge = std::max(0.15, number(*slot.stats, "charge", 0.75));
                     const double min_charge = number(*slot.stats, "min_charge", 0.15);
                     const double base_dmg = number(*slot.stats, "damage", 315.0);

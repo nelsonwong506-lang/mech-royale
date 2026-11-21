@@ -24,7 +24,6 @@ namespace {
 
 using namespace std::chrono_literals;
 constexpr double infinity = std::numeric_limits<double>::infinity();
-constexpr std::array angles{0, 30, -30, 60, -60, 90, -90, 135, -135, 180};
 
 struct Command {
     Vec2 move{};
@@ -229,15 +228,15 @@ public:
         }
 
         // Dynamic Fight-First + Regen-to-100% Rule:
-        // Never abandon a finishable kill or winning 1v1; once safely regenerating, heal to ~100% (98%)
+        // Never abandon a finishable kill or winning 1v1; once safely regenerating, heal to ~100% (96%)
         // unless zone urgency, finishable kill, or clear enemy opening!
-        const bool finishableClose = threat && threat->position && threat->hp <= 540.0 &&
+        const bool finishableClose = threat && threat->position && threat->hp <= 520.0 &&
             distanceXY(start, *threat->position) <= 75.0 && hpFrac >= 0.22;
         const bool winning1v1 = close80 <= 1 && threat && threat->position &&
             threat->hp < hp * 0.85 && hpFrac >= 0.25;
-        if (!inZone || window.urgent || hpFrac >= 0.98 || finishableClose || winning1v1 || enemyOpening) {
+        if (!inZone || window.urgent || hpFrac >= 0.96 || finishableClose || winning1v1 || enemyOpening) {
             regenMode_ = false;
-        } else if (hpFrac < 0.42 || (hpFrac < 0.68 && (onRoof || exposedNow == 0 || hasNanites))) {
+        } else if (hpFrac < 0.42 || (hpFrac < 0.65 && (onRoof || exposedNow == 0 || hasNanites))) {
             regenMode_ = true;
         }
 
@@ -262,7 +261,8 @@ public:
 
         const auto& weapons = me.contains("weapons") && me["weapons"].is_array() ? me["weapons"] : Json::array();
         const bool laserCharging = isLaserCharging(weapons);
-        const bool holdFireForRegen = regenMode_ && exposedNow == 0 && !laserCharging;
+        const bool takingDamageNow = (now - threats_.last_damage_time()) <= 1.1;
+        const bool holdFireForRegen = regenMode_ && !underThreat && !takingDamageNow && exposedNow == 0 && !laserCharging;
         const bool effectiveFireAllowed = decision.fireAllowed && !holdFireForRegen;
 
         const bool canJoin = duel && !underThreat && !regenMode_ && !peek_ && !hop_ && inZone && !window.urgent;
@@ -331,10 +331,14 @@ public:
         action["fire"] = fire;
 
         const bool anyFire = fire[0] || fire[1] || laserCharging;
-        // Hidden Auto-Reload: whenever safely tucked behind hard cover / roof core (exposedNow == 0)
-        // or actively tucking on a roof in regenMode_, reload anytime mag < 8 (out of 12)!
-        const double earlyReloadThreshold = (close70 == 0 && !underThreat) ? 8.0
-            : ((exposedNow == 0 && (shelteredAt_.has_value() || onRoof)) || (onRoof && regenMode_)) ? 7.0 : 0.0;
+        // CRITICAL: Never trigger an early reload while actively targeting an enemy, crate, NPC, or duel
+        // (even during the 0.14s inter-shot cooldown tick when fire[0] is false!).
+        // Only auto-reload when no active shot exists (e.g., tucked behind cover or out of combat).
+        const bool activelyTargeting = (!regenMode_ || underThreat) &&
+            ((shot.has_value() && !holdFireForRegen) || joining || defending || canJoin);
+        const double earlyReloadThreshold = activelyTargeting ? 0.0
+            : (close70 == 0 && !underThreat) ? 5.0
+            : ((exposedNow == 0 && (shelteredAt_.has_value() || onRoof)) || (onRoof && regenMode_)) ? 6.0 : 0.0;
         bool shouldReload = false;
         if (!anyFire) {
             shouldReload = std::any_of(weapons.begin(), weapons.end(), [earlyReloadThreshold](const Json& weapon) {
@@ -742,19 +746,18 @@ private:
         // User's Storm-Finish Rule: allow brief early/mid storm tanking (dps <= 60, ample HP, near border)
         // to finish a low-HP 1v1 kill before rotating into the safe zone!
         const bool canFinishInStorm = (!inZone || window.urgent) && threat && threat->position &&
-            !threat->is_npc && close80 <= 1 && threat->hp <= 420.0 &&
-            distanceXY(start, *threat->position) <= 62.0 &&
-            zone.dps <= 60.0 && hp >= 580.0 && hpFrac >= 0.42 &&
-            zone.clearance(start, zone.now) >= -36.0;
+            !threat->is_npc && close80 <= 1 && threat->hp <= 380.0 &&
+            distanceXY(start, *threat->position) <= 55.0 &&
+            zone.dps <= 60.0 && hp >= 600.0 && hpFrac >= 0.42 &&
+            zone.clearance(start, zone.now) >= -30.0;
 
         if (threat && threat->position && ((!window.urgent && inZone) || canFinishInStorm)) {
             const double threatDist = distanceXY(start, *threat->position);
-            const int alive = obs.value("alive", 16);
-            // Early snowball hunt: actively engage & finish isolated 1v1 weak bots up to 140m instead of running away!
-            const bool earlyHunt1v1 = alive >= 11 && enemyInfos.size() == 1 && exposedNow == 1 &&
-                hpFrac >= 0.65 && !regenMode_ && !threat->is_npc && threatDist <= 140.0;
+            // Only enter defensive regen cover when an enemy is within 70m or has LOS; if all enemies are
+            // > 70m away and out of LOS, keep moving/looting/rotating while holding fire to regenerate!
+            const bool needRegenCover = regenMode_ && (exposedNow > 0 || threatDist <= 70.0 || onRoof);
             const bool activeCombat = threat->hostile || threat->damaged_recently ||
-                threat->laser_charging || threatDist <= 70.0 || regenMode_ || earlyHunt1v1 || canFinishInStorm;
+                threat->laser_charging || threatDist <= 70.0 || needRegenCover || canFinishInStorm;
 
             if (activeCombat) {
                 if (zone.now >= nextStrafeFlipAt_ || (zone.now - threats_.last_damage_time() <= 0.15 && zone.now >= nextStrafeFlipAt_ - 0.8)) {
@@ -971,10 +974,9 @@ private:
         const bool blocked = threat->facing_us && wallBehind(start, away, motion);
         if (zone.now >= nextHopAt_ && exposed && (laser || threat->damaged_recently || blocked)) {
             const auto path = planDefensiveHop(me, *threat, enemies, zone, motion, arena_, navigator_, laser, blocked, deadline);
-            // Allow defensive hop when it gains cover (>=2/3), or under close-range/multi-enemy pressure;
-            // only skip pointless open-field single-bullet hops at long range (> 45m, 1v1, 0 cover).
-            const bool goodHop = path && (wallCover(path->landing, enemy, motion.height, arena_) >= 2 ||
-                                          distanceXY(start, enemy) <= 45.0 || enemies.size() >= 2);
+            // Only hop when dodging a charging laser, escaping a pinning wall behind us, or jumping INTO cover (>=2/3)!
+            // Never jump into 0-cover open air on normal gun fire (which disables 19.5 m/s ground boost & 58.5 m/s^2 ground strafing).
+            const bool goodHop = path && wallCover(path->landing, enemy, motion.height, arena_) >= 2;
             if (path && (laser || blocked || goodHop) && keepsRotation(start, path->landing, zone, window)) {
                 const auto label = laser ? "laser-hop" : blocked ? "wall-hop" : "cover-hop";
                 hop_ = ActiveHop{*path, zone.now, label};
@@ -1177,7 +1179,7 @@ private:
         }
         const double remaining = std::max(0.0, zone.end - zone.now);
         if (!target && grounded && zone.now >= considerFlightAt_ && !insideNext && energy > maximum * 0.35 &&
-            (goals_.empty() || navigator_.searchExhausted() || (complete && eta > remaining * 1.2))) {
+            (outside || goals_.empty() || navigator_.searchExhausted() || (complete && eta > remaining * 1.2))) {
             considerFlightAt_ = zone.now + 0.7;
             flight_ = navigator_.flightPlan(start, goals_, zone, motion, energy, maximum,
                                             std::min(hardDeadline, Clock::now() + 4ms));
@@ -1222,9 +1224,18 @@ private:
             if (escape) target = escape;
         }
         monitorProgress(start, target, zone.now, navigator_.isSearching());
-        const bool boost = grounded && target && !insideNext && (outside || eta + 3 > window.secondsUntilRisk) &&
+        const bool boost = grounded && target &&
+            ((!insideNext && (outside || eta + 4.5 > window.secondsUntilRisk)) ||
+             (hostileNow && energy > 0.35 * maximum)) &&
             energy > 0.2 * maximum + motion.boostDrain * 0.2;
-        auto command = groundCommand(start, target, me, zone, motion, boost, outside ? std::vector<Vec3>{} : enemies, window.urgent);
+        Zone moveZone = zone;
+        if (outside || (window.urgent && route.empty())) {
+            // When already outside the zone or routing around a blocking building wall under urgent rotation,
+            // enforce 100% prism/wall collision safety without letting Zone::segment trap us against a wall!
+            moveZone.radius += 120.0;
+            moveZone.nextRadius += 120.0;
+        }
+        auto command = groundCommand(start, target, me, moveZone, motion, boost, outside ? std::vector<Vec3>{} : enemies, window.urgent);
         if (window.urgent && (outside || zone.clearance(start, zone.now + 0.55) < 0) &&
             std::hypot(command.move[0], command.move[1]) < 0.12) {
             auto current = zone;
@@ -1244,17 +1255,18 @@ private:
         return {command, outside ? "recover-zone" : labelOverride ? labelOverride : "rotate"};
     }
 
-    // Refuse to leave cover or walk into enemy LOS just to greed a cube/pickup when another enemy is watching.
+    // Refuse to leave cover or walk into close enemy LOS just to greed a cube/pickup when an enemy is watching.
     bool lootPointSafe(const Vec3& start, const Vec3& itemPos, const std::vector<EnemyInfo>& enemyInfos,
                        const Motion& motion, double hpFrac) const {
         for (const auto& e : enemyInfos) {
             const double enemyToItem = distanceXY(e.pos, itemPos);
-            if (enemyToItem > 175.0) continue;
+            if (enemyToItem > 135.0) continue;
             const bool itemExposed = wallCover(itemPos, e.pos, motion.height, arena_) < 3;
             if (!itemExposed) continue;
             const bool currentlyCovered = wallCover(start, e.pos, motion.height, arena_) == 3;
-            if (currentlyCovered) return false;
-            if (e.facing_us || e.charging || enemyToItem < 75.0 || regenMode_ || hpFrac < 0.70) {
+            if (currentlyCovered && enemyToItem < 110.0) return false;
+            if (enemyToItem < 52.0) return false;
+            if ((e.facing_us || e.charging) && (enemyToItem < 95.0 || hpFrac < 0.50)) {
                 return false;
             }
         }
@@ -1406,7 +1418,7 @@ private:
                 if (myCubes >= cubeStatCap_ && distanceXY(start, cube) > 10.0) {
                     continue;
                 }
-                if (const auto target = evaluateItem(cube, 3.5)) {
+                if ( const auto target = evaluateItem(cube, 5.5)) {
                     return target;
                 }
             }
@@ -1420,32 +1432,41 @@ private:
         const Vec2 center = destination.value_or(zone.nextRadius < zone.radius ? zone.nextCenter : zone.circle(zone.now + 0.8).first);
         const double yaw = std::atan2(center[1] - start[1], center[0] - start[0]);
         const double startDist = distanceXY(start, center);
+        const bool outsideNow = zone.clearance(start, zone.now) < 0.5;
         double bestSafeScore = -infinity;
         std::optional<Vec3> bestSafe;
         double bestFallbackScore = -infinity;
         std::optional<Vec3> bestFallback;
-        for (const double length : {7.0, 3.5}) {
-            for (const int offset : angles) {
+        constexpr std::array<int, 14> slideAngles{0, 25, -25, 50, -50, 75, -75, 95, -95, 115, -115, 140, -140, 180};
+        for (const double length : {11.0, 7.5, 4.0}) {
+            for (const int offset : slideAngles) {
                 if (Clock::now() >= deadline) {
                     return bestSafe ? bestSafe : bestFallback;
                 }
                 const double angle = yaw + radians(offset);
                 const Vec2 xy{start[0] + length * std::cos(angle), start[1] + length * std::sin(angle)};
                 const double progress = startDist - distanceXY(xy, center);
-                if (progress <= 0.1) {
+                // When direct paths (>0.1m progress) are clear, prefer them; when blocked by a wide perpendicular wall,
+                // allow +-75/95/115 deg wall-sliding steps so we never freeze at move={0,0} against a building!
+                if (progress < -0.65 * length) {
                     continue;
                 }
                 const auto point = navigator_.support(xy, motion, start[2] + motion.step);
-                if (!point || !navigator_.direct(start, *point, zone, motion)) {
+                const bool reachable = point && (outsideNow
+                    ? navigator_.walkable(start, *point, motion)
+                    : navigator_.direct(start, *point, zone, motion));
+                if (!reachable) {
                     continue;
                 }
+                const double slideBias = (offset * strafeSign_ >= 0) ? 0.45 : 0.0;
+                const double baseScore = progress + slideBias;
                 if (avoidsApproach(start, xy, enemies)) {
-                    if (progress > bestSafeScore) {
-                        bestSafeScore = progress;
+                    if (baseScore > bestSafeScore) {
+                        bestSafeScore = baseScore;
                         bestSafe = point;
                     }
                 } else {
-                    const double score = progress - 0.35 * approachPenalty(start, xy, enemies);
+                    const double score = baseScore - 0.35 * approachPenalty(start, xy, enemies);
                     if (score > bestFallbackScore) {
                         bestFallbackScore = score;
                         bestFallback = point;
@@ -1557,13 +1578,7 @@ private:
                 flight_.reset();
                 return {};
             }
-            const Vec2 toLanding = direction(start, flight.landing);
-            const double velTowardLanding = velocity[0] * toLanding[0] + velocity[1] * toLanding[1];
-            const double speedXY = std::hypot(velocity[0], velocity[1]);
-            // Running jump-jet: launch immediately without braking to a dead stop when at takeoff and moving toward landing!
-            const bool readyToLaunch = distanceXY(start, flight.takeoff) <= 1.8 &&
-                (speedXY <= 2.5 || velTowardLanding >= -0.5);
-            if (!readyToLaunch) {
+            if (distanceXY(start, flight.takeoff) > 1.0 || std::hypot(velocity[0], velocity[1]) > 2) {
                 return groundCommand(start, flight.takeoff, me, zone, motion, false);
             }
             const Vec3 vertical{start[0], start[1], flight.apex};
