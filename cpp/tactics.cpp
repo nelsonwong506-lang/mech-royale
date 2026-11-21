@@ -1740,10 +1740,6 @@ std::optional<GunShot> ThreatTracker::visible_shot(const Json& obs, const Arena&
     int light_slot = -1;
     double light_range = 42.0;
     bool light_spare_ready = false;
-    int laser_crate_slot = -1;
-    double laser_crate_charge = 0.0;
-    double laser_crate_full = 0.75;
-    bool laser_crate_ready = false;
     for (std::size_t s = 0; s < slot_count; ++s) {
         if (slots[s].kind == "gun") {
             gun_slot = slots[s].index;
@@ -1752,20 +1748,14 @@ std::optional<GunShot> ThreatTracker::visible_shot(const Json& obs, const Arena&
         } else if (slots[s].kind == "lightning") {
             light_slot = slots[s].index;
             light_range = slots[s].range;
-            light_spare_ready = slots[s].ready && my_energy > (has_gun_slot ? 45.0 : 22.0);
-        } else if (slots[s].kind == "laser" && !has_gun_slot && allow_laser_charge) {
-            laser_crate_slot = slots[s].index;
-            laser_crate_charge = slots[s].charge;
-            laser_crate_full = std::max(0.15, number(*slots[s].stats, "charge", 0.75));
-            laser_crate_ready = slots[s].ready || slots[s].charge > 0.0;
+            light_spare_ready = slots[s].ready && my_energy > 45.0;
         }
     }
     const auto& crates = field(obs, "crates");
-    if ((gun_spare_ready || light_spare_ready || laser_crate_ready) && crates.is_array()) {
+    if ((gun_spare_ready || light_spare_ready) && crates.is_array()) {
         const Vec3 origin = muzzle(me);
-        const double max_crate_range = std::max({gun_spare_ready ? gun_range : 0.0,
-                                                 light_spare_ready ? light_range : 0.0,
-                                                 laser_crate_ready ? 70.0 : 0.0});
+        const double max_crate_range = std::max(gun_spare_ready ? gun_range : 0.0,
+                                                light_spare_ready ? light_range : 0.0);
         double nearest_crate = std::numeric_limits<double>::infinity();
         for (const auto& crate : crates) {
             if (Clock::now() >= deadline) {
@@ -1789,12 +1779,6 @@ std::optional<GunShot> ThreatTracker::visible_shot(const Json& obs, const Arena&
             if (light_slot >= 0 && light_spare_ready && dist <= light_range &&
                 std::abs(std::remainder((*aim)[0] - actual[0], Tau)) <= radians(13.0)) {
                 gs.fire[static_cast<std::size_t>(light_slot)] = true;
-            } else if (laser_crate_slot >= 0 && laser_crate_ready && dist > light_range && dist <= 70.0) {
-                const bool aligned = aim_aligned(*aim, actual, dist, 1.3, 0.0) &&
-                    clear_aim_line(origin, actual, dist, arena);
-                // Charge laser to one-shot 300 HP crate (315 dmg at full charge) and release when aligned!
-                const bool release = laser_crate_charge >= laser_crate_full - 0.03 && aligned;
-                gs.fire[static_cast<std::size_t>(laser_crate_slot)] = !release;
             }
             gs.crate = true;
             best = gs;

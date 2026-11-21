@@ -330,35 +330,29 @@ std::optional<CombatMove> planCombatPosition(const Vec3& from, const Threat& pri
     const bool focusFinishable = focusHp <= 420.0 && hpFrac >= 0.25;
 
     // Weapon-Triangle optimal distance counterplay:
-    // - Lightning vs Laser: close in to lightningRange - 8m to short-circuit laser & melt at 240 DPS!
-    // - Laser vs Mortar: hold 88m for +60% Cook-off (504-705 dmg) outside easy mortar range!
+    // - Laser vs Mortar: hold 85m for +60% Cook-off (504+ dmg) outside easy mortar range!
+    // - Lightning vs Laser: close in to lightningRange - 9m ONLY when already near range (<= lightningRange + 6m) or finishable!
     // - Mortar vs Lightning: hold 48m to knockback + drain 45 energy outside arc range!
-    // - Dual Laser+Lightning: zap close (<= lightningRange+10) in 1v1, snipe at 72m otherwise!
-    double optimalRange = 44.0;
+    double optimalRange = 42.0;
     const double safeLightIn = std::max(20.0, ctx.lightningRange - 9.0);
-    if (ctx.hasLaser && focusHasMortar) {
-        optimalRange = 88.0;
-    } else if (ctx.hasLightning && focusHasLaser && !multiEnemy && hpFrac >= 0.50 && ctx.energy >= 22.0) {
+    if (ctx.hasLaser && focusHasMortar && !ctx.hasLightning) {
+        optimalRange = 85.0;
+    } else if (ctx.hasLightning && focusHasLaser && !multiEnemy && hpFrac >= 0.50 && ctx.energy >= 22.0 &&
+               (startFocusDist <= ctx.lightningRange + 6.0 || focusFinishable)) {
         optimalRange = safeLightIn;
     } else if (focusHasLightning && ctx.hasMortar && !ctx.hasLightning) {
         optimalRange = 48.0;
-    } else if (ctx.hasLightning && ctx.hasLaser && !ctx.hasGun) {
-        if (!multiEnemy && ctx.energy >= 22.0 && (startFocusDist <= ctx.lightningRange + 10.0 || focusFinishable) && !focusHasMortar) {
-            optimalRange = safeLightIn;
-        } else {
-            optimalRange = 72.0;
-        }
     } else if (ctx.hasLightning && ctx.energy >= 18.0 && !focusHasMortar) {
-        optimalRange = focusFinishable ? std::max(18.0, safeLightIn - 6.0) : safeLightIn;
+        optimalRange = focusFinishable ? std::max(18.0, safeLightIn - 6.0) : std::min(31.0, safeLightIn);
     } else if (ctx.hasLaser && !ctx.hasLightning) {
-        optimalRange = 76.0;
+        optimalRange = 75.0;
     } else if (ctx.hasMortar && !ctx.hasLightning) {
         optimalRange = 55.0;
     } else if (focusFinishable) {
         optimalRange = 28.0;
     }
-    if (focusHasLightning && !(ctx.hasLightning && (focusFinishable || focusHasLaser))) {
-        optimalRange = std::max(optimalRange, 56.0);
+    if (focusHasLightning && !(ctx.hasLightning && focusFinishable)) {
+        optimalRange = std::max(optimalRange, 54.0);
     }
 
     // Compute pinch escape vector (away from enemy centroid) so we break out of flanks.

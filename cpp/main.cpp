@@ -105,17 +105,17 @@ int upgradePriority(const Json& choice) {
             const std::string_view id = idIt->get_ref<const std::string&>();
             if (id == "nanites") return 100;
             if (id == "armor") return 96;
-            if (id == "plating") return 93;
-            if (id == "laser_charge") return 91;
+            if (id == "plating") return 92;
             if (id == "lightning_efficiency") return 90;
-            if (id == "laser_damage") return 89;
             if (id == "lightning_chain") return 88;
-            if (id == "lightning_range") return 87;
-            if (id == "gun_damage") return 83;
-            if (id == "gun_rate") return 81;
-            if (id == "laser_pierce") return 79;
-            if (id == "gun_mag") return 77;
+            if (id == "lightning_range") return 86;
+            if (id == "gun_damage") return 84;
+            if (id == "gun_rate") return 82;
+            if (id == "laser_charge") return 80;
+            if (id == "laser_damage") return 79;
+            if (id == "gun_mag") return 78;
             if (id == "servos") return 76;
+            if (id == "laser_pierce") return 72;
             if (id == "reactor") return 70;
             if (id == "jets") return 65;
             if (id == "mortar_reload") return 64;
@@ -262,8 +262,7 @@ public:
         const bool joining = effectiveFireAllowed && canJoin && opportunity_fire(obs, duel, arena_);
 
         const double myCubes = me.value("cubes", 0.0);
-        const bool hasDreamLoadout = hasWeaponKind(weapons, "laser") && hasWeaponKind(weapons, "lightning");
-        const bool needsSecondary = countHeldWeapons(weapons) < 2 || !hasDreamLoadout;
+        const bool needsSecondary = countHeldWeapons(weapons) < 2;
         const bool allowCrates = !underThreat && !regenMode_ && inZone && !peek_ && !hop_ &&
             (myCubes < cubeStatCap_ || needsSecondary);
         const bool allowNpcs = !underThreat && !regenMode_ && inZone && !peek_ && !hop_ &&
@@ -273,15 +272,12 @@ public:
         }));
         const bool allowLaserCharge = !window.urgent && inZone && !(threat && threat->laser_charging) &&
             (onRoof || close35 == 0) && !regenMode_;
-        const std::string_view decLabel = decision.label ? std::string_view(decision.label) : std::string_view{};
-        const bool prechargeLaser = allowLaserCharge && hasWeaponKind(weapons, "laser") &&
-            ((peek_.has_value() && !peek_->returning) || decLabel == "split-1v1" || decLabel == "flank");
 
         const auto shotDeadline = std::min(tickStarted + 34ms, Clock::now() + 5ms);
         std::optional<GunShot> shot;
         if ((effectiveFireAllowed || laserCharging) && !joining) {
             shot = threats_.visible_shot(obs, arena_, threat, shotDeadline, allowCrates, allowNpcs,
-                                         allowLaserCharge, lastTargetId_, prechargeLaser);
+                                         allowLaserCharge, lastTargetId_, false);
         }
         if (shot && !shot->crate && !shot->npc && shot->target_id >= 0) {
             lastTargetId_ = shot->target_id;
@@ -432,42 +428,28 @@ private:
         return false;
     }
 
-    // Determine whether we want to pick up a weapon kind, and which slot to drop (or -1 if empty slot / not wanted).
-    // Supports dropping the starter gun to assemble the premier dual-power loadout: laser + lightning!
+    // Keep the full-speed gun in slot 0 and upgrade slot 1 (lightning > laser > mortar).
     static std::pair<bool, int> desiredSwapSlot(const Json& weapons, std::string_view kind) {
         if (kind.empty() || kind == "gun" || hasWeaponKind(weapons, kind)) {
             return {false, -1};
         }
         int emptySlot = -1;
-        int gunSlot = -1;
-        int mortarSlot = -1;
         if (weapons.is_array()) {
             for (std::size_t i = 0; i < 2; ++i) {
                 if (i >= weapons.size() || weapons[i].is_null()) {
-                    if (emptySlot < 0) emptySlot = static_cast<int>(i);
-                } else if (weapons[i].is_object()) {
-                    const auto held = weapons[i].value("kind", std::string{});
-                    if (held == "gun") gunSlot = static_cast<int>(i);
-                    else if (held == "mortar") mortarSlot = static_cast<int>(i);
+                    emptySlot = static_cast<int>(i);
+                    break;
                 }
             }
         }
         if (emptySlot >= 0) {
             return {true, -1};
         }
-        const bool haveLaser = hasWeaponKind(weapons, "laser");
-        const bool haveLightning = hasWeaponKind(weapons, "lightning");
-        // Dream loadout already assembled: never drop laser or lightning!
-        if (haveLaser && haveLightning) {
-            return {false, -1};
-        }
-        // Upgrade mortar -> lightning or mortar -> laser (avoids Cook-off!).
-        if (mortarSlot >= 0 && (kind == "lightning" || kind == "laser")) {
-            return {true, mortarSlot};
-        }
-        // Drop starter gun to assemble dual power weapons (laser + lightning)!
-        if (gunSlot >= 0 && ((haveLightning && kind == "laser") || (haveLaser && kind == "lightning"))) {
-            return {true, gunSlot};
+        if (weapons.is_array() && weapons.size() >= 2 && weapons[1].is_object()) {
+            const int slot1Prio = weaponPriority(weapons[1].value("kind", std::string{}));
+            if (weaponPriority(kind) > slot1Prio) {
+                return {true, 1};
+            }
         }
         return {false, -1};
     }
@@ -741,11 +723,15 @@ private:
              (insideNext && !underThreat && !regenMode_ && countHeldWeapons(weapons) >= 2 && me.value("cubes", 0.0) >= 4.0));
         if (wantRoof) {
             considerRoofAt_ = zone.now + 1.5;
-            // Prefer 6.0-16.5 m golden rooftops first (no -0.7 rad pitch dead zone & low jet cost!), then 16.5-23 m.
-            auto roofs = arena_.nearbyRooftops(start, 38.0, 6.0, 16.5, motion.radius, motion.height);
-            if (roofs.empty()) {
-                roofs = arena_.nearbyRooftops(start, 38.0, 16.5, 23.0, motion.radius, motion.height);
-            }
+            // Query all 6-26 m campus roofs, preferring golden 6-16.5 m height first (no -0.7 rad dead zone)
+            // without ever skipping reachable 16.5-26 m buildings!
+            auto roofs = arena_.nearbyRooftops(start, 38.0, 6.0, 26.0, motion.radius, motion.height);
+            std::stable_sort(roofs.begin(), roofs.end(), [&](const Vec3& a, const Vec3& b) {
+                const bool aGold = (a[2] - start[2]) <= 16.5;
+                const bool bGold = (b[2] - start[2]) <= 16.5;
+                if (aGold != bGold) return aGold;
+                return distanceXY(start, a) < distanceXY(start, b);
+            });
             const auto roofDeadline = std::min(hardDeadline, Clock::now() + 4ms);
             for (const auto& roof : roofs) {
                 if (Clock::now() >= roofDeadline) break;
@@ -1323,30 +1309,21 @@ private:
     std::optional<Vec3> pickup(const Json& obs, const Vec3& start, const std::optional<Threat>& threat,
                                const std::vector<EnemyInfo>& enemyInfos, const Zone& zone,
                                const Motion& motion, const Goals& route, bool complete, bool urgentZone) {
+        (void)urgentZone;
         const auto& me = obs.contains("self") && obs["self"].is_object() ? obs["self"] : Json::object();
         const double hpFrac = me.value("hp", 1400.0) / std::max(1.0, me.value("max_hp", 1400.0));
         const bool hostileThreat = threat && (threat->hostile || threat->damaged_recently || threat->laser_charging);
-        if (hostileThreat || !me.value("in_zone", false)) {
-            return {};
-        }
-        const bool partialRouteMode = !complete && !zone.inNext(start, motion.radius + 4);
-        if (partialRouteMode && urgentZone) {
+        if (hostileThreat || !me.value("in_zone", false) ||
+            (!complete && !zone.inNext(start, motion.radius + 4))) {
             return {};
         }
         const double base = navigator_.pathTime(start, route, motion.walk);
-        auto evaluateItem = [&](const Vec3& pos, double maxDetourSec, double maxPartialDist) -> std::optional<Vec3> {
+        auto evaluateItem = [&](const Vec3& pos, double maxDetourSec) -> std::optional<Vec3> {
             const auto point = navigator_.support(horizontal(pos), motion, pos[2] + 4.0);
             if (!point || std::abs((*point)[2] - pos[2]) > 4.0 || !navigator_.direct(start, *point, zone, motion)) {
                 return std::nullopt;
             }
             if (!lootPointSafe(start, *point, enemyInfos, motion, hpFrac)) {
-                return std::nullopt;
-            }
-            if (partialRouteMode) {
-                if (distanceXY(start, *point) <= maxPartialDist &&
-                    zone.clearance(horizontal(*point), zone.now + 6.0) > motion.radius + 2.0) {
-                    return point;
-                }
                 return std::nullopt;
             }
             if (!route.empty() && !navigator_.walkable(*point, route.front(), motion)) {
@@ -1367,7 +1344,7 @@ private:
             return std::nullopt;
         };
 
-        // 1. Prioritize weapon pickups to assemble dual power weapons (laser + lightning)!
+        // 1. Prioritize weapon pickups (lightning > laser > mortar) when slot 1 is empty or upgradable.
         const auto& weapons = me.contains("weapons") && me["weapons"].is_array() ? me["weapons"] : Json::array();
         const bool needsSecondary = countHeldWeapons(weapons) < 2;
         if (const auto it = obs.find("pickups"); it != obs.end() && it->is_array()) {
@@ -1383,11 +1360,11 @@ private:
                 const auto pos = safeVec3(item, "pos", {infinity, infinity, 0.0});
                 if (!std::isfinite(pos[0])) continue;
                 const double dist = distanceXY(start, pos);
-                const double maxRange = needsSecondary ? 65.0 : 45.0;
+                const double maxRange = needsSecondary ? 65.0 : 35.0;
                 if (dist > maxRange || zone.clearance(horizontal(pos), zone.now) <= motion.radius) continue;
                 const double score = prio - dist * 1.4;
                 if (score > bestScore) {
-                    if (const auto target = evaluateItem(pos, needsSecondary ? 6.5 : 4.5, 24.0)) {
+                    if (const auto target = evaluateItem(pos, needsSecondary ? 6.5 : 3.5)) {
                         bestScore = score;
                         bestPickup = target;
                     }
@@ -1413,7 +1390,7 @@ private:
                 if (myCubes >= cubeStatCap_ && distanceXY(start, cube) > 10.0) {
                     continue;
                 }
-                if (const auto target = evaluateItem(cube, 3.5, 18.0)) {
+                if (const auto target = evaluateItem(cube, 3.5)) {
                     return target;
                 }
             }
