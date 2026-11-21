@@ -67,6 +67,11 @@ struct GunShot {
     bool firing() const { return fire[0] || fire[1]; }
 };
 
+struct ProjectileDodge {
+    Vec2 direction{};
+    bool urgent_mortar = false;
+};
+
 class ThreatTracker {
 public:
     explicit ThreatTracker(const Json& config);
@@ -82,6 +87,7 @@ public:
                                         bool allow_npcs = false,
                                         bool allow_laser_charge = true) const;
     std::vector<EnemyInfo> visible_enemies(const Json& obs, const Arena& arena) const;
+    std::optional<ProjectileDodge> projectile_dodge(const Json& obs, const Arena& arena) const;
     bool can_collect_cubes(const Json& obs) const;
     double last_combat_time() const;
     double last_damage_time() const;

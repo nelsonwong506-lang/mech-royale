@@ -11,7 +11,6 @@ namespace mr {
 namespace {
 
 constexpr double RetaliationSeconds = 3.0;
-constexpr double CubeDamageQuietSeconds = 3.5;
 constexpr double FreshHostileDamageSeconds = 0.35;
 constexpr double ProjectileLookahead = 0.45;
 constexpr double CubeDetourMeters = 24.0;
@@ -472,8 +471,100 @@ bool enemy_aims_at(const Threat& threat, const Vec3& feet, double radius, double
     return false;
 }
 
+std::optional<ProjectileDodge> ThreatTracker::projectile_dodge(const Json& obs, const Arena& arena) const {
+    const auto& projectiles = field(obs, "projectiles");
+    if (!projectiles.is_array() || projectiles.empty()) {
+        return std::nullopt;
+    }
+    const auto& me = field(obs, "self");
+    const Vec3 self_pos = point_or(me, "pos");
+    const Vec3 self_vel = point_or(me, "vel");
+    const auto& stats = field(me, "stats");
+    const double self_radius = number(stats, "radius", mech_radius_);
+    const double self_height = number(stats, "height", mech_height_);
+
+    // 1. Check incoming mortar shells first (360 dmg + knockback + energy drain!).
+    double soonest_mortar = std::numeric_limits<double>::infinity();
+    std::optional<Vec2> mortar_escape;
+    for (const auto& object : projectiles) {
+        if (text(field(object, "kind")) != "mortar") continue;
+        const auto pos = try_point(field(object, "pos"));
+        const auto vel = try_point(field(object, "vel"));
+        if (!pos || !vel) continue;
+        Vec3 prev = *pos;
+        for (int step = 1; step <= 30; ++step) {
+            const double t = step * 0.1;
+            const Vec3 next{(*pos)[0] + (*vel)[0] * t,
+                            (*pos)[1] + (*vel)[1] * t,
+                            (*pos)[2] + (*vel)[2] * t - 0.5 * mortar_gravity_ * t * t};
+            const double surf = arena.surface(next[0], next[1], std::max(prev[2], next[2]) + 1.0);
+            const bool hit = next[2] <= surf || arena.blocksPrismLine(prev, next);
+            if (hit) {
+                const double dist = distanceXY(self_pos, next);
+                if (dist <= self_radius + 8.8 && t < soonest_mortar) {
+                    soonest_mortar = t;
+                    const double dx = self_pos[0] - next[0];
+                    const double dy = self_pos[1] - next[1];
+                    const double norm = std::hypot(dx, dy);
+                    if (norm > 0.4) {
+                        mortar_escape = Vec2{dx / norm, dy / norm};
+                    } else {
+                        // Dead center on landing point: sprint perpendicular to shell velocity.
+                        const double vnorm = std::max(1.0, std::hypot((*vel)[0], (*vel)[1]));
+                        mortar_escape = Vec2{-(*vel)[1] / vnorm, (*vel)[0] / vnorm};
+                    }
+                }
+                break;
+            }
+            prev = next;
+        }
+    }
+    if (mortar_escape) {
+        return ProjectileDodge{*mortar_escape, true};
+    }
+
+    // 2. Accumulate perpendicular sidestep away from imminent gun / NPC bullets.
+    double dodge_x = 0.0, dodge_y = 0.0;
+    for (const auto& object : projectiles) {
+        const auto kind = text(field(object, "kind"));
+        if (kind != "gun" && kind != "npc") continue;
+        const auto pos = try_point(field(object, "pos"));
+        const auto vel = try_point(field(object, "vel"));
+        if (!pos || !vel) continue;
+        const double dx = (*pos)[0] - self_pos[0];
+        const double dy = (*pos)[1] - self_pos[1];
+        const double rvx = (*vel)[0] - self_vel[0];
+        const double rvy = (*vel)[1] - self_vel[1];
+        const double speed_sq = rvx * rvx + rvy * rvy;
+        if (speed_sq < 4.0) continue;
+        const double t = -(dx * rvx + dy * rvy) / speed_sq;
+        if (t <= 0.02 || t > 0.45) continue;
+        const double miss_x = dx + rvx * t;
+        const double miss_y = dy + rvy * t;
+        const double miss_dist = std::hypot(miss_x, miss_y);
+        if (miss_dist > self_radius + 1.3) continue;
+        const double bullet_z = (*pos)[2] + (*vel)[2] * t;
+        if (bullet_z < self_pos[2] - 0.6 || bullet_z > self_pos[2] + self_height + 0.6) continue;
+        const Vec3 impact{(*pos)[0] + (*vel)[0] * t, (*pos)[1] + (*vel)[1] * t, bullet_z};
+        if (arena.blocksLine(*pos, impact)) continue;
+        // Sidestep away from the bullet path; bias toward the side we're already slightly on.
+        const double vnorm = std::sqrt(speed_sq);
+        const double perp_x = -rvy / vnorm;
+        const double perp_y = rvx / vnorm;
+        const double side = (-miss_x * perp_x - miss_y * perp_y) >= 0.0 ? 1.0 : -1.0;
+        const double weight = 1.0 / std::max(0.08, t);
+        dodge_x += side * perp_x * weight;
+        dodge_y += side * perp_y * weight;
+    }
+    const double dodge_norm = std::hypot(dodge_x, dodge_y);
+    if (dodge_norm > 1e-3) {
+        return ProjectileDodge{{dodge_x / dodge_norm, dodge_y / dodge_norm}, false};
+    }
+    return std::nullopt;
+}
+
 bool ThreatTracker::can_collect_cubes(const Json& obs) const {
-    return match_time(obs) - last_damage_at_ >= CubeDamageQuietSeconds;
+    return match_time(obs) - last_damage_at_ >= 0.8;
 }
 
 double ThreatTracker::last_combat_time() const {
@@ -1246,12 +1337,12 @@ std::optional<GunShot> ThreatTracker::visible_shot(const Json& obs, const Arena&
                             laser_bonus = 130.0 + (target.has_mortar ? 140.0 : 0.0);
                         }
                     } else if (slot.ready && allow_laser_charge && !is_npc &&
-                               (target.has_mortar || dist > 45.0 || !gun_is_ready)) {
+                               (target.has_mortar || dist > 62.0 || !gun_is_ready || !target.facing_us)) {
                         laser_aim = aim;
                         laser_slot = slot.index;
                         laser_dist = dist;
                         laser_trigger = true;  // Start charging!
-                        laser_bonus = (target.has_mortar ? 150.0 : 40.0);
+                        laser_bonus = (target.has_mortar ? 160.0 : 45.0);
                     }
                 } else if (slot.kind == "mortar" && slot.ready && !is_npc) {
                     const double speed = number(*slot.stats, "speed", 72.0);

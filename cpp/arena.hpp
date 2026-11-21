@@ -26,6 +26,8 @@ public:
     bool flightSegment(const Vec3& start, const Vec3& end, double radius, double height) const;
     bool blocksPrismLine(const Vec3& start, const Vec3& end) const;
     bool blocksLine(const Vec3& start, const Vec3& end) const;
+    std::vector<Vec3> nearbyRooftops(const Vec3& from, double maxRange, double minRise,
+                                     double maxRise, double radius, double height) const;
 
 private:
     struct Edge {

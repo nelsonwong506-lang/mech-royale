@@ -411,6 +411,50 @@ std::optional<Flight> Navigator::flightPlan(const Vec3& from, const std::vector<
     return std::nullopt;
 }
 
+std::optional<Flight> Navigator::flightToRoof(const Vec3& from, const Vec3& landing, const Zone& zone,
+                                              const Motion& motion, double energy, double maximum,
+                                              Clock::time_point deadline) {
+    if (Clock::now() >= deadline || distanceXY(from, landing) > 45.0) {
+        return std::nullopt;
+    }
+    if (zone.clearance(landing, zone.now + 10.0) < motion.radius + 1.0 && !zone.inNext(landing, motion.radius)) {
+        return std::nullopt;
+    }
+    const Vec2 away = direction(landing, from);
+    for (const double shift : {0.0, 4.5, 9.0}) {
+        if (Clock::now() >= deadline) {
+            return std::nullopt;
+        }
+        const Vec2 startPoint{from[0] + away[0] * shift, from[1] + away[1] * shift};
+        const auto takeoff = support(startPoint, motion, from[2] + motion.step);
+        if (!takeoff || !direct(from, *takeoff, zone, motion)) {
+            continue;
+        }
+        const double apex = std::max((*takeoff)[2], landing[2]) + 2.2;
+        const double climb = std::max(0.3, (apex - (*takeoff)[2] - 0.6) / std::max(1.0, motion.rise) + 0.22);
+        const double across = distanceXY(*takeoff, landing) / std::max(1.0, motion.walk) + 0.35;
+        const double down = std::sqrt(2 * std::max(0.1, apex - landing[2]) / motion.gravity) + 0.25;
+        const double seconds = climb + across + down;
+        if (energy - (climb + across) * motion.jetDrain < 0.18 * maximum) {
+            continue;
+        }
+        const double at = zone.now + distanceXY(from, *takeoff) / motion.walk;
+        if (!zone.segment(*takeoff, *takeoff, at, climb)
+            || !zone.segment(*takeoff, landing, at + climb, across)
+            || !zone.segment(landing, landing, at + climb + across, down)) {
+            continue;
+        }
+        const Vec3 aboveTakeoff{(*takeoff)[0], (*takeoff)[1], apex};
+        const Vec3 aboveLanding{landing[0], landing[1], apex};
+        if (arena_.flightSegment(*takeoff, aboveTakeoff, motion.radius, motion.height)
+            && arena_.flightSegment(aboveTakeoff, aboveLanding, motion.radius, motion.height)
+            && arena_.flightSegment(aboveLanding, landing, motion.radius, motion.height)) {
+            return Flight{*takeoff, landing, apex, climb, seconds};
+        }
+    }
+    return std::nullopt;
+}
+
 bool Navigator::guard(const Vec2& move, bool boost, const Json& me, const Zone& zone,
                        const Motion& motion, bool jet) {
     const Vec3 start = safeVec3(me, "pos");

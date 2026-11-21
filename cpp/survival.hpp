@@ -38,7 +38,10 @@ struct CombatContext {
     bool reloading = false;
     bool wantRegen = false;
     bool needReposition = false;
+    bool onRoof = false;
     Vec3 anchor{};
+    Vec2 velocity{};
+    std::optional<Vec2> bulletDodge;
 };
 
 struct CombatMove {

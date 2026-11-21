@@ -477,8 +477,24 @@ std::optional<CombatMove> planCombatPosition(const Vec3& from, const Threat& pri
 
         // Escape-pinch alignment bonus when outnumbered or defensive.
         const double moveYaw = std::atan2(xy[1] - from[1], xy[0] - from[0]);
+        const Vec2 moveDir{std::cos(moveYaw), std::sin(moveYaw)};
         const double escapeAlign = std::cos(moveYaw - escapeYaw);
         const double pinchBonus = (multiEnemy || defensive) ? 8.5 * escapeAlign : 0.0;
+
+        // Momentum continuity: smooth high-speed circular strafing instead of left-right jitter.
+        const double velSpeed = std::hypot(ctx.velocity[0], ctx.velocity[1]);
+        const double momentumBonus = velSpeed > 1.5
+            ? 3.8 * (moveDir[0] * ctx.velocity[0] + moveDir[1] * ctx.velocity[1]) / velSpeed
+            : 0.0;
+
+        // Incoming bullet sidestep bias.
+        const double dodgeBonus = ctx.bulletDodge
+            ? 14.0 * (moveDir[0] * (*ctx.bulletDodge)[0] + moveDir[1] * (*ctx.bulletDodge)[1])
+            : 0.0;
+
+        // Rooftop high-ground retention: don't accidentally step off a roof while fighting ground bots!
+        const bool staysElevated = ctx.onRoof && (*point)[2] >= from[2] - 1.5;
+        const double roofBonus = ctx.onRoof ? (staysElevated ? 22.0 : -26.0) : 0.0;
 
         // Penalize walking closer to non-focus enemies.
         double otherApproachPenalty = 0.0;
@@ -491,7 +507,7 @@ std::optional<CombatMove> planCombatPosition(const Vec3& from, const Threat& pri
             }
         }
 
-        const double score = exposureScore + pinchBonus + repositionBonus +
+        const double score = exposureScore + pinchBonus + repositionBonus + momentumBonus + dodgeBonus + roofBonus +
             (defensive ? 3.5 : 8.0) * lateral + (preferredSide ? 2.5 : 0.0) -
             (defensive ? 0.15 : 0.45) * rangeError - weaponDangerPenalty - rearRiskPenalty -
             0.55 * otherApproachPenalty + 0.32 * progress + 0.025 * std::min(40.0, clearance);

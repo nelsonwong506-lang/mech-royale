@@ -91,6 +91,9 @@ public:
     std::optional<Flight> flightPlan(const Vec3& from, const std::vector<Vec3>& goals, const Zone& zone,
                                      const Motion& motion, double energy, double maximum,
                                      Clock::time_point deadline);
+    std::optional<Flight> flightToRoof(const Vec3& from, const Vec3& landing, const Zone& zone,
+                                       const Motion& motion, double energy, double maximum,
+                                       Clock::time_point deadline);
     bool guard(const Vec2& move, bool boost, const Json& me, const Zone& zone,
                const Motion& motion, bool jet = false);
 

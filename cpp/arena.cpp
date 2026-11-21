@@ -423,4 +423,56 @@ bool Arena::blocksLine(const Vec3& start, const Vec3& end) const {
     return false;
 }
 
+std::vector<Vec3> Arena::nearbyRooftops(const Vec3& from, double maxRange, double minRise,
+                                        double maxRise, double radius, double height) const {
+    std::vector<Vec3> roofs;
+    const int firstX = bin(from[0] - maxRange), lastX = bin(from[0] + maxRange);
+    const int firstY = bin(from[1] - maxRange), lastY = bin(from[1] + maxRange);
+    std::vector<std::size_t> visited;
+    visited.reserve(32);
+
+    for (int bx = firstX; bx <= lastX; ++bx) {
+        for (int by = firstY; by <= lastY; ++by) {
+            const auto cell = bins_.find(binKey(bx, by));
+            if (cell == bins_.end()) continue;
+            for (const auto idx : cell->second) {
+                if (std::find(visited.begin(), visited.end(), idx) != visited.end()) continue;
+                visited.push_back(idx);
+                const auto& prism = prisms_[idx];
+                const double rise = prism.top - from[2];
+                if (rise < minRise || rise > maxRise) continue;
+                const double minX = prism.bounds[0], minY = prism.bounds[1];
+                const double maxX = prism.bounds[2], maxY = prism.bounds[3];
+                if (maxX - minX < radius * 2.4 || maxY - minY < radius * 2.4) continue;
+                const double cx = 0.5 * (minX + maxX), cy = 0.5 * (minY + maxY);
+                const double inset = radius + 1.4;
+                // Sample a point near the closest climbable edge of the roof plus its center.
+                const double nearX = std::clamp(from[0], minX + inset, maxX - inset);
+                const double nearY = std::clamp(from[1], minY + inset, maxY - inset);
+                const std::array<Vec2, 3> samples{{
+                    {nearX, nearY},
+                    {0.5 * (nearX + cx), 0.5 * (nearY + cy)},
+                    {cx, cy}
+                }};
+                for (const auto& s : samples) {
+                    if (distanceXY(from, s) > maxRange) continue;
+                    if (!prism.contains(s[0], s[1])) continue;
+                    if (bodyClear(s[0], s[1], prism.top, radius, height) &&
+                        std::abs(surface(s[0], s[1], prism.top + 0.5) - prism.top) <= 0.2) {
+                        roofs.push_back(Vec3{s[0], s[1], prism.top});
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    std::sort(roofs.begin(), roofs.end(), [&](const Vec3& a, const Vec3& b) {
+        return distanceXY(from, a) < distanceXY(from, b);
+    });
+    if (roofs.size() > 8) {
+        roofs.resize(8);
+    }
+    return roofs;
+}
+
 }  // namespace mr
