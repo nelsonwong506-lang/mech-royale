@@ -24,6 +24,7 @@ public:
     bool walkSegment(const Vec3& start, const Vec3& end, double radius, double height,
                      double stepUp, double maxSlopeDeg) const;
     bool flightSegment(const Vec3& start, const Vec3& end, double radius, double height) const;
+    bool blocksPrismLine(const Vec3& start, const Vec3& end) const;
     bool blocksLine(const Vec3& start, const Vec3& end) const;
 
 private:

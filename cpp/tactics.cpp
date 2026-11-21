@@ -15,6 +15,8 @@ constexpr double CubeDamageQuietSeconds = 5.0;
 constexpr double ProjectileLookahead = 0.4;
 constexpr double CubeDetourMeters = 20.0;
 constexpr double Tau = 6.283185307179586;
+constexpr std::array<std::string_view, 4> WeaponKinds{"gun", "mortar", "laser", "lightning"};
+constexpr std::size_t MortarIndex = 1;
 
 const Json& field(const Json& value, const char* key) {
     static const Json missing;
@@ -183,6 +185,12 @@ Shot shot_points(const Json& me, const Threat& threat, const Json& weapon_stats)
     return {origin, target, intercept};
 }
 
+double mortar_range(const Json& mortar) {
+    const double speed = number(mortar, "speed", 72.0);
+    const double gravity = std::max(1.0, number(mortar, "gravity", 22.0));
+    return number(mortar, "range", speed * speed / gravity);
+}
+
 }  // namespace
 
 ThreatTracker::ThreatTracker(const Json& config)
@@ -192,7 +200,77 @@ ThreatTracker::ThreatTracker(const Json& config)
       turn_rate_(number(field(config, "mech"), "turn_rate", 4.0)),
       pitch_rate_(number(field(config, "mech"), "pitch_rate", 3.0)),
       size_per_cube_(number(field(config, "cubes"), "size_per_cube", 0.05)),
-      mortar_gravity_(number(field(field(config, "weapons"), "mortar"), "gravity", 22.0)) {}
+      mortar_gravity_(number(field(field(config, "weapons"), "mortar"), "gravity", 22.0)) {
+    const auto& weapons = field(config, "weapons");
+    weapon_ranges_ = {number(field(weapons, "gun"), "range", 230.0), mortar_range(field(weapons, "mortar")),
+                      number(field(weapons, "laser"), "range", 280.0), number(field(weapons, "lightning"), "range", 45.0)};
+}
+
+Threat ThreatTracker::describe_enemy(const Json& actor, int id) const {
+    const double scale = 1 + size_per_cube_ * number(actor, "cubes", 0.0);
+    Threat threat;
+    threat.position = point(actor.at("pos"));
+    threat.actor_id = id;
+    threat.attack_radius = mech_radius_ * scale;
+    threat.attack_height = mech_height_ * scale;
+    const auto& aim = field(actor, "aim");
+    if (aim.is_array() && aim.size() >= 2) {
+        threat.enemy_aim = pair(aim);
+    }
+
+    const auto& weapons = field(actor, "weapons");
+    threat.enemy_muzzle_height = muzzle_height_ * scale;
+    if (!weapons.is_array()) {
+        // The protocol may omit loadout data. Every mech starts with a gun.
+        threat.enemy_range = weapon_ranges_.front();
+        return threat;
+    }
+    bool has_straight_weapon = false;
+    for (const auto& weapon : weapons) {
+        const auto kind = std::find(WeaponKinds.begin(), WeaponKinds.end(), text(weapon));
+        if (kind == WeaponKinds.end()) {
+            continue;
+        }
+        const auto index = static_cast<std::size_t>(kind - WeaponKinds.begin());
+        threat.enemy_range = std::max(threat.enemy_range, weapon_ranges_[index]);
+        has_straight_weapon = has_straight_weapon || index != MortarIndex;
+    }
+    if (threat.enemy_range > 0 && !has_straight_weapon) {
+        threat.enemy_muzzle_height = (mech_height_ + 0.5) * scale;
+    }
+    return threat;
+}
+
+bool enemy_aims_at(const Threat& threat, const Vec3& feet, double radius, double height, const Arena& arena) {
+    if (!threat.position || !threat.enemy_aim || threat.enemy_range <= 0) {
+        return false;
+    }
+    const auto [enemy_yaw, enemy_pitch] = *threat.enemy_aim;
+    const Vec3 source = above(*threat.position, threat.enemy_muzzle_height);
+    const double horizontal_distance = distanceXY(source, feet);
+    if (horizontal_distance > threat.enemy_range + radius) {
+        return false;
+    }
+    const double yaw = std::atan2(feet[1] - source[1], feet[0] - source[0]);
+    const double yaw_tolerance = std::clamp(std::atan2(radius, horizontal_distance) + radians(3),
+                                            radians(5), radians(20));
+    if (horizontal_distance > radius && std::abs(std::remainder(yaw - enemy_yaw, Tau)) > yaw_tolerance) {
+        return false;
+    }
+    // Check the height hit by the aim first. Sampling the chassis lets a partially
+    // exposed target count only when its exposed part is also inside the aim cone.
+    const double aimed_height = std::clamp(source[2] - feet[2] + horizontal_distance * std::tan(enemy_pitch),
+                                            height * 0.1, height * 0.95);
+    for (const double target_height : {aimed_height, height * 0.5, height * 0.2, height * 0.9}) {
+        const Vec3 target = above(feet, target_height);
+        const double pitch = std::atan2(target[2] - source[2], horizontal_distance);
+        if (std::abs(pitch - enemy_pitch) <= radians(5) &&
+            distance_3d(source, target) <= threat.enemy_range + radius && !arena.blocksLine(source, target)) {
+            return true;
+        }
+    }
+    return false;
+}
 
 bool ThreatTracker::can_collect_cubes(const Json& obs) const {
     return match_time(obs) - last_damage_at_ >= CubeDamageQuietSeconds;
@@ -208,7 +286,7 @@ std::optional<Threat> ThreatTracker::update(const Json& obs, const Arena& arena)
     for (const auto& actor : field(obs, "mechs")) {
         if (text(field(actor, "kind")) == "mech") {
             const auto id = actor_id(actor, "id");
-            if (id) {
+            if (id && id != self_id) {
                 enemies[*id] = &actor;
             }
         }
@@ -299,10 +377,39 @@ std::optional<Threat> ThreatTracker::update(const Json& obs, const Arena& arena)
             attacker = id;
         }
     }
+
+    std::optional<Threat> nearest;
+    std::optional<Threat> facing;
+    double nearest_distance = std::numeric_limits<double>::infinity();
+    double facing_distance = std::numeric_limits<double>::infinity();
+    const double radius = number(self_stats, "radius", mech_radius_);
+    const double height = number(self_stats, "height", mech_height_);
+    for (int id = 0; id < static_cast<int>(enemies.size()); ++id) {
+        if (!enemies[id]) {
+            continue;
+        }
+        Threat observed = describe_enemy(*enemies[id], id);
+        const double distance = distanceXY(position, *observed.position);
+        if (distance < nearest_distance) {
+            nearest = observed;
+            nearest_distance = distance;
+        }
+        if (distance < facing_distance && enemy_aims_at(observed, position, radius, height, arena)) {
+            observed.facing_us = true;
+            observed.hostile = true;
+            observed.attack_id = id;
+            observed.attack_position = observed.position;
+            observed.attack_velocity = point(enemies[id]->at("vel"));
+            facing = observed;
+            facing_distance = distance;
+        }
+    }
+    if (facing) {
+        return facing;
+    }
     if (attacker >= 0) {
         const auto* enemy = enemies[attacker];
-        const double scale = 1 + size_per_cube_ * (enemy ? number(*enemy, "cubes", 0.0) : 0.0);
-        Threat threat;
+        Threat threat = enemy ? describe_enemy(*enemy, attacker) : Threat{};
         threat.position = attacks_[attacker].position;
         threat.actor_id = attacker;
         threat.hostile = true;
@@ -311,8 +418,6 @@ std::optional<Threat> ThreatTracker::update(const Json& obs, const Arena& arena)
             threat.attack_position = threat.position;
             threat.attack_velocity = point(enemy->at("vel"));
         }
-        threat.attack_radius = mech_radius_ * scale;
-        threat.attack_height = mech_height_ * scale;
         return threat;
     }
     if (now < unknown_until_) {
@@ -320,22 +425,6 @@ std::optional<Threat> ThreatTracker::update(const Json& obs, const Arena& arena)
         threat.position = unknown_position_;
         threat.hostile = true;
         return threat;
-    }
-    std::optional<Threat> nearest;
-    double nearest_distance = std::numeric_limits<double>::infinity();
-    for (int id = 0; id < static_cast<int>(enemies.size()); ++id) {
-        if (!enemies[id]) {
-            continue;
-        }
-        const Vec3 enemy_position = point(enemies[id]->at("pos"));
-        const double distance = distanceXY(position, enemy_position);
-        if (distance < nearest_distance) {
-            Threat threat;
-            threat.position = enemy_position;
-            threat.actor_id = id;
-            nearest = threat;
-            nearest_distance = distance;
-        }
     }
     return nearest;
 }
@@ -352,8 +441,9 @@ std::optional<Vec2> retreat_aim(const Json& obs, const std::optional<Threat>& th
     return angles(muzzle(me), above(*threat->position, 4.5));
 }
 
-bool return_fire(const Json& obs, const std::optional<Threat>& threat, const Vec2& move, const Arena& arena) {
-    if (!threat || !threat->hostile || !threat->attack_id || !threat->attack_position) {
+bool return_fire(const Json& obs, const std::optional<Threat>& threat, const Vec2& move, const Arena& arena,
+                 bool returning_to_cover) {
+    if (!threat || !threat->facing_us || !threat->attack_id || !threat->attack_position) {
         return false;
     }
     const auto& me = obs.at("self");
@@ -365,8 +455,9 @@ bool return_fire(const Json& obs, const std::optional<Threat>& threat, const Vec
     const auto position = point(me.at("pos"));
     const double dx = (*threat->attack_position)[0] - position[0];
     const double dy = (*threat->attack_position)[1] - position[1];
-    // Lateral movement can reach cover, but closing on the attacker is not withdrawal.
-    if (std::hypot(move[0], move[1]) < 0.15 || dx * move[0] + dy * move[1] > 0.05 * std::hypot(dx, dy)) {
+    // The caller may validate a short return route to cover that points towards the attacker.
+    if (std::hypot(move[0], move[1]) < 0.15 ||
+        (!returning_to_cover && dx * move[0] + dy * move[1] > 0.05 * std::hypot(dx, dy))) {
         return false;
     }
     const auto& weapon_stats = field(weapon, "stats");

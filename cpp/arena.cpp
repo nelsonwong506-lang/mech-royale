@@ -335,8 +335,7 @@ bool Arena::flightSegment(const Vec3& start, const Vec3& end, double radius, dou
     return true;
 }
 
-bool Arena::blocksLine(const Vec3& start, const Vec3& end) const {
-    const double dx = end[0] - start[0], dy = end[1] - start[1], dz = end[2] - start[2];
+bool Arena::blocksPrismLine(const Vec3& start, const Vec3& end) const {
     const int firstX = bin(std::min(start[0], end[0])), lastX = bin(std::max(start[0], end[0]));
     const int firstY = bin(std::min(start[1], end[1])), lastY = bin(std::max(start[1], end[1]));
     for (int x = firstX; x <= lastX; ++x) {
@@ -355,7 +354,14 @@ bool Arena::blocksLine(const Vec3& start, const Vec3& end) const {
             }
         }
     }
+    return false;
+}
 
+bool Arena::blocksLine(const Vec3& start, const Vec3& end) const {
+    if (blocksPrismLine(start, end)) {
+        return true;
+    }
+    const double dx = end[0] - start[0], dy = end[1] - start[1], dz = end[2] - start[2];
     const int count = std::max(1, static_cast<int>(std::ceil(std::hypot(dx, dy) / sampleSpacing)));
     for (int i = 0; i <= count; ++i) {
         const double fraction = static_cast<double>(i) / count;
