@@ -14,12 +14,13 @@ namespace {
 
 constexpr double rotationReserve = 7.0;
 constexpr double infinity = std::numeric_limits<double>::infinity();
+constexpr double tau = 6.283185307179586;
 
 int coverFrom(const Vec3& feet, const Vec3& source, double height, const Arena& arena) {
     int protectedPoints = 0;
     for (const double fraction : {0.22, 0.54, 0.9}) {
         const Vec3 sample{feet[0], feet[1], feet[2] + height * fraction};
-        protectedPoints += arena.blocksLine(source, sample);
+        protectedPoints += arena.blocksPrismLine(source, sample);
     }
     return protectedPoints;
 }
@@ -31,6 +32,30 @@ bool avoidsOne(const Vec3& from, const Vec2& toward, const Vec3& enemy, double t
     return closing <= 0.05 * initialDistance * travel && distanceXY(toward, enemy) + 0.05 >= initialDistance;
 }
 
+// Compute the minimum angular span covering a set of bearings and its center yaw.
+std::pair<double, double> angularCoverage(std::vector<double>& yaws) {
+    if (yaws.empty()) {
+        return {0.0, 0.0};
+    }
+    if (yaws.size() == 1) {
+        return {0.0, yaws[0]};
+    }
+    std::sort(yaws.begin(), yaws.end());
+    double maxGap = -1.0;
+    std::size_t gapAfter = 0;
+    for (std::size_t i = 0; i < yaws.size(); ++i) {
+        const double next = (i + 1 < yaws.size()) ? yaws[i + 1] : (yaws[0] + tau);
+        const double gap = next - yaws[i];
+        if (gap > maxGap) {
+            maxGap = gap;
+            gapAfter = i;
+        }
+    }
+    const double span = std::max(0.0, tau - maxGap);
+    const double startYaw = yaws[(gapAfter + 1) % yaws.size()];
+    const double centerYaw = std::remainder(startYaw + span * 0.5, tau);
+    return {span, centerYaw};
+}
 
 std::optional<DefensiveHop> traceHop(const Vec3& start, const Vec3& initialVelocity, const Vec2& launch,
                                     const Vec3& primaryOrigin, bool strictAvoid, const Zone& zone,
@@ -150,17 +175,13 @@ int wallCover(const Vec3& feet, const Vec3& threat, double ownHeight, const Aren
     return coverFrom(feet, source, ownHeight, arena);
 }
 
-int wallCover(const Vec3& feet, const EnemyInfo& threat, double ownHeight, const Arena& arena) {
-    return coverFrom(feet, {threat.pos[0], threat.pos[1], threat.pos[2] + threat.muzzleHeight}, ownHeight, arena);
-}
-
 std::optional<double> frontArmorYaw(const Vec3& from, const std::vector<EnemyInfo>& enemies,
                                     double ownHeight, const Arena& arena) {
     // Point our 180-deg front armor arc at the centroid of exposed close threats to avoid 1.5x rear damage.
     double sumX = 0.0, sumY = 0.0;
     for (const auto& e : enemies) {
         const double dist = distanceXY(from, e.pos);
-        if (dist > 280.0 || wallCover(from, e, ownHeight, arena) == 3) {
+        if (dist > 180.0 || wallCover(from, e.pos, ownHeight, arena) == 3) {
             continue;
         }
         const double weight = (e.facing_us ? 2.5 : 1.0) * (e.charging ? 2.0 : 1.0) / std::max(10.0, dist);
@@ -249,252 +270,298 @@ std::optional<RetreatPlan> planRetreat(const Vec3& from, const Threat& threat, c
     return best;
 }
 
-namespace {
-
-constexpr double exchangeSeconds = 6.0;
-
-const Json& child(const Json* obj, const char* key) {
-    static const Json empty = Json::object();
-    if (!obj || !obj->is_object()) return empty;
-    const auto it = obj->find(key);
-    return it != obj->end() && it->is_object() ? *it : empty;
-}
-
-enum class Weapon { Gun, Mortar, Laser, Lightning };
-
-struct LoadoutSlot {
-    Weapon kind;
-    double damage, range, cycle, ready, speed, gravity, energyCost, reload;
-    int ammo, mag;
-};
-
-LoadoutSlot readSlot(Weapon kind, const Json& stats, const Json& state) {
-    const bool gun = kind == Weapon::Gun, mortar = kind == Weapon::Mortar, laser = kind == Weapon::Laser;
-    const double speed = stats.value("speed", mortar ? 72.0 : 252.0);
-    const double gravity = std::max(1.0, stats.value("gravity", 22.0));
-    const double charge = laser ? stats.value("charge", 0.75) : 0.0;
-    const int mag = std::max(1, stats.value("mag", 12));
-    return {kind, stats.value("damage", gun ? 45.0 : mortar ? 200.0 : laser ? 315.0 : 60.0),
-        stats.value("range", gun ? 230.0 : mortar ? speed * speed / gravity : laser ? 280.0 : 45.0),
-        std::max(0.05, stats.value("cooldown", gun ? 0.24 : mortar ? 2.6 : laser ? 1.65 : 0.25) + charge),
-        std::max(state.value("cooldown", 0.0), state.value("reload", 0.0)) +
-            std::max(0.0, charge - state.value("charge", 0.0)),
-        speed, gravity, stats.value("energy", 3.0), stats.value("reload", 2.4),
-        state.value("ammo", mag), mag};
-}
-
-constexpr std::array weaponNames{"gun", "mortar", "laser", "lightning"};
-using Loadout = std::vector<LoadoutSlot>;
-
-double expectedHits(const LoadoutSlot& slot, double start, double duration, double energy) {
-    if (duration <= 0) return 0;
-    // Expected trigger opportunities in an interval. Magazine changes consume real match time.
-    const auto until = [&](double end) {
-        if (end <= slot.ready) return 0.0;
-        double time = end - slot.ready;
-        if (slot.kind != Weapon::Gun) return 1.0 + std::floor((time - 1e-6) / slot.cycle);
-        const double first = std::min<double>(slot.ammo, 1 + std::floor((time - 1e-6) / slot.cycle));
-        const double firstReload = std::max(0, slot.ammo - 1) * slot.cycle + slot.reload;
-        if (time <= firstReload) return first;
-        time -= firstReload;
-        const double cycle = (slot.mag - 1) * slot.cycle + std::max(0.05, slot.reload);
-        return first + slot.mag * std::floor(time / cycle) +
-               std::min<double>(slot.mag, 1.0 + std::floor(std::fmod(time, cycle) / slot.cycle));
-    };
-    double hits = std::max(0.0, until(start + duration) - until(start));
-    if (slot.kind == Weapon::Lightning) hits = std::min(hits, std::floor(energy / std::max(0.1, slot.energyCost)));
-    return hits;
-}
-
-struct Exchange {
-    double hp = 0.0;
-    int exposed = 0;
-};
-
-class ExchangeModel {
-public:
-    ExchangeModel(const Threat& focus, const std::vector<EnemyInfo>& enemies, const CombatContext& ctx,
-                  const Motion& motion, const Arena& arena)
-        : focus_(focus), enemies_(enemies), ctx_(ctx), motion_(motion), arena_(arena) {
-        // update() gives a neutral visible actor a position and id, while a bearing-only
-        // alert or a past attacker may have an estimated position without a current observation.
-        canAttack_ = focus.attack_position.has_value() ||
-            (focus.actor_id && std::any_of(enemies.begin(), enemies.end(),
-                [&](const EnemyInfo& enemy) { return enemy.id == *focus.actor_id; }));
-        const auto& catalog = child(ctx.config, "weapons");
-        const Json empty = Json::object();
-        for (std::size_t i = 0; i < defaults_.size(); ++i)
-            defaults_[i] = readSlot(static_cast<Weapon>(i), child(&catalog, weaponNames[i]), empty);
-        if (ctx.weapons && ctx.weapons->is_array()) {
-            for (const auto& w : *ctx.weapons) {
-                if (!w.is_object()) continue;
-                for (std::size_t i = 0; i < defaults_.size(); ++i) {
-                    if (w.value("kind", "") != std::string_view(weaponNames[i]) ||
-                        (i == 2 && ctx.laserShorted)) continue;
-                    auto slot = readSlot(static_cast<Weapon>(i), child(&w, "stats"), w);
-                    if (slot.kind == Weapon::Gun && w.value("reload", 0.0) > 0)
-                        slot.ammo = slot.mag;
-                    own_.push_back(slot);
-                }
-            }
-        } else {
-            if (!ctx.reloading) own_.push_back(defaults_[0]);
-            if (ctx.hasMortar) own_.push_back(defaults_[1]);
-            if (ctx.hasLaser && !ctx.laserShorted) own_.push_back(defaults_[2]);
-            if (ctx.hasLightning) own_.push_back(defaults_[3]);
-        }
-        const auto& cubeRules = child(ctx.config, "cubes");
-        perCube_ = cubeRules.value("damage_per_cube", 0.04);
-        cap_ = cubeRules.value("stat_cap", 10.0);
-        memory_ = child(ctx.config, "vision").value("memory_s", 5.0);
-    }
-
-    Exchange at(const Vec3& from, const Vec3& point) const {
-        Exchange result;
-        const auto target = focus_.attack_position ? focus_.attack_position : focus_.position;
-        if (!target) return result;
-        const double distance = distanceXY(from, point);
-        const double walk = std::max(1.0, motion_.walk * (ctx_.laserCharging ? 0.5 : 1.0));
-        const double arrival = std::min(exchangeSeconds, distance / walk +
-            std::max(0.0, point[2] - from[2] - motion_.step) / std::max(1.0, motion_.rise));
-        // A planned peek must leave time to return to its chosen interior cover.
-        const double returnTime = ctx_.returnCover ? std::min(exchangeSeconds - arrival,
-            distanceXY(point, *ctx_.returnCover) / walk) : 0.0;
-        const double dwell = std::max(0.0, exchangeSeconds - arrival - returnTime);
-        const Vec3 muzzle{point[0], point[1], point[2] + ctx_.muzzleHeight};
-        const Vec3 torso{(*target)[0], (*target)[1], (*target)[2] + focus_.attack_height * 0.5};
-        const double range = std::hypot(distanceXY(muzzle, torso), muzzle[2] - torso[2]);
-        const bool direct = !arena_.blocksLine(muzzle, torso);
-        double outgoing = 0.0;
-        // Legs and torso are independent. Translation permits firing until geometry closes the lane.
-        const Vec3 startMount{from[0], from[1], from[2] + ctx_.muzzleHeight};
-        const double firingStart = direct && !arena_.blocksLine(startMount, torso) ? arrival * 0.25 : arrival;
-        for (const auto& slot : own_) {
-            if (ctx_.wantRegen || !canAttack_ || range > slot.range) continue;
-            double contact = direct ? 1.0 : 0.0;
-            if (slot.kind == Weapon::Mortar) {
-                if (range < 14.0) continue;
-                const Vec3 mount{point[0], point[1], point[2] + motion_.height + 0.5};
-                const Vec3 low{(*target)[0], (*target)[1], (*target)[2] + 1.5};
-                contact = mortarLane(mount, low, slot.speed, slot.gravity, arena_) ? 0.65 : 0.0;
-            }
-            const double weakness = slot.kind == Weapon::Laser && focus_.has_mortar ? 1.6 : 1.0;
-            outgoing += expectedHits(slot, firingStart, dwell + arrival - firingStart, ctx_.energy) *
-                        slot.damage * weakness * contact;
-        }
-        outgoing *= 1.0 + perCube_ * std::min(cap_, ctx_.cubes);
-        const double focusActive = outgoing >= focus_.hp && outgoing > 0.0
-            ? std::min(exchangeSeconds, firingStart + (dwell + arrival - firingStart) * focus_.hp / outgoing)
-            : exchangeSeconds;
-        double incoming = 0.0;
-        const double aimYaw = std::atan2((*target)[1] - point[1], (*target)[0] - point[0]);
-        for (const auto& e : enemies_) {
-            const double d = distanceXY(point, e.pos);
-            if (d > 300.0) continue;
-            const double open = 1.0 - wallCover(point, e, motion_.height, arena_) / 3.0;
-            result.exposed += open > 0.0;
-            const double initialOpen = distance > 0.01 ? 1.0 - wallCover(from, e, motion_.height, arena_) / 3.0 : open;
-            const double yaw = std::atan2(e.pos[1] - point[1], e.pos[0] - point[0]);
-            const Vec2 travel = direction(from, point);
-            const double lateral = std::abs(travel[0] * std::sin(yaw) - travel[1] * std::cos(yaw));
-            const double armor = std::clamp(ctx_.stats ? ctx_.stats->value("armor", 0.0) : 0.0, 0.0, 1.0);
-            const double rear = std::cos(yaw - aimYaw) < 0 ? 1.5 : 1.0;
-            const double scale = (1.0 + perCube_ * std::min(cap_, e.cubes)) * (1.0 - armor) * rear;
-            const Vec3 eye{e.pos[0], e.pos[1], e.pos[2] + e.height * (8.0 / 9.0)};
-            const Vec3 selfTop{point[0], point[1], point[2] + motion_.height};
-            const Vec3 selfCenter{point[0], point[1], point[2] + motion_.height * 0.5};
-            // Assume an opponent retains the full tracking window after we break vision.
-            const bool hidden = dwell > memory_ && open > 0 && d > 45 &&
-                                arena_.blocksVision(eye, selfTop) && arena_.blocksVision(eye, selfCenter);
-            const double visibility = hidden ? 1.0 - 0.5 * std::clamp((dwell - memory_) / exchangeSeconds, 0.0, 1.0) : 1.0;
-            const double exposure = (arrival * (open + initialOpen) * 0.5 + dwell * open * visibility +
-                                     returnTime * open * 0.5) / exchangeSeconds;
-            const double bearingToUs = yaw + std::numbers::pi;
-            const double yawError = e.aim ? std::abs(std::remainder(bearingToUs - (*e.aim)[0], 2 * std::numbers::pi)) : 0.0;
-            const double turnTime = yawError / std::max(0.1, child(ctx_.config, "mech").value("turn_rate", 4.0));
-            const std::array equipped{e.hasGun, e.has_mortar, e.has_laser, e.has_lightning};
-            for (std::size_t i = 0; i < equipped.size(); ++i) {
-                const auto& slot = defaults_[i];
-                if (!equipped[i] || d > slot.range) continue;
-                double fraction = exposure;
-                if (slot.kind == Weapon::Mortar) {
-                    if (d < 14.0) continue;
-                    const Vec3 tube{e.pos[0],e.pos[1],e.pos[2] + e.height + 0.5};
-                    const Vec3 low{point[0],point[1],point[2] + 1.5};
-                    if (mortarLane(tube, low, slot.speed, slot.gravity, arena_)) fraction = std::max(fraction, 0.45);
-                }
-                const double hitChance = slot.kind == Weapon::Gun || slot.kind == Weapon::Mortar
-                    ? 1.0 / (1.0 + lateral * std::min(1.0, distance / walk) * d / std::max(1.0, slot.speed)) : 1.0;
-                const double weakness = slot.kind == Weapon::Laser && ctx_.hasMortar ? 1.6 : 1.0;
-                auto estimated = slot;
-                estimated.ready = (slot.kind == Weapon::Laser && e.charging ? 0 : slot.ready) + turnTime;
-                const double active = focus_.actor_id && e.id == *focus_.actor_id ? focusActive : exchangeSeconds;
-                incoming += expectedHits(estimated, 0.0, active, 100.0) *
-                            slot.damage * fraction * scale * hitChance * weakness;
-            }
-        }
-        result.hp = std::min(focus_.hp, outgoing) - 1.5 * incoming;
-        if (ctx_.wantRegen && result.exposed == 0) {
-            const double healingTime = std::max(0.0, dwell - std::max(0.0, ctx_.regenWait - arrival));
-            result.hp += std::min(ctx_.maxHp - ctx_.hp, healingTime *
-                                  (ctx_.stats ? ctx_.stats->value("regen_per_s", 45.0) : 45.0));
-        }
-        return result;
-    }
-
-private:
-    const Threat& focus_;
-    const std::vector<EnemyInfo>& enemies_;
-    const CombatContext& ctx_;
-    const Motion& motion_;
-    const Arena& arena_;
-    std::array<LoadoutSlot, 4> defaults_{};
-    Loadout own_;
-    bool canAttack_ = false;
-    double perCube_, cap_, memory_;
-};
-} // namespace
-
-double exchangeValue(const Vec3& from, const Vec3& candidate, const Threat& primary,
-                     const std::vector<EnemyInfo>& enemies, const CombatContext& ctx,
-                     const Motion& motion, const Arena& arena) {
-    return ExchangeModel(primary, enemies, ctx, motion, arena).at(from, candidate).hp;
-}
-
 std::optional<CombatMove> planCombatPosition(const Vec3& from, const Threat& primary,
                                              const std::vector<EnemyInfo>& enemies,
                                              const CombatContext& ctx, const Zone& zone,
                                              const Motion& motion, const Arena& arena,
                                              Navigator& navigator, Clock::time_point deadline) {
-    const auto focus = primary.attack_position ? primary.attack_position : primary.position;
-    if (!focus || zone.clearance(from, zone.now) < 0 || Clock::now() >= deadline) return std::nullopt;
-    ExchangeModel model(primary, enemies, ctx, motion, arena);
-    const auto current = model.at(from, from);
-    CombatMove best{from, false, current.exposed == 0, current.exposed, "engage"};
-    double bestScore = current.hp, bestTie = 0.0;
-    const double angle = std::atan2((*focus)[1] - from[1], (*focus)[0] - from[0]);
-    const double side = ctx.strafeSign < 0 ? -1.0 : 1.0;
-    const std::array lengths = ctx.onRoof ? std::array{3.0, 6.0, 10.0} : std::array{5.0, 10.0, 16.0};
-    for (const double length : lengths) {
-        for (const int offset : {90, -90, 145, -145, 45, -45, 180, 0}) {
-            if (Clock::now() >= deadline) return best;
-            const double yaw = angle + side * radians(offset);
-            const Vec2 xy{from[0] + length * std::cos(yaw), from[1] + length * std::sin(yaw)};
-            auto point = navigator.support(xy, motion, from[2] + motion.step + 0.1);
-            if (!point || (ctx.onRoof && (*point)[2] < from[2] - motion.step) ||
-                !navigator.direct(from, *point, zone, motion)) continue;
-            const auto estimate = model.at(from, *point);
+    const auto origin = primary.attack_position ? primary.attack_position : primary.position;
+    if (!origin || zone.clearance(from, zone.now) < 0 || Clock::now() >= deadline) {
+        return std::nullopt;
+    }
+
+    // Filter enemies within tactical combat radius (<= 160 m) for fast multi-enemy geometry evaluation.
+    std::vector<const EnemyInfo*> nearby;
+    nearby.reserve(enemies.size());
+    int closeCount = 0;
+    for (const auto& e : enemies) {
+        const double d = distanceXY(from, e.pos);
+        if (d <= 165.0) {
+            nearby.push_back(&e);
+            if (d <= 90.0) {
+                ++closeCount;
+            }
+        }
+    }
+    const bool multiEnemy = closeCount >= 2;
+    const double hpFrac = ctx.hp / std::max(1.0, ctx.maxHp);
+    const bool enemyFinishable = primary.hp <= 420.0 && hpFrac >= 0.25;
+    const bool defensive = ctx.wantRegen || ctx.reloading || (hpFrac < 0.38 && !enemyFinishable);
+
+    // Choose optimal combat distance based on OUR equipped weapons and enemy loadout.
+    double optimalRange = 42.0;
+    if (ctx.hasLightning && ctx.energy >= 18.0 && !primary.has_mortar) {
+        optimalRange = enemyFinishable ? 24.0 : 31.0;
+    } else if (ctx.hasLaser && !ctx.hasLightning) {
+        optimalRange = 75.0;
+    } else if (ctx.hasMortar && !ctx.hasLightning) {
+        optimalRange = 55.0;
+    } else if (enemyFinishable) {
+        optimalRange = 28.0;
+    }
+    if (primary.has_lightning && !(ctx.hasLightning && enemyFinishable)) {
+        optimalRange = std::max(optimalRange, 52.0);
+    }
+
+    // Pick our focus target (weakest close enemy to isolate in 1vMany cover-splitting).
+    Vec3 focusPos = *origin;
+    double focusHeight = primary.attack_height;
+    int focusId = primary.actor_id.value_or(-1);
+    if (multiEnemy && !defensive) {
+        double bestFocus = -infinity;
+        for (const auto* e : nearby) {
+            const double d = distanceXY(from, e->pos);
+            if (d > 110.0) continue;
+            const double s = (1400.0 - std::min(1400.0, e->hp)) * 0.25 - d + (e->charging ? 120.0 : 0.0);
+            if (s > bestFocus) {
+                bestFocus = s;
+                focusPos = e->pos;
+                focusHeight = e->height;
+                focusId = e->id;
+            }
+        }
+    }
+    const Vec3 focusTorso{focusPos[0], focusPos[1], focusPos[2] + focusHeight * 0.5};
+
+    // Compute pinch escape vector (away from enemy centroid) so we break out of flanks.
+    double enemySumX = 0.0, enemySumY = 0.0, enemyWeightSum = 0.0;
+    for (const auto* e : nearby) {
+        const double d = std::max(8.0, distanceXY(from, e->pos));
+        const double w = (d <= 95.0 ? 2.5 : 1.0) / d;
+        enemySumX += w * e->pos[0];
+        enemySumY += w * e->pos[1];
+        enemyWeightSum += w;
+    }
+    const Vec2 centroid = enemyWeightSum > 0.0
+        ? Vec2{enemySumX / enemyWeightSum, enemySumY / enemyWeightSum}
+        : horizontal(focusPos);
+    const double escapeYaw = std::atan2(from[1] - centroid[1], from[0] - centroid[0]);
+    const double toFocus = std::atan2(focusPos[1] - from[1], focusPos[0] - from[0]);
+    const double distanceToNext = distanceXY(from, zone.nextCenter);
+
+    // Check if staying put in hard cover is ideal (during regen or reload).
+    if (defensive && !ctx.needReposition) {
+        int exposedHere = 0;
+        for (const auto* e : nearby) {
+            if (wallCover(from, e->pos, motion.height, arena) < 3) {
+                ++exposedHere;
+            }
+        }
+        if (exposedHere == 0 && zone.clearance(from, zone.now + 1.5) > motion.radius + 1.5) {
+            return CombatMove{from, false, true, 0, ctx.wantRegen ? "regen-cover" : "reload-cover"};
+        }
+    }
+
+    // Build candidate offsets anchored on focus direction + pinch escape direction.
+    const std::array<int, 12> baseOffsets{
+        static_cast<int>(ctx.strafeSign * 85), static_cast<int>(ctx.strafeSign * 60),
+        static_cast<int>(ctx.strafeSign * 115), static_cast<int>(-ctx.strafeSign * 85),
+        static_cast<int>(-ctx.strafeSign * 60), static_cast<int>(-ctx.strafeSign * 115),
+        static_cast<int>(ctx.strafeSign * 145), static_cast<int>(-ctx.strafeSign * 145),
+        180, static_cast<int>(ctx.strafeSign * 35), static_cast<int>(-ctx.strafeSign * 35), 0
+    };
+
+    double bestScore = -infinity;
+    std::optional<CombatMove> best;
+    std::vector<double> exposedYaws;
+    exposedYaws.reserve(nearby.size());
+
+    auto evaluateCandidate = [&](const Vec2& xy, double length, bool preferredSide, double lateral) {
+        const double arrival = zone.now + length / std::max(1.0, motion.walk) + 0.35;
+        const double clearance = zone.clearance(xy, arrival);
+        if (clearance < zone.buffer(zone.circle(arrival).second, motion.radius + 1.2)) {
+            return;
+        }
+        const auto point = navigator.support(xy, motion, from[2] + motion.step + 0.1);
+        if (!point || !navigator.direct(from, *point, zone, motion)) {
+            return;
+        }
+
+        int exposedCount = 0;
+        int lightningCluster = 0;
+        double minEnemyDist = infinity;
+        double weaponDangerPenalty = 0.0;
+        exposedYaws.clear();
+        for (const auto* e : nearby) {
+            const double d = distanceXY(*point, e->pos);
+            minEnemyDist = std::min(minEnemyDist, d);
+            const bool exposed = wallCover(*point, e->pos, motion.height, arena) < 3;
+            if (exposed) {
+                ++exposedCount;
+                exposedYaws.push_back(std::atan2(e->pos[1] - (*point)[1], e->pos[0] - (*point)[0]));
+                if (e->has_lightning && d < 47.0 && !(ctx.hasLightning && e->hp < 350.0)) {
+                    weaponDangerPenalty += (47.0 - d) * 1.3;
+                }
+                if (e->charging) {
+                    weaponDangerPenalty += 30.0;
+                }
+            }
+            if (ctx.hasLightning && d <= 42.0 && distanceXY(e->pos, focusPos) <= 14.0) {
+                ++lightningCluster;
+            }
+        }
+        if (minEnemyDist < 10.0) {
+            return;
+        }
+
+        // Front-armor protection: penalize positions where exposed enemies span > 150 deg (1.5x rear-armor risk!).
+        const auto [span, centerYaw] = angularCoverage(exposedYaws);
+        (void)centerYaw;
+        double rearRiskPenalty = 0.0;
+        if (exposedCount >= 2 && span > radians(145.0)) {
+            rearRiskPenalty = 24.0 + 18.0 * (span - radians(145.0));
+        }
+
+        const Vec3 muzzlePos{(*point)[0], (*point)[1], (*point)[2] + ctx.muzzleHeight};
+        const bool hasFocusLos = !arena.blocksLine(muzzlePos, focusTorso);
+        const double focusDist = distanceXY(*point, focusPos);
+        const double rangeError = std::abs(focusDist - optimalRange);
+        const double progress = distanceToNext - distanceXY(xy, zone.nextCenter);
+        const double anchorShift = distanceXY(*point, ctx.anchor);
+        const double repositionBonus = ctx.needReposition ? std::min(12.0, anchorShift * 0.65) : 0.0;
+
+        double exposureScore = 0.0;
+        const char* label = "engage";
+        if (defensive) {
+            // Regen or reload: strongly prefer full cover (0 exposed) or breaking LOS.
+            if (exposedCount == 0) {
+                exposureScore = 48.0;
+                label = ctx.wantRegen ? "regen-cover" : "reload-cover";
+            } else if (exposedCount == 1) {
+                exposureScore = 10.0;
+                label = "kite-defend";
+            } else {
+                exposureScore = -24.0 * exposedCount;
+                label = "split-out";
+            }
+        } else if (multiEnemy) {
+            // 1vMany core tactic: isolate EXACTLY 1 exposed enemy via cover-splitting!
+            if (exposedCount == 1 && hasFocusLos) {
+                exposureScore = 44.0;
+                label = "split-1v1";
+            } else if (exposedCount == 0) {
+                exposureScore = ctx.hasMortar ? 32.0 : 18.0;
+                label = ctx.hasMortar ? "mortar-cover" : "reposition";
+            } else if (exposedCount == 2 && ctx.hasLightning && ctx.energy >= 20.0 &&
+                       hpFrac >= 0.55 && lightningCluster >= 2 && span <= radians(115.0)) {
+                // Lightning chains across both enemies inside front armor arc!
+                exposureScore = 26.0;
+                label = "chain-kite";
+            } else {
+                exposureScore = -22.0 * (exposedCount - 1) + (hasFocusLos ? 6.0 : -8.0);
+                label = "kite-multi";
+            }
+        } else {
+            // 1v1: keep LOS, kite laterally at optimal range, or use cover with mortar.
+            if (hasFocusLos) {
+                exposureScore = 28.0;
+                label = "engage";
+            } else if (ctx.hasMortar && exposedCount == 0 && focusDist >= 18.0) {
+                exposureScore = 24.0;
+                label = "mortar-cover";
+            } else {
+                exposureScore = -12.0;
+                label = "flank";
+            }
+        }
+
+        // Escape-pinch alignment bonus when outnumbered or defensive.
+        const double moveYaw = std::atan2(xy[1] - from[1], xy[0] - from[0]);
+        const Vec2 moveDir{std::cos(moveYaw), std::sin(moveYaw)};
+        const double escapeAlign = std::cos(moveYaw - escapeYaw);
+        const double pinchBonus = (multiEnemy || defensive) ? 8.5 * escapeAlign : 0.0;
+
+        // Momentum continuity: smooth high-speed circular strafing instead of left-right jitter.
+        const double velSpeed = std::hypot(ctx.velocity[0], ctx.velocity[1]);
+        const double momentumBonus = velSpeed > 1.5
+            ? 3.8 * (moveDir[0] * ctx.velocity[0] + moveDir[1] * ctx.velocity[1]) / velSpeed
+            : 0.0;
+
+        // Incoming bullet sidestep bias.
+        const double dodgeBonus = ctx.bulletDodge
+            ? 14.0 * (moveDir[0] * (*ctx.bulletDodge)[0] + moveDir[1] * (*ctx.bulletDodge)[1])
+            : 0.0;
+
+        // Rooftop high-ground retention: don't accidentally step off a roof while fighting ground bots!
+        const bool staysElevated = ctx.onRoof && (*point)[2] >= from[2] - 1.5;
+        const double roofBonus = ctx.onRoof ? (staysElevated ? 22.0 : -26.0) : 0.0;
+
+        // Open-ground cover pull: drag fights from the open Oval lawn toward the nearest building ring!
+        double pullBonus = 0.0;
+        if (ctx.coverPull && !ctx.onRoof && (exposedCount >= 1 || defensive)) {
+            const double pullProgress = distanceXY(from, *ctx.coverPull) - distanceXY(xy, *ctx.coverPull);
+            const double pullWeight = (multiEnemy || defensive) ? 1.25 : 0.60;
+            pullBonus = pullWeight * pullProgress;
+            if (pullProgress > 4.0 && multiEnemy && exposedCount >= 2) {
+                label = "pull-cover";
+            }
+        }
+
+        // Penalize walking closer to non-focus enemies.
+        double otherApproachPenalty = 0.0;
+        for (const auto* e : nearby) {
+            if (e->id == focusId) continue;
+            const double before = distanceXY(from, e->pos);
+            const double after = distanceXY(xy, e->pos);
+            if (after < before) {
+                otherApproachPenalty += (before - after) * (35.0 / std::max(10.0, before));
+            }
+        }
+
+        const double score = exposureScore + pinchBonus + repositionBonus + momentumBonus + dodgeBonus +
+            roofBonus + pullBonus +
+            (defensive ? 3.5 : 8.0) * lateral + (preferredSide ? 2.5 : 0.0) -
+            (defensive ? 0.15 : 0.45) * rangeError - weaponDangerPenalty - rearRiskPenalty -
+            0.55 * otherApproachPenalty + 0.32 * progress + 0.025 * std::min(40.0, clearance);
+
+        if (score > bestScore) {
+            bestScore = score;
+            const double energyReserve = ctx.hasLightning ? 0.45 : 0.30;
+            const bool wantBoost = !ctx.laserCharging &&
+                ctx.energy > energyReserve * ctx.maxEnergy &&
+                (multiEnemy || defensive || (primary.facing_us && focusDist < 55.0) || ctx.needReposition);
+            best = CombatMove{*point, wantBoost, exposedCount == 0, exposedCount, label};
+        }
+    };
+
+    const std::array<double, 4> roofLengths{2.8, 5.5, 9.0, 14.0};
+    const std::array<double, 4> groundLengths{9.0, 15.0, 21.0, 5.5};
+    const auto& stepLengths = ctx.onRoof ? roofLengths : groundLengths;
+    for (const double length : stepLengths) {
+        for (const int offset : baseOffsets) {
+            if (Clock::now() >= deadline) {
+                return best;
+            }
+            const double heading = toFocus + radians(offset);
+            const Vec2 xy{from[0] + length * std::cos(heading), from[1] + length * std::sin(heading)};
             const double lateral = std::abs(std::sin(radians(offset)));
-            // Prefer continuous lateral motion among equally valuable exchanges.
-            const double tie = lateral + 0.01 * (ctx.velocity[0] * std::cos(yaw) + ctx.velocity[1] * std::sin(yaw));
-            if (estimate.hp > bestScore + 0.5 || (std::abs(estimate.hp - bestScore) <= 0.5 &&
-                current.exposed > 0 && !ctx.wantRegen && tie > bestTie)) {
-                bestScore = estimate.hp;
-                bestTie = tie;
-                const bool boost = !ctx.laserCharging && ctx.energy > motion.boostDrain + (ctx.hasLightning ? 12.0 : 0.0) &&
-                                   estimate.exposed < current.exposed;
-                best = {*point, boost, estimate.exposed == 0, estimate.exposed,
-                        estimate.exposed == 0 ? "combat-cover" : "engage"};
+            const bool preferredSide = (offset * ctx.strafeSign) > 0;
+            evaluateCandidate(xy, length, preferredSide, lateral);
+        }
+        // Also explicitly sample the pinch escape bisector in multi-enemy fights.
+        if (multiEnemy && Clock::now() < deadline) {
+            const Vec2 xy{from[0] + length * std::cos(escapeYaw), from[1] + length * std::sin(escapeYaw)};
+            evaluateCandidate(xy, length, true, 0.7);
+        }
+        // Sample directly toward nearest building cover when caught in open ground.
+        if (ctx.coverPull && Clock::now() < deadline) {
+            const double pullYaw = std::atan2((*ctx.coverPull)[1] - from[1], (*ctx.coverPull)[0] - from[0]);
+            for (const int po : {0, 28, -28}) {
+                if (Clock::now() >= deadline) break;
+                const double yaw = pullYaw + radians(po);
+                const Vec2 xy{from[0] + length * std::cos(yaw), from[1] + length * std::sin(yaw)};
+                const double lat = std::abs(std::sin(yaw - toFocus));
+                evaluateCandidate(xy, length, true, lat);
             }
         }
     }

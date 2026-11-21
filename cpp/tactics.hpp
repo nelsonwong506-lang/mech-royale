@@ -43,9 +43,6 @@ struct EnemyInfo {
     double hp = 1400.0;
     double radius = 2.5;
     double height = 9.0;
-    double muzzleHeight = 7.0;
-    double cubes = 0.0;
-    bool hasGun = false;
     bool is_npc = false;
     bool has_lightning = false;
     bool has_laser = false;
@@ -97,23 +94,13 @@ public:
                                         bool allow_crates = false,
                                         bool allow_npcs = false,
                                         bool allow_laser_charge = true,
-                                        std::optional<int> sticky_target_id = std::nullopt,
-                                        double jet_energy_reserve = 0.0) const;
+                                        std::optional<int> sticky_target_id = std::nullopt) const;
     std::vector<EnemyInfo> visible_enemies(const Json& obs, const Arena& arena) const;
-    std::optional<Threat> recovery_attacker(const Json& obs, const Arena& arena) const;
-    std::optional<Threat> combat_focus(const Json& obs, const Arena& arena,
-                                       const std::vector<EnemyInfo>& enemies,
-                                       const std::optional<Threat>& current,
-                                       Clock::time_point deadline = Clock::time_point::max()) const;
     std::optional<ProjectileDodge> projectile_dodge(const Json& obs, const Arena& arena) const;
     std::optional<SoundAlert> sound_alert(double now) const;
     bool can_collect_cubes(const Json& obs) const;
     double last_combat_time() const;
     double last_damage_time() const;
-    bool eliminated(int id) const;
-    bool laser_shorted(double now) const { return now < short_until_; }
-    bool recent_cookoff(double now) const { return now < cookoff_until_; }
-    std::optional<double> rear_bearing(double now) const;
     std::optional<double> sound_heading(double now) const;
 
 private:
@@ -121,7 +108,6 @@ private:
 
     struct AttackMemory {
         double time = -std::numeric_limits<double>::infinity();
-        double damageTime = -std::numeric_limits<double>::infinity();
         std::optional<Vec3> position;
         bool is_npc = false;
     };
@@ -136,19 +122,12 @@ private:
     std::unordered_map<int, HealthSample> health_samples_{};
     std::array<std::array<std::optional<double>, 16>, 16> duel_times_{};
     std::optional<Vec3> unknown_position_;
-    std::optional<Vec3> unknown_damage_position_;
-    double unknown_damage_at_ = -std::numeric_limits<double>::infinity();
     double unknown_until_ = -std::numeric_limits<double>::infinity();
     std::optional<double> sound_heading_;
     double sound_until_ = -std::numeric_limits<double>::infinity();
     std::optional<SoundAlert> sound_alert_;
     double sound_alert_until_ = -std::numeric_limits<double>::infinity();
     double last_damage_at_ = -std::numeric_limits<double>::infinity();
-    std::array<bool, 16> eliminated_{};
-    double short_until_ = -std::numeric_limits<double>::infinity();
-    double cookoff_until_ = -std::numeric_limits<double>::infinity();
-    double rear_until_ = -std::numeric_limits<double>::infinity();
-    double rear_bearing_ = 0.0;
     double last_hit_dealt_at_ = -std::numeric_limits<double>::infinity();
     double last_hostile_damage_at_ = -std::numeric_limits<double>::infinity();
     double last_duel_at_ = -std::numeric_limits<double>::infinity();
@@ -161,7 +140,6 @@ private:
     double damage_per_cube_;
     double cube_stat_cap_;
     double mortar_gravity_;
-    double short_seconds_;
     std::array<double, 4> weapon_ranges_;
 };
 
@@ -174,6 +152,5 @@ std::vector<Cube> safe_cubes(const Json& obs, const std::optional<Threat>& threa
                              double pickup_radius, const std::function<bool(const Vec2&)>& safe_point);
 int cover_quality(const Vec3& position, const std::optional<Threat>& threat, const Arena& arena,
                   double height = 9.0);
-bool mortarLane(const Vec3& mount, const Vec3& target, double speed, double gravity, const Arena& arena);
 
 }  // namespace mr

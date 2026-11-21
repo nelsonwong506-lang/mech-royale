@@ -97,20 +97,6 @@ std::array<double, 4> Motion::shape() const {
     return {radius, height, step, slope};
 }
 
-std::pair<Vec2, bool> Flight::steer(const Vec3& pos, const Vec3& velocity, const Motion& motion,
-                                   double remainingEnergy) {
-    if (stage == Stage::Climb && pos[2] >= apex - 0.4) stage = Stage::Cross;
-    const double offset = distanceXY(pos, landing);
-    if (stage == Stage::Cross && offset <= 1.1 && std::hypot(velocity[0], velocity[1]) < 4.)
-        stage = Stage::Descend;
-    const auto& target = stage == Stage::Climb ? climbToward : landing;
-    const double distance = std::max(0., distanceXY(pos, target) - (stage == Stage::Climb ? 0. : 0.35));
-    const double speed = std::min(1., std::sqrt(2 * motion.airAcceleration * distance) / std::max(1., motion.walk));
-    const bool jet = stage != Stage::Descend && remainingEnergy > 0.2 * motion.jetDrain &&
-        pos[2] + velocity[2] * 0.16 < apex + 0.4;
-    return {direction(pos, target, speed), jet};
-}
-
 std::size_t Navigator::PointHash::operator()(const Vec3& point) const noexcept {
     std::size_t hash = 0;
     for (const double component : point) {
@@ -343,72 +329,9 @@ RouteResult Navigator::plan(const Vec3& from, const std::vector<Vec3>& goals, co
     return {std::move(partial), false};
 }
 
-std::optional<Flight> Navigator::checkedFlight(const Vec3& takeoff, const Vec3& landing, const Motion& motion,
-                                               const Zone& zone, double at, Vec2 velocity, double energyAvailable,
-                                               Clock::time_point deadline) const {
-    if (energyAvailable <= 0 || motion.walk <= 0 || motion.rise <= 0 || motion.gravity <= 0) return {};
-    double highPoint = std::max(takeoff[2], landing[2]);
-    if (landing[2] < arena_.ground(landing[0], landing[1]) + 2.0) {
-        // A ground-to-ground recovery may cross a solid higher than both endpoints.
-        const double length = distanceXY(takeoff, landing);
-        const Vec2 along = direction(takeoff, landing);
-        const int samples = std::max(1, static_cast<int>(std::ceil(length / 2.)));
-        for (int n = 1; n < samples; ++n) {
-            const double d = length * n / samples;
-            for (double offset : {-motion.radius, 0., motion.radius}) {
-                highPoint = std::max(highPoint, arena_.surface(takeoff[0] + d*along[0] - offset*along[1],
-                                                              takeoff[1] + d*along[1] + offset*along[0]));
-            }
-        }
-    }
-    const double apex = highPoint + 2.2;
-    const double climb = std::max(0.3, (apex - takeoff[2]) / motion.rise + 0.2);
-    const double down = std::sqrt(2 * (apex - landing[2]) / motion.gravity) + 0.3;
-    const Vec3 aboveLanding{landing[0], landing[1], apex};
-    if (!arena_.flightSegment(aboveLanding, landing, motion.radius, motion.height)) return {};
-    const double advance = std::min(distanceXY(takeoff, landing), climb * motion.walk);
-    const Vec2 forward = direction(takeoff, landing);
-    for (double share : {1., 0.5, 0.}) {
-        if (Clock::now() >= deadline) return {};
-        const Vec3 toward{takeoff[0] + forward[0]*advance*share, takeoff[1] + forward[1]*advance*share, apex};
-        Vec3 p = takeoff;
-        Vec2 speed = velocity;
-        double vz = motion.jump, elapsed = 0;
-        bool clear = true;
-        while (p[2] < apex - 0.02 && elapsed < climb + 1.) {
-            if (Clock::now() >= deadline) return {};
-            constexpr double dt = 0.1;
-            const double remaining = distanceXY(p, toward);
-            const auto wanted = direction(p, toward, std::min(motion.walk, std::sqrt(2*motion.airAcceleration*remaining)));
-            const Vec2 change{wanted[0] - speed[0], wanted[1] - speed[1]};
-            const double magnitude = std::hypot(change[0], change[1]);
-            const double fraction = magnitude > 0 ? std::min(1., motion.airAcceleration*dt/magnitude) : 0.;
-            speed[0] += fraction * change[0];
-            speed[1] += fraction * change[1];
-            // The initial action jumps without boosting; jet thrust starts at the next decision.
-            vz = elapsed == 0. ? vz - motion.gravity * dt
-                               : std::min(motion.rise, vz + (motion.jet - motion.gravity) * dt);
-            if (vz <= 0) { clear = false; break; }
-            const Vec3 next{p[0] + speed[0]*dt, p[1] + speed[1]*dt, std::min(apex, p[2] + vz*dt)};
-            if (!arena_.flightSegment(p, next, motion.radius, motion.height) ||
-                !zone.segment(p, next, at + elapsed, dt)) { clear = false; break; }
-            p = next;
-            elapsed += dt;
-        }
-        if (!clear || p[2] < apex - 0.02) continue;
-        const double across = distanceXY(p, landing) / motion.walk + 0.35;
-        if ((elapsed + across) * motion.jetDrain > energyAvailable ||
-            !zone.segment(p, aboveLanding, at + elapsed, across) ||
-            !zone.segment(aboveLanding, landing, at + elapsed + across, down) ||
-            !arena_.flightSegment(p, aboveLanding, motion.radius, motion.height)) continue;
-        return Flight{takeoff, landing, apex, elapsed, elapsed + across + down, false, toward};
-    }
-    return {};
-}
-
 std::optional<Flight> Navigator::flightPlan(const Vec3& from, const std::vector<Vec3>& goals,
                                            const Zone& zone, const Motion& motion, double energy,
-                                           double maximum, Clock::time_point deadline, Vec2 velocity) {
+                                           double maximum, Clock::time_point deadline) {
     const auto [minX, minY, maxX, maxY] = arena_.bounds;
     const double startToNext = distanceXY(from, zone.nextCenter);
     std::vector<Vec2> centers;
@@ -438,19 +361,14 @@ std::optional<Flight> Navigator::flightPlan(const Vec3& from, const std::vector<
             }
             const Vec2 xy{center[0] + 6 * offset[0], center[1] + 6 * offset[1]};
             const bool insideNext = zone.inNext(xy);
-            const double arrivalClearance = zone.clearance(xy, zone.now + 3.);
-            const bool intermediateSafe = distanceXY(xy, zone.nextCenter) < startToNext - 4.0 &&
-                (arrivalClearance >= 0. || (zone.clearance(from, zone.now) < 0. &&
-                 arrivalClearance > zone.clearance(from, zone.now + 3.) + 4.));
+            const bool intermediateSafe = distanceXY(xy, zone.nextCenter) < startToNext - 4.0
+                && zone.clearance(xy, zone.now + 3.0) >= 0.0;
             if (xy[0] <= minX || xy[0] >= maxX || xy[1] <= minY || xy[1] >= maxY
                 || distanceXY(from, xy) > 55.0 || (!insideNext && !intermediateSafe)) {
                 continue;
             }
             const auto landing = support(xy, motion);
-            if (!landing) continue;
-            const bool onRoof = (*landing)[2] > arena_.ground(xy[0], xy[1]) + 2.;
-            if ((onRoof && !arena_.roofFits(*landing, motion.radius, motion.height)) ||
-                (!onRoof && from[2] < (*landing)[2] + 2. && walkable(from, *landing, motion))) {
+            if (!landing || ((*landing)[2] < arena_.ground(xy[0], xy[1]) + 2.0 && from[2] < (*landing)[2] + 2.0)) {
                 continue;
             }
             const Vec2 away = direction(xy, from);
@@ -464,11 +382,29 @@ std::optional<Flight> Navigator::flightPlan(const Vec3& from, const std::vector<
                 if (!takeoff || !direct(from, *takeoff, zone, motion)) {
                     continue;
                 }
+                const double apex = std::max((*takeoff)[2], (*landing)[2]) + 2.2;
+                const double climb = std::max(0.3, (apex - (*takeoff)[2] - 0.6) / std::max(1.0, motion.rise) + 0.22);
+                const double across = distanceXY(*takeoff, *landing) / std::max(1.0, motion.walk) + 0.35;
+                const double down = std::sqrt(2 * (apex - (*landing)[2]) / motion.gravity) + 0.3;
+                const double seconds = climb + across + down;
+                // Budget full thrust for climbing and crossing to leave reserve for a recovery.
+                if (energy - (climb + across) * motion.jetDrain < 0.2 * maximum) {
+                    continue;
+                }
                 const double at = zone.now + distanceXY(from, *takeoff) / motion.walk;
-                const auto flight = checkedFlight(*takeoff, *landing, motion, zone, at, velocity,
-                                                  energy - 0.2 * maximum, deadline);
-                if (flight && !(insideNext && at + flight->seconds > zone.end && zone.nextRadius > 0.0))
-                    return flight;
+                if ((insideNext && at + seconds > zone.end && zone.nextRadius > 0.0)
+                    || !zone.segment(*takeoff, *takeoff, at, climb)
+                    || !zone.segment(*takeoff, *landing, at + climb, across)
+                    || !zone.segment(*landing, *landing, at + climb + across, down)) {
+                    continue;
+                }
+                const Vec3 aboveTakeoff{(*takeoff)[0], (*takeoff)[1], apex};
+                const Vec3 aboveLanding{(*landing)[0], (*landing)[1], apex};
+                if (arena_.flightSegment(*takeoff, aboveTakeoff, motion.radius, motion.height)
+                    && arena_.flightSegment(aboveTakeoff, aboveLanding, motion.radius, motion.height)
+                    && arena_.flightSegment(aboveLanding, *landing, motion.radius, motion.height)) {
+                    return Flight{*takeoff, *landing, apex, climb, seconds};
+                }
             }
         }
     }
@@ -477,11 +413,10 @@ std::optional<Flight> Navigator::flightPlan(const Vec3& from, const std::vector<
 
 std::optional<Flight> Navigator::flightToRoof(const Vec3& from, const Vec3& landing, const Zone& zone,
                                               const Motion& motion, double energy, double maximum,
-                                              Clock::time_point deadline, Vec2 velocity) {
+                                              Clock::time_point deadline) {
     if (Clock::now() >= deadline || distanceXY(from, landing) > 45.0) {
         return std::nullopt;
     }
-    if (!arena_.roofFits(landing, motion.radius, motion.height)) return {};
     if (zone.clearance(landing, zone.now + 10.0) < motion.radius + 1.0 && !zone.inNext(landing, motion.radius)) {
         return std::nullopt;
     }
@@ -495,70 +430,29 @@ std::optional<Flight> Navigator::flightToRoof(const Vec3& from, const Vec3& land
         if (!takeoff || !direct(from, *takeoff, zone, motion)) {
             continue;
         }
+        const double apex = std::max((*takeoff)[2], landing[2]) + 2.2;
+        const double climb = std::max(0.3, (apex - (*takeoff)[2] - 0.6) / std::max(1.0, motion.rise) + 0.22);
+        const double across = distanceXY(*takeoff, landing) / std::max(1.0, motion.walk) + 0.35;
+        const double down = std::sqrt(2 * std::max(0.1, apex - landing[2]) / motion.gravity) + 0.25;
+        const double seconds = climb + across + down;
+        if (energy - (climb + across) * motion.jetDrain < 0.18 * maximum) {
+            continue;
+        }
         const double at = zone.now + distanceXY(from, *takeoff) / motion.walk;
-        const auto flight = checkedFlight(*takeoff, landing, motion, zone, at, velocity, energy - 0.18 * maximum, deadline);
-        if (flight) return flight;
-    }
-    return std::nullopt;
-}
-
-bool Navigator::landingFits(const Vec3& landing, const Motion& motion) const {
-    const auto point = support(horizontal(landing), motion, landing[2] + 0.15);
-    if (!point || std::abs((*point)[2] - landing[2]) > 0.15) return false;
-    return std::abs(landing[2] - arena_.ground(landing[0], landing[1])) <= 0.15 ||
-           arena_.roofFits(landing, motion.radius, motion.height);
-}
-
-std::optional<Flight> Navigator::revalidateLaunch(const Vec3& start, const Vec3& landing, const Zone& zone,
-                                                const Motion& motion, double energy, double maximum,
-                                                Vec2 velocity, Clock::time_point deadline) const {
-    if (!landingFits(landing, motion)) return {};
-    return checkedFlight(start, landing, motion, zone, zone.now, velocity, energy - 0.2 * maximum, deadline);
-}
-
-std::optional<Flight> Navigator::emergencyLanding(const Vec3& start, const Vec3& velocity, const Zone& zone,
-                                                 const Motion& motion, Clock::time_point deadline) const {
-    const double gravity = std::max(1., motion.gravity), acceleration = std::max(1., motion.airAcceleration);
-    const double stopTime = std::hypot(velocity[0], velocity[1]) / acceleration;
-    const Vec2 stopping{start[0] + velocity[0] * stopTime * 0.5, start[1] + velocity[1] * stopTime * 0.5};
-    const double ceiling = start[2] + std::pow(std::max(0., velocity[2]), 2) / (2 * gravity);
-    const Vec2 inward = direction(start, zone.circle(zone.now + 1.).first);
-    const std::array<Vec2, 6> candidates{{{stopping[0] + 8*inward[0], stopping[1] + 8*inward[1]},
-        stopping, horizontal(start), {start[0] + 4*inward[0], start[1] + 4*inward[1]},
-        {stopping[0] - inward[1]*5, stopping[1] + inward[0]*5},
-        {stopping[0] + inward[1]*5, stopping[1] - inward[0]*5}}};
-    // Simulate an unpowered descent. A replacement cannot spend the reserve or cross a wall.
-    for (const auto& xy : candidates) {
-        const auto landing = support(xy, motion, ceiling);
-        if (!landing || !landingFits(*landing, motion)) continue;
-        Flight descent{start, *landing, ceiling, 0., 0., true, start, Flight::Stage::Descend};
-        Vec3 p = start, v = velocity;
-        for (int tick = 0; tick < 120; ++tick) {
-            if (Clock::now() >= deadline) return {};
-            constexpr double dt = 0.05;
-            const auto move = descent.steer(p, v, motion, 0.).first;
-            const double dx = move[0]*motion.walk - v[0], dy = move[1]*motion.walk - v[1];
-            const double dv = std::hypot(dx, dy);
-            const double scale = dv > 0 ? std::min(1., acceleration*dt/dv) : 0.;
-            v[0] += dx*scale;
-            v[1] += dy*scale;
-            v[2] -= gravity*dt;
-            Vec3 next{p[0]+v[0]*dt, p[1]+v[1]*dt, p[2]+v[2]*dt};
-            const bool touch = v[2] < 0 && next[2] <= (*landing)[2];
-            if (touch) next[2] = (*landing)[2];
-            if (!zone.segment(p, next, zone.now + tick*dt, dt) ||
-                !arena_.flightSegment(p, next, motion.radius, motion.height)) break;
-            if (touch) {
-                if (distanceXY(next, *landing) <= 1.2 && landingFits(next, motion)) {
-                    descent.seconds = (tick + 1)*dt;
-                    return descent;
-                }
-                break;
-            }
-            p = next;
+        if (!zone.segment(*takeoff, *takeoff, at, climb)
+            || !zone.segment(*takeoff, landing, at + climb, across)
+            || !zone.segment(landing, landing, at + climb + across, down)) {
+            continue;
+        }
+        const Vec3 aboveTakeoff{(*takeoff)[0], (*takeoff)[1], apex};
+        const Vec3 aboveLanding{landing[0], landing[1], apex};
+        if (arena_.flightSegment(*takeoff, aboveTakeoff, motion.radius, motion.height)
+            && arena_.flightSegment(aboveTakeoff, aboveLanding, motion.radius, motion.height)
+            && arena_.flightSegment(aboveLanding, landing, motion.radius, motion.height)) {
+            return Flight{*takeoff, landing, apex, climb, seconds};
         }
     }
-    return {};
+    return std::nullopt;
 }
 
 bool Navigator::guard(const Vec2& move, bool boost, const Json& me, const Zone& zone,

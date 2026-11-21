@@ -58,18 +58,12 @@ struct Motion {
 };
 
 struct Flight {
-    enum class Stage { Climb, Cross, Descend };
-
     Vec3 takeoff;
     Vec3 landing;
     double apex;
     double climb;
     double seconds;
     bool airborne = false;
-    Vec3 climbToward{};
-    Stage stage = Stage::Climb;
-    std::pair<Vec2, bool> steer(const Vec3& pos, const Vec3& velocity, const Motion& motion,
-                               double remainingEnergy);
 };
 
 struct RouteResult {
@@ -96,16 +90,10 @@ public:
                      const Motion& motion, std::size_t role, Clock::time_point deadline);
     std::optional<Flight> flightPlan(const Vec3& from, const std::vector<Vec3>& goals, const Zone& zone,
                                      const Motion& motion, double energy, double maximum,
-                                     Clock::time_point deadline, Vec2 velocity = {});
+                                     Clock::time_point deadline);
     std::optional<Flight> flightToRoof(const Vec3& from, const Vec3& landing, const Zone& zone,
                                        const Motion& motion, double energy, double maximum,
-                                       Clock::time_point deadline, Vec2 velocity = {});
-    bool landingFits(const Vec3& landing, const Motion& motion) const;
-    std::optional<Flight> revalidateLaunch(const Vec3& start, const Vec3& landing, const Zone& zone,
-                                          const Motion& motion, double energy, double maximum,
-                                          Vec2 velocity, Clock::time_point deadline) const;
-    std::optional<Flight> emergencyLanding(const Vec3& start, const Vec3& velocity, const Zone& zone,
-                                          const Motion& motion, Clock::time_point deadline) const;
+                                       Clock::time_point deadline);
     bool guard(const Vec2& move, bool boost, const Json& me, const Zone& zone,
                const Motion& motion, bool jet = false);
 
@@ -155,9 +143,6 @@ private:
     void advance(Search& search, const Zone& zone, const Motion& motion, Clock::time_point deadline);
     std::vector<Vec3> usable(const Vec3& from, const std::vector<Vec3>& path,
                              const Zone& zone, const Motion& motion);
-    std::optional<Flight> checkedFlight(const Vec3& takeoff, const Vec3& landing, const Motion& motion,
-                                        const Zone& zone, double at, Vec2 velocity, double energyAvailable,
-                                        Clock::time_point deadline) const;
 
     const Arena& arena_;
     std::optional<Search> search_;

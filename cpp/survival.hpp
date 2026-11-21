@@ -25,13 +25,6 @@ struct RetreatPlan {
 };
 
 struct CombatContext {
-    const Json* weapons = nullptr;
-    const Json* config = nullptr;
-    const Json* stats = nullptr;
-    std::optional<Vec3> returnCover;
-    double cubes = 0.0;
-    bool laserShorted = false;
-    double regenWait = 5.0;
     double hp = 1400.0;
     double maxHp = 1400.0;
     double energy = 100.0;
@@ -44,9 +37,12 @@ struct CombatContext {
     bool laserCharging = false;
     bool reloading = false;
     bool wantRegen = false;
+    bool needReposition = false;
     bool onRoof = false;
     Vec3 anchor{};
     Vec2 velocity{};
+    std::optional<Vec2> bulletDodge;
+    std::optional<Vec2> coverPull;
 };
 
 struct CombatMove {
@@ -69,10 +65,6 @@ RotationWindow rotationWindow(const Vec3& from, const Zone& zone, const Motion& 
 bool avoidsApproach(const Vec3& from, const Vec2& toward, const std::vector<Vec3>& enemies);
 double approachPenalty(const Vec3& from, const Vec2& toward, const std::vector<Vec3>& enemies);
 int wallCover(const Vec3& feet, const Vec3& threat, double ownHeight, const Arena& arena);
-int wallCover(const Vec3& feet, const EnemyInfo& threat, double ownHeight, const Arena& arena);
-double exchangeValue(const Vec3& from, const Vec3& candidate, const Threat& primary,
-                     const std::vector<EnemyInfo>& enemies, const CombatContext& ctx,
-                     const Motion& motion, const Arena& arena);
 std::optional<double> frontArmorYaw(const Vec3& from, const std::vector<EnemyInfo>& enemies,
                                     double ownHeight, const Arena& arena);
 std::optional<RetreatPlan> planRetreat(const Vec3& from, const Threat& threat, const std::vector<Vec3>& enemies,
