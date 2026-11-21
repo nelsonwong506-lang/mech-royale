@@ -228,13 +228,16 @@ public:
         }
 
         // Dynamic Fight-First + Regen-to-100% Rule:
-        // Never abandon a finishable kill or winning 1v1; once safely regenerating, heal to ~100% (96%)
-        // unless zone urgency, finishable kill, or clear enemy opening!
+        // Never abandon a finishable kill or winning 1v1.
+        // When safely hidden out of enemy LOS (exposedNow == 0 && !underThreat), heal to ~100% (96%).
+        // When an enemy is actively engaging or in LOS (exposedNow > 0 || underThreat), exit regenMode_ at >= 85% HP
+        // so we NEVER fight in defensive mode or disable our laser when we already have 85%+ HP!
         const bool finishableClose = threat && threat->position && threat->hp <= 520.0 &&
             distanceXY(start, *threat->position) <= 75.0 && hpFrac >= 0.22;
         const bool winning1v1 = close80 <= 1 && threat && threat->position &&
             threat->hp < hp * 0.85 && hpFrac >= 0.25;
-        if (!inZone || window.urgent || hpFrac >= 0.96 || finishableClose || winning1v1 || enemyOpening) {
+        const double regenExitThreshold = (exposedNow == 0 && !underThreat) ? 0.96 : 0.85;
+        if (!inZone || window.urgent || hpFrac >= regenExitThreshold || finishableClose || winning1v1 || enemyOpening) {
             regenMode_ = false;
         } else if (hpFrac < 0.42 || (hpFrac < 0.65 && (onRoof || exposedNow == 0 || hasNanites))) {
             regenMode_ = true;
@@ -292,19 +295,24 @@ public:
         const bool defending = effectiveFireAllowed && !joining && !(shot && shot->firing()) && !laserCharging &&
             return_fire(obs, threat, command.move, arena_, decision.returningToCover);
 
-        // Aim priority: active shot > duel > visible front-armor facing (NEVER sell 1.5x rear armor!) > rear-hit snap > blind-spot sound > threat > scan.
+        // Aim priority: active shot > duel > visible front-armor facing (with +-22 deg radar sweep when not aiming a shot,
+        // keeping 100% within +-90 deg front armor while widening FOV to 164 deg!) > rear-hit snap > blind-spot sound > close/active threat pre-aim > 360° scanAim while walking!
+        const bool isMoving = std::hypot(command.move[0], command.move[1]) >= 0.25;
         std::optional<Vec2> aim;
         if (shot) {
             aim = shot->aim;
         } else if (canJoin) {
             aim = retreat_aim(obs, duel);
         } else if (const auto armorYaw = frontArmorYaw(start, enemyInfos, motion.height, arena_)) {
-            aim = Vec2{*armorYaw, 0.0};
+            const double radarSweep = 0.38 * std::sin(now * 3.6);
+            aim = Vec2{*armorYaw + radarSweep, 0.0};
         } else if (const auto rearYaw = threats_.recent_rear_hit_bearing(now)) {
             aim = Vec2{*rearYaw, 0.0};
         } else if (soundAlert && (soundAlert->laser_charge || (onRoof && soundAlert->near_jet) || soundAlert->near_hostile)) {
             aim = Vec2{soundAlert->bearing, (onRoof && soundAlert->near_jet) ? -0.35 : 0.0};
-        } else if (threat && threat->position) {
+        } else if (threat && threat->position &&
+                   (underThreat || peek_ || (!isMoving && regenMode_) ||
+                    (distanceXY(start, *threat->position) <= 75.0 && std::fmod(now, 2.0) < 1.1))) {
             aim = retreat_aim(obs, threat);
         }
         if (aim) {
@@ -743,13 +751,13 @@ private:
             }
         }
 
-        // User's Storm-Finish Rule: allow brief early/mid storm tanking (dps <= 60, ample HP, near border)
+        // User's Storm-Finish Rule: allow brief early storm tanking (dps <= 35, ample HP >= 900, near border)
         // to finish a low-HP 1v1 kill before rotating into the safe zone!
         const bool canFinishInStorm = (!inZone || window.urgent) && threat && threat->position &&
-            !threat->is_npc && close80 <= 1 && threat->hp <= 380.0 &&
-            distanceXY(start, *threat->position) <= 55.0 &&
-            zone.dps <= 60.0 && hp >= 600.0 && hpFrac >= 0.42 &&
-            zone.clearance(start, zone.now) >= -30.0;
+            !threat->is_npc && close80 <= 1 && threat->hp <= 320.0 &&
+            distanceXY(start, *threat->position) <= 48.0 &&
+            zone.dps > 0.0 && zone.dps <= 35.0 && hp >= 900.0 && hpFrac >= 0.65 &&
+            zone.clearance(start, zone.now) >= -18.0;
 
         if (threat && threat->position && ((!window.urgent && inZone) || canFinishInStorm)) {
             const double threatDist = distanceXY(start, *threat->position);
@@ -974,9 +982,10 @@ private:
         const bool blocked = threat->facing_us && wallBehind(start, away, motion);
         if (zone.now >= nextHopAt_ && exposed && (laser || threat->damaged_recently || blocked)) {
             const auto path = planDefensiveHop(me, *threat, enemies, zone, motion, arena_, navigator_, laser, blocked, deadline);
-            // Only hop when dodging a charging laser, escaping a pinning wall behind us, or jumping INTO cover (>=2/3)!
-            // Never jump into 0-cover open air on normal gun fire (which disables 19.5 m/s ground boost & 58.5 m/s^2 ground strafing).
-            const bool goodHop = path && wallCover(path->landing, enemy, motion.height, arena_) >= 2;
+            // Allow defensive hop when it gains cover (>=2/3), or under close-range/multi-enemy pressure (Lesson #6);
+            // only skip pointless open-field single-bullet hops at long range (> 45m, 1v1, 0 cover).
+            const bool goodHop = path && (wallCover(path->landing, enemy, motion.height, arena_) >= 2 ||
+                                          distanceXY(start, enemy) <= 45.0 || enemies.size() >= 2);
             if (path && (laser || blocked || goodHop) && keepsRotation(start, path->landing, zone, window)) {
                 const auto label = laser ? "laser-hop" : blocked ? "wall-hop" : "cover-hop";
                 hop_ = ActiveHop{*path, zone.now, label};
@@ -1225,13 +1234,12 @@ private:
         }
         monitorProgress(start, target, zone.now, navigator_.isSearching());
         const bool boost = grounded && target &&
-            ((!insideNext && (outside || eta + 4.5 > window.secondsUntilRisk)) ||
-             (hostileNow && energy > 0.35 * maximum)) &&
+            ((!insideNext && (outside || eta + 3 > window.secondsUntilRisk)) ||
+             (hostileNow && !insideNext && energy > 0.40 * maximum)) &&
             energy > 0.2 * maximum + motion.boostDrain * 0.2;
         Zone moveZone = zone;
-        if (outside || (window.urgent && route.empty())) {
-            // When already outside the zone or routing around a blocking building wall under urgent rotation,
-            // enforce 100% prism/wall collision safety without letting Zone::segment trap us against a wall!
+        if (outside) {
+            // ONLY when already outside the zone: allow sliding around blocking walls without Zone::segment locking us!
             moveZone.radius += 120.0;
             moveZone.nextRadius += 120.0;
         }

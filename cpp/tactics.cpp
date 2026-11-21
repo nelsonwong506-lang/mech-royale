@@ -221,7 +221,7 @@ Shot shot_points(const Json& me, const Threat& threat, const Json& weapon_stats,
     const Vec3 base_origin = muzzle(me);
     const Vec3 lead_origin{base_origin[0] + self_vel[0] * 0.05,
                            base_origin[1] + self_vel[1] * 0.05,
-                           base_origin[2]};
+                           base_origin[2] + self_vel[2] * 0.05};
     const Vec3 target = above(*threat.attack_position, threat.attack_height / 2);
     const Vec3 velocity = threat.attack_velocity.value_or(Vec3{});
     if (hitscan) {
@@ -373,13 +373,18 @@ bool weapon_ready(const Json& weapon) {
            number(weapon, "reload", 0.0) <= 0.0 && number(weapon, "ammo", 1.0) > 0.0;
 }
 
-bool aim_aligned(const Vec2& desired, const Vec2& actual, double distance, double radius, double extra_slack = 0.025) {
+bool aim_aligned(const Vec2& desired, const Vec2& actual, double distance, double radius,
+                 double extra_slack = 0.025, double target_height = 0.0) {
     const auto [yaw, pitch] = desired;
     const auto [actual_yaw, actual_pitch] = actual;
     const double yaw_error = std::remainder(yaw - actual_yaw, Tau) * std::cos(pitch);
     const double pitch_error = pitch - actual_pitch;
-    const double tolerance = std::min(0.18, std::atan2(radius, std::max(distance, 1.0)) + extra_slack);
-    return yaw_error * yaw_error + pitch_error * pitch_error <= tolerance * tolerance;
+    const double yaw_tol = std::min(0.18, std::atan2(radius, std::max(distance, 1.0)) + extra_slack);
+    const double vert_half = std::max(radius, target_height * 0.40);
+    const double pitch_tol = std::min(0.24, std::atan2(vert_half, std::max(distance, 1.0)) + extra_slack);
+    const double norm_yaw = yaw_error / std::max(1e-4, yaw_tol);
+    const double norm_pitch = pitch_error / std::max(1e-4, pitch_tol);
+    return norm_yaw * norm_yaw + norm_pitch * norm_pitch <= 1.0;
 }
 
 bool clear_aim_line(const Vec3& origin, const Vec2& actual, double distance, const Arena& arena) {
@@ -416,7 +421,7 @@ bool ready_aligned_shot(const Json& me, const Threat& target, const Arena& arena
     const auto actual = pair_or(me, "aim");
     const double slack = distance > 90.0 ? 0.012 : 0.025;
     return distance <= number(weapon_stats, "range", 230.0) &&
-           aim_aligned(angles(shot.lead_origin, *aim_point), actual, distance, target.attack_radius, slack) &&
+           aim_aligned(angles(shot.lead_origin, *aim_point), actual, distance, target.attack_radius, slack, target.attack_height) &&
            clear_aim_line(shot.origin, actual, distance, arena);
 }
 
@@ -685,6 +690,30 @@ std::vector<EnemyInfo> ThreatTracker::visible_enemies(const Json& obs, const Are
             enemy_aims_at(desc, self_pos, self_radius, self_height, arena);
         list.push_back(info);
     }
+    // Include recent off-FOV attackers (< 2.5s) whose real position is known (from vision memory or beam origin)
+    // so 1vMany cover-splitting & rooftop climbing (close80 >= 2) never forget an off-angle flanker!
+    const double now = match_time(obs);
+    for (const auto& [att_id, mem] : attacks_) {
+        if (mem.is_npc || now - mem.time > 2.5) continue;
+        if (std::any_of(list.begin(), list.end(), [&](const EnemyInfo& e) { return e.id == att_id; })) {
+            continue;
+        }
+        std::optional<Vec3> real_pos;
+        if (const auto it = last_seen_pos_.find(att_id); it != last_seen_pos_.end()) {
+            real_pos = it->second;
+        } else if (mem.exact_pos && mem.position) {
+            real_pos = *mem.position;
+        }
+        if (!real_pos) continue;
+        EnemyInfo flanker;
+        flanker.id = att_id;
+        flanker.pos = *real_pos;
+        flanker.hp = 1200.0;
+        flanker.radius = mech_radius_;
+        flanker.height = mech_height_;
+        flanker.facing_us = true;
+        list.push_back(flanker);
+    }
     return list;
 }
 
@@ -794,12 +823,18 @@ std::optional<Threat> ThreatTracker::update(const Json& obs, const Arena& arena,
                 mem.is_npc = is_npc;
                 if (const auto it = enemies.find(*id); it != enemies.end()) {
                     mem.position = point_or(*it->second, "pos");
+                    mem.exact_pos = true;
                 } else if (const auto it = npcs.find(*id); it != npcs.end()) {
                     mem.position = point_or(*it->second, "pos");
+                    mem.exact_pos = true;
+                } else if (const auto it = last_seen_pos_.find(*id); it != last_seen_pos_.end()) {
+                    mem.position = it->second;
+                    mem.exact_pos = true;
                 } else if (bearing.is_number()) {
                     const double angle = finiteOr(bearing.get<double>());
                     mem.position = Vec3{position[0] + 40 * std::cos(angle),
                                         position[1] + 40 * std::sin(angle), position[2]};
+                    mem.exact_pos = false;
                 }
             } else if (bearing.is_number()) {
                 const double angle = finiteOr(bearing.get<double>());
@@ -840,6 +875,8 @@ std::optional<Threat> ThreatTracker::update(const Json& obs, const Arena& arena,
                     mem.is_npc = npcs.count(*shooter) > 0;
                     if (const auto a = try_point(path[0])) {
                         mem.position = *a;
+                        mem.exact_pos = true;
+                        last_seen_pos_[*shooter] = *a;
                     }
                 } else if (const auto a = try_point(path[0])) {
                     unknown_position_ = *a;
@@ -1396,9 +1433,9 @@ std::optional<GunShot> ThreatTracker::visible_shot(const Json& obs, const Arena&
             const double hp = std::clamp(target.hp, 1.0, 2200.0);
             const double hp_bonus = (is_npc && !attacking_npc)
                 ? -450.0  // Only farm passive NPCs when no real enemy mech can be shot.
-                : ((hp <= 350.0 ? 240.0 : 0.0) + std::max(0.0, 1400.0 - hp) * 0.15);
-            const double sticky_bonus = (!is_npc && sticky_target_id && *sticky_target_id == *id && hp < 1150.0)
-                ? 65.0 : 0.0;
+                : ((hp <= 520.0 ? 240.0 + (520.0 - hp) * 0.35 : 0.0) + std::max(0.0, 1400.0 - hp) * 0.18);
+            const double sticky_bonus = (!is_npc && sticky_target_id && *sticky_target_id == *id && hp < 1200.0)
+                ? 85.0 : 0.0;
             const double threat_bonus = is_primary && primary_threat->hostile
                 ? (primary_threat->laser_charging ? 200.0 : 95.0) : 0.0;
 
@@ -1443,7 +1480,8 @@ std::optional<GunShot> ThreatTracker::visible_shot(const Json& obs, const Arena&
                     if (dist > slot.range) continue;
                     const Vec2 aim = angles(shot.lead_origin, *aim_pt);
                     const double slack = dist > 90.0 ? 0.012 : 0.025;
-                    const bool fire = slot.ready && aim_aligned(aim, actual, dist, target.attack_radius, slack) &&
+                    const bool fire = slot.ready &&
+                                      aim_aligned(aim, actual, dist, target.attack_radius, slack, target.attack_height) &&
                                       clear_aim_line(shot.origin, actual, dist, arena);
                     gun_aim = aim;
                     gun_can_fire = fire;

@@ -597,15 +597,12 @@ std::optional<CombatMove> planCombatPosition(const Vec3& from, const Threat& pri
         int lightningCluster = 0;
         double minEnemyDist = infinity;
         double weaponDangerPenalty = 0.0;
-        double treeStealthBonus = 0.0;
         exposedYaws.clear();
-        const Vec3 ptEye{(*point)[0], (*point)[1], (*point)[2] + 8.0};
 
         for (const auto* e : nearby) {
             const double d = distanceXY(*point, e->pos);
             minEnemyDist = std::min(minEnemyDist, d);
-            const int cov = wallCover(*point, e->pos, motion.height, arena);
-            const bool exposed = cov < 3;
+            const bool exposed = wallCover(*point, e->pos, motion.height, arena) < 3;
             if (exposed) {
                 ++exposedCount;
                 exposedYaws.push_back(std::atan2(e->pos[1] - (*point)[1], e->pos[0] - (*point)[0]));
@@ -614,13 +611,6 @@ std::optional<CombatMove> planCombatPosition(const Vec3& from, const Threat& pri
                 }
                 if (e->charging) {
                     weaponDangerPenalty += 30.0;
-                }
-                // Check if OSU Oval tree canopy breaks enemy vision (> 48m) while we can still shoot!
-                if (d > 48.0 && !e->facing_us) {
-                    const Vec3 eEye{e->pos[0], e->pos[1], e->pos[2] + 8.0};
-                    if (arena.blocksVisionTree(eEye, ptEye)) {
-                        treeStealthBonus += 5.0;
-                    }
                 }
             }
             if (ctx.hasLightning && d <= 42.0 && distanceXY(e->pos, focusPos) <= 14.0) {
@@ -631,7 +621,7 @@ std::optional<CombatMove> planCombatPosition(const Vec3& from, const Threat& pri
             return;
         }
 
-        // Front-armor protection: penalize positions where exposed enemies span > 145 deg (1.5x rear-armor risk!).
+        // Front-armor protection: penalize positions where exposed enemies span > 150 deg (1.5x rear-armor risk!).
         const auto [span, centerYaw] = angularCoverage(exposedYaws);
         (void)centerYaw;
         double rearRiskPenalty = 0.0;
@@ -665,18 +655,18 @@ std::optional<CombatMove> planCombatPosition(const Vec3& from, const Threat& pri
         } else if (multiEnemy) {
             // 1vMany core tactic: isolate EXACTLY 1 exposed enemy via cover-splitting!
             if (exposedCount == 1 && hasFocusLos) {
-                exposureScore = 44.0;
+                exposureScore = 56.0;
                 label = "split-1v1";
             } else if (exposedCount == 0) {
-                exposureScore = ctx.hasMortar ? 32.0 : 18.0;
+                exposureScore = ctx.hasMortar ? 36.0 : 20.0;
                 label = ctx.hasMortar ? "mortar-cover" : "reposition";
             } else if (exposedCount == 2 && ctx.hasLightning && ctx.energy >= 20.0 &&
                        hpFrac >= 0.55 && lightningCluster >= 2 && span <= radians(115.0)) {
                 // Lightning chains across both enemies inside front armor arc!
-                exposureScore = 26.0;
+                exposureScore = 28.0;
                 label = "chain-kite";
             } else {
-                exposureScore = -22.0 * (exposedCount - 1) + (hasFocusLos ? 6.0 : -8.0);
+                exposureScore = -28.0 * (exposedCount - 1) + (hasFocusLos ? 6.0 : -8.0);
                 label = "kite-multi";
             }
         } else {
@@ -736,7 +726,7 @@ std::optional<CombatMove> planCombatPosition(const Vec3& from, const Threat& pri
             }
         }
 
-        const double score = exposureScore + treeStealthBonus + pinchBonus +
+        const double score = exposureScore + pinchBonus +
             repositionBonus + momentumBonus + dodgeBonus + roofBonus + pullBonus +
             (defensive ? 3.5 : 8.0) * lateral + (preferredSide ? 2.5 : 0.0) -
             (defensive ? 0.15 : 0.45) * rangeError - weaponDangerPenalty - rearRiskPenalty -
@@ -752,11 +742,9 @@ std::optional<CombatMove> planCombatPosition(const Vec3& from, const Threat& pri
         }
     };
 
-    const bool nearCornerWall = !ctx.onRoof && arena.distanceToNearestWall(from[0], from[1], from[2], 10.0) <= 8.5;
     const std::array<double, 4> roofLengths{2.8, 5.5, 9.0, 14.0};
-    const std::array<double, 4> cornerLengths{3.2, 8.5, 14.5, 20.0};
     const std::array<double, 4> groundLengths{9.0, 15.0, 21.0, 5.5};
-    const auto& stepLengths = ctx.onRoof ? roofLengths : (nearCornerWall ? cornerLengths : groundLengths);
+    const auto& stepLengths = ctx.onRoof ? roofLengths : groundLengths;
     for (const double length : stepLengths) {
         for (const int offset : baseOffsets) {
             if (Clock::now() >= deadline) {
@@ -784,12 +772,6 @@ std::optional<CombatMove> planCombatPosition(const Vec3& from, const Threat& pri
                 evaluateCandidate(xy, length, true, lat);
             }
         }
-    }
-    // Also evaluate nearest OSU Oval tree visual cover spot when fighting > 48m in open lawn.
-    if (ctx.treeCover && Clock::now() < deadline) {
-        const double len = distanceXY(from, *ctx.treeCover);
-        const double yaw = std::atan2((*ctx.treeCover)[1] - from[1], (*ctx.treeCover)[0] - from[0]);
-        evaluateCandidate(*ctx.treeCover, len, true, std::abs(std::sin(yaw - toFocus)));
     }
     return best;
 }

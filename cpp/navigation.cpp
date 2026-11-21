@@ -219,7 +219,7 @@ void Navigator::advance(Search& search, const Zone& zone, const Motion& motion, 
                 }
                 const double duration = length / motion.walk;
                 const double endClearance = zone.clearance(point, at + duration);
-                if (!zone.segment(horizontal(entry.point), point, at, duration) && endClearance < -28.0) {
+                if (!zone.segment(horizontal(entry.point), point, at, duration) && endClearance < -22.0) {
                     continue;
                 }
                 const double maxClimb = std::max(motion.step * 3.0, std::tan(radians(motion.slope)) * length + 0.2);
@@ -285,7 +285,7 @@ std::vector<Vec3> Navigator::usable(const Vec3& from, const std::vector<Vec3>& p
                                     const Zone& zone, const Motion& motion) {
     for (std::size_t end = std::min<std::size_t>(6, path.size()); end > 0; --end) {
         const auto& point = path[end - 1];
-        if (distanceXY(from, point) <= 16.0 && direct(from, point, zone, motion)) {
+        if (distanceXY(from, point) <= 15.0 && direct(from, point, zone, motion)) {
             return {path.begin() + static_cast<std::ptrdiff_t>(end - 1), path.end()};
         }
     }

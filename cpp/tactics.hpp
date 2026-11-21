@@ -117,6 +117,7 @@ private:
         double time = -std::numeric_limits<double>::infinity();
         std::optional<Vec3> position;
         bool is_npc = false;
+        bool exact_pos = false;
     };
 
     struct HealthSample {
