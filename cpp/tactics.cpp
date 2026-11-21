@@ -379,7 +379,7 @@ bool aim_aligned(const Vec2& desired, const Vec2& actual, double distance, doubl
     const auto [actual_yaw, actual_pitch] = actual;
     const double yaw_error = std::remainder(yaw - actual_yaw, Tau) * std::cos(pitch);
     const double pitch_error = pitch - actual_pitch;
-    const double yaw_tol = std::min(0.18, std::atan2(radius, std::max(distance, 1.0)) + extra_slack);
+    const double yaw_tol = std::min(0.16, std::atan2(radius * 0.92, std::max(distance, 1.0)) + extra_slack);
     const double vert_half = std::max(radius, target_height * 0.40);
     const double pitch_tol = std::min(0.24, std::atan2(vert_half, std::max(distance, 1.0)) + extra_slack);
     const double norm_yaw = yaw_error / std::max(1e-4, yaw_tol);
@@ -1546,11 +1546,18 @@ std::optional<GunShot> ThreatTracker::visible_shot(const Json& obs, const Arena&
                         }
                     } else if (slot.ready && allow_laser_charge && !is_npc && !enemy_holds_lightning_close &&
                                (target.has_mortar || dist > 62.0 || !gun_is_ready || !target.facing_us)) {
-                        laser_aim = aim;
-                        laser_slot = slot.index;
-                        laser_dist = dist;
-                        laser_trigger = true;
-                        laser_bonus = (target.has_mortar ? 170.0 : 45.0);
+                        const Vec3 vel = target.attack_velocity.value_or(Vec3{});
+                        const Vec3 future_target{shot.target[0] + vel[0] * 0.38,
+                                                 shot.target[1] + vel[1] * 0.38,
+                                                 shot.target[2]};
+                        const bool stays_in_los = dist <= 38.0 || !arena.blocksLine(shot.origin, future_target);
+                        if (stays_in_los) {
+                            laser_aim = aim;
+                            laser_slot = slot.index;
+                            laser_dist = dist;
+                            laser_trigger = true;
+                            laser_bonus = (target.has_mortar ? 170.0 : 45.0);
+                        }
                     }
                 } else if (slot.kind == "mortar" && slot.ready && !is_npc) {
                     const double speed = number(*slot.stats, "speed", 72.0);

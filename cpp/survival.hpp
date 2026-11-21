@@ -32,6 +32,7 @@ struct CombatContext {
     double cubes = 0.0;
     double muzzleHeight = 7.0;
     double strafeSign = 1.0;
+    double weaveInOut = 1.0;
     bool hasLightning = false;
     bool hasLaser = false;
     bool hasMortar = false;
@@ -47,6 +48,7 @@ struct CombatContext {
     std::optional<Vec2> bulletDodge;
     std::optional<Vec2> coverPull;
     std::optional<Vec2> treeCover;
+    std::vector<Vec3> nearbyCubes;
 };
 
 struct CombatMove {

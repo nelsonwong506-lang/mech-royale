@@ -643,7 +643,7 @@ std::optional<CombatMove> planCombatPosition(const Vec3& from, const Threat& pri
         if (defensive) {
             // Regen or reload: strongly prefer full cover (0 exposed) or breaking LOS.
             if (exposedCount == 0) {
-                exposureScore = 48.0;
+                exposureScore = ctx.reloading ? 58.0 : 48.0;
                 label = ctx.onRoof ? "roof-tuck" : (ctx.wantRegen ? "regen-cover" : "reload-cover");
             } else if (exposedCount == 1) {
                 exposureScore = 10.0;
@@ -689,10 +689,16 @@ std::optional<CombatMove> planCombatPosition(const Vec3& from, const Threat& pri
         const double escapeAlign = std::cos(moveYaw - escapeYaw);
         const double pinchBonus = (multiEnemy || defensive) ? 8.5 * escapeAlign : 0.0;
 
-        // Momentum continuity: smooth high-speed circular strafing instead of left-right jitter.
+        // 2D Left-Right + In-Out weave bonus ("上下左右走位") to defeat enemy linear lead prediction.
+        const double radialAlign = std::cos(moveYaw - toFocus);
+        const double weaveBonus = !defensive
+            ? (preferredSide ? 7.2 : -1.5) + 3.6 * (ctx.weaveInOut * radialAlign)
+            : (preferredSide ? 2.5 : 0.0);
+
+        // Momentum continuity only within the current weave phase so strafe reversals happen crisply.
         const double velSpeed = std::hypot(ctx.velocity[0], ctx.velocity[1]);
-        const double momentumBonus = velSpeed > 1.5
-            ? 3.8 * (moveDir[0] * ctx.velocity[0] + moveDir[1] * ctx.velocity[1]) / velSpeed
+        const double momentumBonus = (velSpeed > 1.5 && preferredSide)
+            ? 2.0 * std::max(0.0, (moveDir[0] * ctx.velocity[0] + moveDir[1] * ctx.velocity[1]) / velSpeed)
             : 0.0;
 
         // Incoming bullet sidestep bias.
@@ -715,6 +721,20 @@ std::optional<CombatMove> planCombatPosition(const Vec3& from, const Threat& pri
             }
         }
 
+        // Mid-combat power cube grab: pick up nearby dropped cubes (instant heal + permanent damage/HP buff!).
+        double cubeGrabBonus = 0.0;
+        if (!ctx.nearbyCubes.empty() && minEnemyDist >= 14.0) {
+            for (const auto& cpos : ctx.nearbyCubes) {
+                const double dAfter = distanceXY(xy, cpos);
+                const double dBefore = distanceXY(from, cpos);
+                if (dAfter <= 3.4) {
+                    cubeGrabBonus = std::max(cubeGrabBonus, hpFrac < 0.75 ? 36.0 : 25.0);
+                } else if (dBefore <= 13.0 && dAfter < dBefore) {
+                    cubeGrabBonus = std::max(cubeGrabBonus, (dBefore - dAfter) * (hpFrac < 0.75 ? 2.6 : 1.8));
+                }
+            }
+        }
+
         // Penalize walking closer to non-focus enemies.
         double otherApproachPenalty = 0.0;
         for (const auto* e : nearby) {
@@ -727,8 +747,8 @@ std::optional<CombatMove> planCombatPosition(const Vec3& from, const Threat& pri
         }
 
         const double score = exposureScore + pinchBonus +
-            repositionBonus + momentumBonus + dodgeBonus + roofBonus + pullBonus +
-            (defensive ? 3.5 : 8.0) * lateral + (preferredSide ? 2.5 : 0.0) -
+            repositionBonus + momentumBonus + dodgeBonus + roofBonus + pullBonus + cubeGrabBonus +
+            (defensive ? 3.5 : 8.5) * lateral + weaveBonus -
             (defensive ? 0.15 : 0.45) * rangeError - weaponDangerPenalty - rearRiskPenalty -
             0.55 * otherApproachPenalty + 0.32 * progress + 0.025 * std::min(40.0, clearance);
 
@@ -771,6 +791,17 @@ std::optional<CombatMove> planCombatPosition(const Vec3& from, const Threat& pri
                 const double lat = std::abs(std::sin(yaw - toFocus));
                 evaluateCandidate(xy, length, true, lat);
             }
+        }
+    }
+    // Also evaluate stepping directly onto safe nearby power cubes during combat.
+    for (const auto& cpos : ctx.nearbyCubes) {
+        if (Clock::now() >= deadline) break;
+        const Vec2 xy = horizontal(cpos);
+        const double len = distanceXY(from, xy);
+        if (len >= 2.0 && len <= 15.0) {
+            const double yaw = std::atan2(xy[1] - from[1], xy[0] - from[0]);
+            const double lat = std::abs(std::sin(yaw - toFocus));
+            evaluateCandidate(xy, len, true, lat);
         }
     }
     return best;

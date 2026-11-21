@@ -90,40 +90,58 @@ std::string toLowerText(const Json& item) {
 }
 
 int weaponPriority(std::string_view kind) {
-    if (kind == "lightning") return 100;
-    if (kind == "laser") return 75;
-    if (kind == "mortar") return 55;
+    if (kind == "lightning") return 85;
+    if (kind == "laser") return 78;
+    if (kind == "mortar") return 64;
     if (kind == "gun") return 10;
     return 0;
 }
 
-int upgradePriority(const Json& choice) {
+bool holdsWeaponKind(const Json& weapons, std::string_view kind) {
+    if (!weapons.is_array()) return false;
+    return std::any_of(weapons.begin(), weapons.end(), [kind](const Json& w) {
+        return w.is_object() && w.value("kind", "") == kind;
+    });
+}
+
+int upgradePriority(const Json& choice, const Json& weapons) {
     if (choice.is_object()) {
         const auto idIt = choice.find("id");
         if (idIt != choice.end() && idIt->is_string()) {
             const std::string_view id = idIt->get_ref<const std::string&>();
-            if (id == "nanites") return 100;
-            if (id == "armor") return 96;
-            if (id == "plating") return 92;
-            if (id == "lightning_efficiency") return 90;
-            if (id == "lightning_chain") return 88;
-            if (id == "lightning_range") return 86;
-            if (id == "gun_damage") return 84;
-            if (id == "gun_rate") return 82;
-            if (id == "laser_charge") return 80;
-            if (id == "laser_damage") return 79;
-            if (id == "gun_mag") return 78;
-            if (id == "servos") return 76;
-            if (id == "laser_pierce") return 72;
-            if (id == "reactor") return 70;
-            if (id == "jets") return 65;
-            if (id == "mortar_reload") return 64;
-            if (id == "capacitor") return 62;
-            if (id == "mortar_splash") return 62;
-            if (id == "mortar_velocity") return 58;
-            if (id == "gun_velocity") return 56;
-            if (id == "gyros") return 52;
-            if (id == "sensors") return 48;
+            int base = 50;
+            if (id == "nanites") base = 100;
+            else if (id == "armor") base = 96;
+            else if (id == "plating") base = 92;
+            else if (id == "gun_damage") base = 88;
+            else if (id == "gun_rate") base = 86;
+            else if (id == "lightning_efficiency") base = 84;
+            else if (id == "lightning_chain") base = 82;
+            else if (id == "lightning_range") base = 80;
+            else if (id == "laser_charge") base = 82;
+            else if (id == "laser_damage") base = 80;
+            else if (id == "gun_mag") base = 78;
+            else if (id == "servos") base = 76;
+            else if (id == "laser_pierce") base = 73;
+            else if (id == "reactor") base = 72;
+            else if (id == "mortar_reload") base = 74;
+            else if (id == "mortar_splash") base = 72;
+            else if (id == "jets") base = 65;
+            else if (id == "capacitor") base = 64;
+            else if (id == "mortar_velocity") base = 62;
+            else if (id == "gun_velocity") base = 58;
+            else if (id == "gyros") base = 52;
+            else if (id == "sensors") base = 48;
+
+            // Boost upgrades matching our actually equipped secondary weapon!
+            if (id.rfind("lightning_", 0) == 0) {
+                base += holdsWeaponKind(weapons, "lightning") ? 10 : -18;
+            } else if (id.rfind("laser_", 0) == 0) {
+                base += holdsWeaponKind(weapons, "laser") ? 10 : -18;
+            } else if (id.rfind("mortar_", 0) == 0) {
+                base += holdsWeaponKind(weapons, "mortar") ? 14 : -18;
+            }
+            return base;
         }
     }
     const std::string desc = toLowerText(choice);
@@ -137,7 +155,7 @@ int upgradePriority(const Json& choice) {
     return score;
 }
 
-int chooseOfferPick(const Json& offer) {
+int chooseOfferPick(const Json& offer, const Json& weapons) {
     const Json* choices = nullptr;
     if (offer.is_array() && !offer.empty()) {
         choices = &offer;
@@ -156,7 +174,7 @@ int chooseOfferPick(const Json& offer) {
     int bestIndex = 0;
     int bestScore = std::numeric_limits<int>::min();
     for (std::size_t i = 0; i < choices->size(); ++i) {
-        const int score = upgradePriority((*choices)[i]);
+        const int score = upgradePriority((*choices)[i], weapons);
         if (score > bestScore) {
             bestScore = score;
             bestIndex = static_cast<int>(i);
@@ -295,17 +313,18 @@ public:
         const bool defending = effectiveFireAllowed && !joining && !(shot && shot->firing()) && !laserCharging &&
             return_fire(obs, threat, command.move, arena_, decision.returningToCover);
 
-        // Aim priority: active shot > duel > visible front-armor facing (with +-22 deg radar sweep when not aiming a shot,
-        // keeping 100% within +-90 deg front armor while widening FOV to 164 deg!) > rear-hit snap > blind-spot sound > close/active threat pre-aim > 360° scanAim while walking!
+        // Aim priority: active shot > duel > zero-lag threat/front-armor pre-aim > rear-hit snap > blind-spot sound > 360° scanAim while walking!
         const bool isMoving = std::hypot(command.move[0], command.move[1]) >= 0.25;
         std::optional<Vec2> aim;
         if (shot) {
             aim = shot->aim;
         } else if (canJoin) {
             aim = retreat_aim(obs, duel);
+        } else if (threat && threat->position && exposedNow == 1 &&
+                   wallCover(start, *threat->position, motion.height, arena_) < 3) {
+            aim = retreat_aim(obs, threat);
         } else if (const auto armorYaw = frontArmorYaw(start, enemyInfos, motion.height, arena_)) {
-            const double radarSweep = 0.38 * std::sin(now * 3.6);
-            aim = Vec2{*armorYaw + radarSweep, 0.0};
+            aim = Vec2{*armorYaw, 0.0};
         } else if (const auto rearYaw = threats_.recent_rear_hit_bearing(now)) {
             aim = Vec2{*rearYaw, 0.0};
         } else if (soundAlert && (soundAlert->laser_charge || (onRoof && soundAlert->near_jet) || soundAlert->near_hostile)) {
@@ -361,11 +380,12 @@ public:
         }
         action["reload"] = shouldReload;
 
-        // Explicit weapon pickup / upgrade swap (protocol.md §7: must send "take": id within 4 m).
-        attachWeaponTake(obs, me, weapons, start, laserCharging, exposedNow, close35, action);
+        // Explicit situational weapon pickup / counter-triangle swap (protocol.md §7).
+        attachWeaponTake(obs, me, weapons, start, enemyInfos, threat, onRoof, zone,
+                         laserCharging, exposedNow, close35, action);
 
         if (const auto offerIt = obs.find("offer"); offerIt != obs.end() && !offerIt->is_null()) {
-            action["pick"] = chooseOfferPick(*offerIt);
+            action["pick"] = chooseOfferPick(*offerIt, weapons);
         }
         if (config_.value("debug", Json::object()).value("max_text_chars", 0) >= 16) {
             action["debug"] = {{"label", joining ? "duel-fire" : canJoin ? "duel-aim" : decision.label}};
@@ -433,9 +453,83 @@ private:
         return false;
     }
 
+    int situationalWeaponScore(std::string_view kind, const Json& me, const Vec3& start,
+                               const std::vector<EnemyInfo>& enemyInfos, const std::optional<Threat>& threat,
+                               bool onRoof, const Zone& zone) const {
+        int score = weaponPriority(kind);
+        if (score <= 10) return score;
+
+        // 1. Owned upgrades bonus: weapon upgrades belong to the mech (protocol.md §10),
+        // so never throw away a weapon we have already invested upgrades into!
+        bool hasEnergyUpgrade = false;
+        const auto upIt = me.find("upgrades");
+        if (upIt != me.end() && upIt->is_array()) {
+            for (const auto& u : *upIt) {
+                std::string_view uid;
+                if (u.is_string()) {
+                    uid = u.get_ref<const std::string&>();
+                } else if (u.is_object() && u.contains("id") && u["id"].is_string()) {
+                    uid = u["id"].get_ref<const std::string&>();
+                }
+                if (uid.empty()) continue;
+                if (kind == "lightning" && uid.rfind("lightning_", 0) == 0) score += 26;
+                else if (kind == "laser" && uid.rfind("laser_", 0) == 0) score += 26;
+                else if (kind == "mortar" && uid.rfind("mortar_", 0) == 0) score += 26;
+                if (uid == "reactor" || uid == "capacitor") hasEnergyUpgrade = true;
+            }
+        }
+        if (kind == "lightning" && hasEnergyUpgrade) {
+            score += 8;
+        }
+
+        // 2. Official Weapon Counter Triangle (protocol.md §7):
+        // Laser beats Mortar (+60% Cook-off), Mortar beats Lightning (Concussion + 45 energy drain),
+        // Lightning beats Laser (2.0s Short).
+        bool enemyHasMortar = threat && threat->has_mortar && threat->position && distanceXY(start, *threat->position) <= 140.0;
+        bool enemyHasLaser = threat && threat->has_laser && threat->position && distanceXY(start, *threat->position) <= 140.0;
+        bool enemyHasLightning = threat && threat->has_lightning && threat->position && distanceXY(start, *threat->position) <= 110.0;
+        for (const auto& e : enemyInfos) {
+            const double d = distanceXY(start, e.pos);
+            if (d <= 140.0) {
+                if (e.has_mortar) enemyHasMortar = true;
+                if (e.has_laser) enemyHasLaser = true;
+            }
+            if (d <= 110.0 && e.has_lightning) {
+                enemyHasLightning = true;
+            }
+        }
+        if (kind == "laser") {
+            if (enemyHasMortar) score += 26;
+            if (enemyHasLightning) score -= 14;
+        } else if (kind == "mortar") {
+            if (enemyHasLightning) score += 26;
+            if (enemyHasLaser) score -= 26;  // Holding mortar against laser risks +60% Cook-off damage!
+        } else if (kind == "lightning") {
+            if (enemyHasLaser) score += 22;
+        }
+
+        // 3. Our own situation: rooftop elevation, HP, energy reserve, and circle radius.
+        const double hpFrac = me.value("hp", 1400.0) / std::max(1.0, me.value("max_hp", 1400.0));
+        const double energy = me.value("energy", 100.0);
+        if (onRoof) {
+            if (kind == "laser") score += 22;
+            else if (kind == "mortar") score += 18;
+            else if (kind == "lightning") score -= 22;  // 45m lightning cannot reach most ground targets from roofs
+        }
+        if (hpFrac < 0.52 || energy < 38.0) {
+            if (kind == "lightning") score -= 18;  // Too risky to brawl <45m or starve escape energy
+            else if (kind == "mortar") score += 14;
+            else if (kind == "laser") score += 12;
+        } else if (zone.radius <= 140.0 && hpFrac >= 0.62 && energy >= 48.0) {
+            if (kind == "lightning") score += 16;  // Chain lightning dominates tight late-game circles
+        }
+        return score;
+    }
+
     void attachWeaponTake(const Json& obs, const Json& me, const Json& weapons,
-                          const Vec3& start, bool laserCharging, int exposedNow, int close35, Json& action) const {
-        (void)me;
+                          const Vec3& start, const std::vector<EnemyInfo>& enemyInfos,
+                          const std::optional<Threat>& threat, bool onRoof, const Zone& zone,
+                          bool laserCharging, int exposedNow, int close35, Json& action) const {
         const auto it = obs.find("pickups");
         if (it == obs.end() || !it->is_array() || it->empty()) {
             return;
@@ -452,11 +546,13 @@ private:
         int slot1Prio = 0;
         bool slot1Ready = false;
         if (weapons.is_array() && weapons.size() >= 2 && weapons[1].is_object()) {
-            slot1Prio = weaponPriority(weapons[1].value("kind", std::string{}));
+            slot1Prio = situationalWeaponScore(weapons[1].value("kind", std::string{}),
+                                               me, start, enemyInfos, threat, onRoof, zone);
             slot1Ready = weapons[1].value("cooldown", 0.0) <= 0.15;
         }
         // Avoid swapping away a ready secondary mid-brawl (swapping incurs a 1.0-1.65s equip cooldown).
         const bool safeToSwap = !laserCharging && (exposedNow == 0 || !slot1Ready || close35 == 0);
+        constexpr int swapHysteresis = 12;
 
         int bestId = -1;
         int bestPrio = 0;
@@ -472,7 +568,7 @@ private:
             if (kind.empty() || kind == "gun" || hasWeaponKind(weapons, kind)) {
                 continue;
             }
-            const int prio = weaponPriority(kind);
+            const int prio = situationalWeaponScore(kind, me, start, enemyInfos, threat, onRoof, zone);
             if (prio <= bestPrio) continue;
             const auto idIt = p.find("id");
             if (idIt == p.end() || !idIt->is_number()) continue;
@@ -481,7 +577,7 @@ private:
                 bestId = pid;
                 bestPrio = prio;
                 needDrop1 = false;
-            } else if (safeToSwap && prio > slot1Prio) {
+            } else if (safeToSwap && prio >= slot1Prio + swapHysteresis) {
                 bestId = pid;
                 bestPrio = prio;
                 needDrop1 = true;
@@ -768,9 +864,12 @@ private:
                 threat->laser_charging || threatDist <= 70.0 || needRegenCover || canFinishInStorm;
 
             if (activeCombat) {
-                if (zone.now >= nextStrafeFlipAt_ || (zone.now - threats_.last_damage_time() <= 0.15 && zone.now >= nextStrafeFlipAt_ - 0.8)) {
+                if (zone.now >= nextStrafeFlipAt_ || (zone.now - threats_.last_damage_time() <= 0.15 && zone.now >= nextStrafeFlipAt_ - 0.5)) {
                     strafeSign_ = -strafeSign_;
-                    nextStrafeFlipAt_ = zone.now + 1.8;
+                    if (strafeSign_ > 0.0) {
+                        weaveInOut_ = -weaveInOut_;
+                    }
+                    nextStrafeFlipAt_ = zone.now + 0.95;
                 }
                 const bool reloadingNoBackup = isGunReloading(weapons) && !hasReadySecondary(weapons, energy);
 
@@ -792,6 +891,7 @@ private:
                 ctx.cubes = me.value("cubes", 0.0);
                 ctx.muzzleHeight = muzzleHeight;
                 ctx.strafeSign = strafeSign_;
+                ctx.weaveInOut = weaveInOut_;
                 ctx.hasLightning = hasWeaponKind(weapons, "lightning");
                 ctx.hasLaser = hasWeaponKind(weapons, "laser");
                 ctx.hasMortar = hasWeaponKind(weapons, "mortar");
@@ -807,6 +907,19 @@ private:
                 ctx.velocity = {vel3[0], vel3[1]};
                 if (projDodge && !projDodge->urgent_mortar) {
                     ctx.bulletDodge = projDodge->direction;
+                }
+                // Pass nearby power cubes (<= 15m) into combat planner so we grab dropped cubes mid-fight!
+                if (ctx.cubes < cubeStatCap_) {
+                    if (const auto cubesIt = obs.find("cubes"); cubesIt != obs.end() && cubesIt->is_array()) {
+                        for (const auto& c : *cubesIt) {
+                            const auto cpos = safeVec3(c, "pos", {infinity, infinity, 0.0});
+                            if (!std::isfinite(cpos[0])) continue;
+                            if (distanceXY(start, cpos) <= 15.0 && std::abs(start[2] - cpos[2]) <= 3.8 &&
+                                zone.clearance(horizontal(cpos), zone.now + 2.0) > motion.radius + 0.5) {
+                                ctx.nearbyCubes.push_back(cpos);
+                            }
+                        }
+                    }
                 }
                 // When caught in open ground (e.g., OSU Oval lawn), pull the fight toward the nearest building or tree cover!
                 if (!onRoof && arena_.distanceToNearestWall(start[0], start[1], start[2], 24.0) > 16.0) {
@@ -857,8 +970,17 @@ private:
                     }
                     shelteredAt_.reset();
                     const bool sprint = grounded && combatMove->boost;
-                    const auto cmd = groundCommand(start, combatMove->target, me, guardZone, motion, sprint, {});
+                    auto cmd = groundCommand(start, combatMove->target, me, guardZone, motion, sprint, {});
                     if (std::hypot(cmd.move[0], cmd.move[1]) > 0.12) {
+                        const double jumpEnergyMin = (ctx.hasLightning ? 0.48 : 0.35) * maxEnergy;
+                        if (grounded && !onRoof && inZone && !window.urgent && !ctx.laserCharging && !regenMode_ &&
+                            !combatMove->hardCover && (exposedNow >= 1 || underThreat) &&
+                            threatDist <= 52.0 && (threat->facing_us || close80 >= 2) &&
+                            energy >= jumpEnergyMin && zone.now >= nextCombatJumpAt_ &&
+                            arena_.flightSegment(start, {start[0], start[1], start[2] + 3.2}, motion.radius, motion.height)) {
+                            cmd.jump = true;
+                            nextCombatJumpAt_ = zone.now + 1.25;
+                        }
                         return {cmd, combatMove->label, true};
                     }
                     strafeSign_ = -strafeSign_;
@@ -1286,9 +1408,11 @@ private:
         const auto& me = obs.contains("self") && obs["self"].is_object() ? obs["self"] : Json::object();
         const double hpFrac = me.value("hp", 1400.0) / std::max(1.0, me.value("max_hp", 1400.0));
         const bool needsSecondary = countHeldWeapons(weapons) < 2;
+        const bool onRoof = arena_.roofAt(start) != nullptr || start[2] > arena_.ground(start[0], start[1]) + 4.5;
         int slot1Prio = 0;
         if (weapons.is_array() && weapons.size() >= 2 && weapons[1].is_object()) {
-            slot1Prio = weaponPriority(weapons[1].value("kind", std::string{}));
+            slot1Prio = situationalWeaponScore(weapons[1].value("kind", std::string{}),
+                                               me, start, enemyInfos, std::nullopt, onRoof, zone);
         }
         // 1. Visible weapon pickups in the current safe zone.
         if (const auto it = obs.find("pickups"); it != obs.end() && it->is_array()) {
@@ -1298,8 +1422,8 @@ private:
                 if (!item.is_object()) continue;
                 const auto kind = item.value("kind", std::string{});
                 if (kind.empty() || kind == "gun" || hasWeaponKind(weapons, kind)) continue;
-                const int prio = weaponPriority(kind);
-                if (!needsSecondary && prio <= slot1Prio) continue;
+                const int prio = situationalWeaponScore(kind, me, start, enemyInfos, std::nullopt, onRoof, zone);
+                if (!needsSecondary && prio < slot1Prio + 12) continue;
                 const auto pos = safeVec3(item, "pos", {infinity, infinity, 0.0});
                 if (!std::isfinite(pos[0])) continue;
                 const double dist = distanceXY(start, pos);
@@ -1377,12 +1501,14 @@ private:
             return std::nullopt;
         };
 
-        // 1. Prioritize weapon pickups (especially lightning!) when slot 1 is empty or upgradable.
+        // 1. Prioritize weapon pickups using situational weapon evaluation when slot 1 is empty or upgradable.
         const auto& weapons = me.contains("weapons") && me["weapons"].is_array() ? me["weapons"] : Json::array();
         const bool needsSecondary = countHeldWeapons(weapons) < 2;
+        const bool onRoof = arena_.roofAt(start) != nullptr || start[2] > arena_.ground(start[0], start[1]) + 4.5;
         int slot1Prio = 0;
         if (weapons.size() >= 2 && weapons[1].is_object()) {
-            slot1Prio = weaponPriority(weapons[1].value("kind", std::string{}));
+            slot1Prio = situationalWeaponScore(weapons[1].value("kind", std::string{}),
+                                               me, start, enemyInfos, threat, onRoof, zone);
         }
         if (const auto it = obs.find("pickups"); it != obs.end() && it->is_array()) {
             double bestScore = -infinity;
@@ -1391,8 +1517,8 @@ private:
                 if (!item.is_object()) continue;
                 const auto kind = item.value("kind", std::string{});
                 if (kind.empty() || kind == "gun" || hasWeaponKind(weapons, kind)) continue;
-                const int prio = weaponPriority(kind);
-                if (!needsSecondary && prio <= slot1Prio) continue;
+                const int prio = situationalWeaponScore(kind, me, start, enemyInfos, threat, onRoof, zone);
+                if (!needsSecondary && prio < slot1Prio + 12) continue;
                 const auto pos = safeVec3(item, "pos", {infinity, infinity, 0.0});
                 if (!std::isfinite(pos[0])) continue;
                 const double dist = distanceXY(start, pos);
@@ -1647,7 +1773,9 @@ private:
     double anchorSetAt_ = -infinity;
     bool regenMode_ = false;
     double strafeSign_ = 1.0;
+    double weaveInOut_ = 1.0;
     double nextStrafeFlipAt_ = -infinity;
+    double nextCombatJumpAt_ = -infinity;
     double nextPeekAt_ = -infinity;
     double nextHopAt_ = -infinity;
     double goalDeadline_ = -infinity;
