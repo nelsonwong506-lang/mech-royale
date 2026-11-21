@@ -758,7 +758,7 @@ private:
             retreat_.reset();
         }
         shelteredAt_.reset();
-        return rotate(obs, start, zone, motion, threat, enemies, onRoof, window, tickStarted, hardDeadline);
+        return rotate(obs, start, zone, motion, threat, enemies, enemyInfos, onRoof, window, tickStarted, hardDeadline);
     }
 
     std::optional<Decision> supplyDropCapture(const Json& obs, const Vec3& start, const Zone& zone,
@@ -966,7 +966,8 @@ private:
     }
 
     Decision rotate(const Json& obs, const Vec3& start, const Zone& zone, const Motion& motion,
-                    const std::optional<Threat>& threat, const std::vector<Vec3>& enemies, bool onRoof,
+                    const std::optional<Threat>& threat, const std::vector<Vec3>& enemies,
+                    const std::vector<EnemyInfo>& enemyInfos, bool onRoof,
                     const RotationWindow& window, Clock::time_point tickStarted, Clock::time_point hardDeadline) {
         const auto& me = obs.contains("self") && obs["self"].is_object() ? obs["self"] : Json::object();
         Goals route;
@@ -1003,7 +1004,7 @@ private:
                                             std::min(hardDeadline, Clock::now() + 4ms));
             if (const auto airborne = fly(me, start, zone, motion)) return {*airborne, "rotate-air"};
         }
-        auto target = pickup(obs, start, threat, zone, motion, route, complete);
+        auto target = pickup(obs, start, threat, enemyInfos, zone, motion, route, complete);
         const char* labelOverride = nullptr;
         const auto& weapons = me.contains("weapons") && me["weapons"].is_array() ? me["weapons"] : Json::array();
         const bool hostileNow = threat && (threat->hostile || threat->damaged_recently || threat->laser_charging);
@@ -1016,7 +1017,7 @@ private:
             window.secondsUntilRisk > window.estimatedTravel + 14.0;
         if (!target && slowEdgePhase) {
             // 1. Grab any visible outer-ring weapon pickup or cube safe in the current zone.
-            if (const auto outerLoot = outerRimLoot(obs, start, zone, motion, weapons)) {
+            if (const auto outerLoot = outerRimLoot(obs, start, enemyInfos, zone, motion, weapons)) {
                 target = *outerLoot;
                 labelOverride = "edge-loot";
             } else if (arena_.distanceToNearestWall(start[0], start[1], start[2], 26.0) > 22.0) {
@@ -1104,9 +1105,29 @@ private:
         return {command, outside ? "recover-zone" : labelOverride ? labelOverride : "rotate"};
     }
 
-    std::optional<Vec3> outerRimLoot(const Json& obs, const Vec3& start, const Zone& zone,
-                                     const Motion& motion, const Json& weapons) {
+    // Refuse to leave cover or walk into enemy LOS just to greed a cube/pickup when another enemy is watching.
+    bool lootPointSafe(const Vec3& start, const Vec3& itemPos, const std::vector<EnemyInfo>& enemyInfos,
+                       const Motion& motion, double hpFrac) const {
+        for (const auto& e : enemyInfos) {
+            const double enemyToItem = distanceXY(e.pos, itemPos);
+            if (enemyToItem > 175.0) continue;
+            const bool itemExposed = wallCover(itemPos, e.pos, motion.height, arena_) < 3;
+            if (!itemExposed) continue;
+            // Don't step out of current hard cover into an enemy's line of sight for loot.
+            const bool currentlyCovered = wallCover(start, e.pos, motion.height, arena_) == 3;
+            if (currentlyCovered) return false;
+            // Don't risk grabbing an exposed cube if a hostile/close/charging enemy threatens it or HP is low.
+            if (e.facing_us || e.charging || enemyToItem < 75.0 || regenMode_ || hpFrac < 0.70) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    std::optional<Vec3> outerRimLoot(const Json& obs, const Vec3& start, const std::vector<EnemyInfo>& enemyInfos,
+                                     const Zone& zone, const Motion& motion, const Json& weapons) {
         const auto& me = obs.contains("self") && obs["self"].is_object() ? obs["self"] : Json::object();
+        const double hpFrac = me.value("hp", 1400.0) / std::max(1.0, me.value("max_hp", 1400.0));
         const bool needsSecondary = countHeldWeapons(weapons) < 2;
         int slot1Prio = 0;
         if (weapons.is_array() && weapons.size() >= 2 && weapons[1].is_object()) {
@@ -1128,6 +1149,7 @@ private:
                 if (dist > 70.0 || zone.clearance(horizontal(pos), zone.now + 8.0) <= motion.radius + 2.0) continue;
                 const auto pt = navigator_.support(horizontal(pos), motion, pos[2] + 4.0);
                 if (!pt || !navigator_.direct(start, *pt, zone, motion)) continue;
+                if (!lootPointSafe(start, *pt, enemyInfos, motion, hpFrac)) continue;
                 const double score = prio - dist * 1.2;
                 if (score > bestScore) {
                     bestScore = score;
@@ -1136,8 +1158,8 @@ private:
             }
             if (best) return best;
         }
-        // 2. Visible power cubes (< 10) in the current safe zone.
-        if (me.value("cubes", 0.0) < cubeStatCap_) {
+        // 2. Visible power cubes (< 10) in the current safe zone, only when safe from enemy fire/cover loss.
+        if (me.value("cubes", 0.0) < cubeStatCap_ && threats_.can_collect_cubes(obs)) {
             if (const auto it = obs.find("cubes"); it != obs.end() && it->is_array()) {
                 double bestDist = 45.0;
                 std::optional<Vec3> best;
@@ -1148,7 +1170,8 @@ private:
                     if (dist <= pickupRadius_ || dist >= bestDist) continue;
                     if (zone.clearance(horizontal(pos), zone.now + 6.0) <= motion.radius + 2.0) continue;
                     const auto pt = navigator_.support(horizontal(pos), motion, pos[2] + 4.0);
-                    if (pt && navigator_.direct(start, *pt, zone, motion)) {
+                    if (pt && navigator_.direct(start, *pt, zone, motion) &&
+                        lootPointSafe(start, *pt, enemyInfos, motion, hpFrac)) {
                         bestDist = dist;
                         best = *pt;
                     }
@@ -1160,8 +1183,10 @@ private:
     }
 
     std::optional<Vec3> pickup(const Json& obs, const Vec3& start, const std::optional<Threat>& threat,
-                               const Zone& zone, const Motion& motion, const Goals& route, bool complete) {
+                               const std::vector<EnemyInfo>& enemyInfos, const Zone& zone,
+                               const Motion& motion, const Goals& route, bool complete) {
         const auto& me = obs.contains("self") && obs["self"].is_object() ? obs["self"] : Json::object();
+        const double hpFrac = me.value("hp", 1400.0) / std::max(1.0, me.value("max_hp", 1400.0));
         const bool hostileThreat = threat && (threat->hostile || threat->damaged_recently || threat->laser_charging);
         if (hostileThreat || !me.value("in_zone", false) ||
             (!complete && !zone.inNext(start, motion.radius + 4))) {
@@ -1171,6 +1196,9 @@ private:
         auto evaluateItem = [&](const Vec3& pos, double maxDetourSec) -> std::optional<Vec3> {
             const auto point = navigator_.support(horizontal(pos), motion, pos[2] + 4.0);
             if (!point || std::abs((*point)[2] - pos[2]) > 4.0 || !navigator_.direct(start, *point, zone, motion)) {
+                return std::nullopt;
+            }
+            if (!lootPointSafe(start, *point, enemyInfos, motion, hpFrac)) {
                 return std::nullopt;
             }
             if (!route.empty() && !navigator_.walkable(*point, route.front(), motion)) {
