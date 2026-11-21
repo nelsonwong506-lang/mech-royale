@@ -46,7 +46,11 @@ public:
 
     double ground(double x, double y) const;
     double surface(double x, double y, double maxZ = std::numeric_limits<double>::infinity()) const;
+    std::pair<double, bool> walkSurfaceInfo(double x, double y) const;
+    double topSurface(double x, double y) const;
+    bool isSolidPoint(double x, double y, double z) const;
     bool bodyClear(double x, double y, double z, double radius, double height) const;
+    bool prismClear(double x, double y, double z, double radius, double height, double stepUp = 0) const;
     bool walkSegment(const Vec3& start, const Vec3& end, double radius, double height,
                      double stepUp, double maxSlopeDeg) const;
     bool flightSegment(const Vec3& start, const Vec3& end, double radius, double height) const;
@@ -83,6 +87,7 @@ private:
     struct Prism {
         std::array<double, 4> bounds;
         double base, top;
+        bool isBridge = false;
         int firstBinX, firstBinY;
         Ring outer;
         std::vector<Ring> holes;
@@ -113,7 +118,6 @@ private:
     static Ring ringEdges(const std::vector<double>& coordinates);
 
     double surfaceAboveTerrain(double x, double y, double maxZ, double terrainZ) const;
-    bool prismClear(double x, double y, double z, double radius, double height, double stepUp = 0) const;
     void loadTrees(const Json& world);
     void buildRooftopGraph();
 

@@ -5,7 +5,7 @@ RUN apt-get update \
 WORKDIR /src
 COPY cpp/ ./
 RUN g++ -std=c++20 -O3 -DNDEBUG -Wall -Wextra -Wpedantic \
-    -static-libstdc++ -static-libgcc main.cpp arena.cpp navigation.cpp survival.cpp tactics.cpp -o /mech-royale
+    -static-libstdc++ -static-libgcc main.cpp arena.cpp navgrid.cpp brain.cpp -o /mech-royale
 
 FROM debian:bookworm-slim
 COPY --from=compiler /mech-royale /usr/local/bin/mech-royale

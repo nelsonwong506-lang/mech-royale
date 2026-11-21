@@ -170,7 +170,8 @@ bool Arena::crossesRing(const Ring& edges, double x, double y, double dx, double
 }
 
 Arena::Prism::Prism(const Json& definition)
-    : base(definition.at("base").get<double>()), top(definition.at("top").get<double>()) {
+    : base(definition.at("base").get<double>()), top(definition.at("top").get<double>()),
+      isBridge(definition.value("kind", "") == std::string_view("bridge")) {
     const auto coordinates = definition.at("ring").get<std::vector<double>>();
     outer = ringEdges(coordinates);
     bounds = {coordinates[0], coordinates[1], coordinates[0], coordinates[1]};
@@ -621,6 +622,68 @@ double Arena::ground(double x, double y) const {
 
 double Arena::surface(double x, double y, double maxZ) const {
     return surfaceAboveTerrain(x, y, maxZ, ground(x, y));
+}
+
+std::pair<double, bool> Arena::walkSurfaceInfo(double x, double y) const {
+    const double g = ground(x, y);
+    double z = g;
+    int topId = -1;
+    const auto cell = bins_.find(binKey(bin(x), bin(y)));
+    if (cell != bins_.end()) {
+        for (int pass = 0; pass < 8; ++pass) {
+            bool moved = false;
+            for (auto index : cell->second) {
+                const auto& prism = prisms_[index];
+                if (prism.top <= z) continue;
+                if (!(prism.base <= z + 1.5 || (prism.isBridge && prism.top - g < 6.5))) continue;
+                if (prism.contains(x, y)) {
+                    z = prism.top;
+                    topId = static_cast<int>(index);
+                    moved = true;
+                }
+            }
+            if (!moved) break;
+        }
+    }
+    const bool nonBridgeRoof = (topId >= 0 && !prisms_[static_cast<std::size_t>(topId)].isBridge && z - g > 1.5);
+    return {z, nonBridgeRoof};
+}
+
+double Arena::topSurface(double x, double y) const {
+    const double g = ground(x, y);
+    double z = g;
+    const auto cell = bins_.find(binKey(bin(x), bin(y)));
+    if (cell != bins_.end()) {
+        for (int pass = 0; pass < 8; ++pass) {
+            bool moved = false;
+            for (auto index : cell->second) {
+                const auto& prism = prisms_[index];
+                if (prism.top <= z || prism.base > z + 1.5) continue;
+                if (prism.contains(x, y)) {
+                    z = prism.top;
+                    moved = true;
+                }
+            }
+            if (!moved) break;
+        }
+    }
+    return z;
+}
+
+bool Arena::isSolidPoint(double x, double y, double z) const {
+    if (z < ground(x, y)) {
+        return true;
+    }
+    const auto cell = bins_.find(binKey(bin(x), bin(y)));
+    if (cell != bins_.end()) {
+        for (auto index : cell->second) {
+            const auto& prism = prisms_[index];
+            if (z > prism.base && z < prism.top && prism.contains(x, y)) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 double Arena::surfaceAboveTerrain(double x, double y, double maxZ, double support) const {
