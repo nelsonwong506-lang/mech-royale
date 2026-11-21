@@ -475,4 +475,68 @@ std::vector<Vec3> Arena::nearbyRooftops(const Vec3& from, double maxRange, doubl
     return roofs;
 }
 
+double Arena::distanceToNearestWall(double x, double y, double z, double maxRange) const {
+    const int firstX = bin(x - maxRange), lastX = bin(x + maxRange);
+    const int firstY = bin(y - maxRange), lastY = bin(y + maxRange);
+    double best = maxRange + 1.0;
+    for (int bx = firstX; bx <= lastX; ++bx) {
+        for (int by = firstY; by <= lastY; ++by) {
+            const auto cell = bins_.find(binKey(bx, by));
+            if (cell == bins_.end()) continue;
+            for (const auto idx : cell->second) {
+                const auto& p = prisms_[idx];
+                if (p.top < z + 5.0 || p.base > z + 4.0) continue;
+                if (p.bounds[2] - p.bounds[0] < 5.0 || p.bounds[3] - p.bounds[1] < 5.0) continue;
+                const double cx = std::clamp(x, p.bounds[0], p.bounds[2]);
+                const double cy = std::clamp(y, p.bounds[1], p.bounds[3]);
+                const double d = std::hypot(x - cx, y - cy);
+                if (d < best) {
+                    best = d;
+                }
+            }
+        }
+    }
+    return best;
+}
+
+std::optional<Vec2> Arena::nearestBuildingAnchor(const Vec3& from, double maxRange,
+                                                 double radius, const Vec2& biasTarget) const {
+    const int firstX = bin(from[0] - maxRange), lastX = bin(from[0] + maxRange);
+    const int firstY = bin(from[1] - maxRange), lastY = bin(from[1] + maxRange);
+    std::vector<std::size_t> visited;
+    visited.reserve(48);
+    double bestScore = std::numeric_limits<double>::infinity();
+    std::optional<Vec2> bestAnchor;
+
+    for (int bx = firstX; bx <= lastX; ++bx) {
+        for (int by = firstY; by <= lastY; ++by) {
+            const auto cell = bins_.find(binKey(bx, by));
+            if (cell == bins_.end()) continue;
+            for (const auto idx : cell->second) {
+                if (std::find(visited.begin(), visited.end(), idx) != visited.end()) continue;
+                visited.push_back(idx);
+                const auto& p = prisms_[idx];
+                // Require a real solid building tall enough to give full cover and wide enough to split angles.
+                if (p.top < from[2] + 5.5 || p.base > from[2] + 3.0) continue;
+                if (p.bounds[2] - p.bounds[0] < 7.0 || p.bounds[3] - p.bounds[1] < 7.0) continue;
+                const double cx = std::clamp(from[0], p.bounds[0], p.bounds[2]);
+                const double cy = std::clamp(from[1], p.bounds[1], p.bounds[3]);
+                const double dist = std::hypot(from[0] - cx, from[1] - cy);
+                if (dist < 4.0 || dist > maxRange) continue;
+                // Anchor just outside the nearest building face so we pull right into cover range.
+                const double ux = (from[0] - cx) / dist;
+                const double uy = (from[1] - cy) / dist;
+                const Vec2 anchor{cx + ux * (radius + 3.0), cy + uy * (radius + 3.0)};
+                const double biasDist = distanceXY(anchor, biasTarget);
+                const double score = dist + 0.25 * biasDist;
+                if (score < bestScore) {
+                    bestScore = score;
+                    bestAnchor = anchor;
+                }
+            }
+        }
+    }
+    return bestAnchor;
+}
+
 }  // namespace mr

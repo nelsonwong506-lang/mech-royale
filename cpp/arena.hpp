@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -28,6 +29,9 @@ public:
     bool blocksLine(const Vec3& start, const Vec3& end) const;
     std::vector<Vec3> nearbyRooftops(const Vec3& from, double maxRange, double minRise,
                                      double maxRise, double radius, double height) const;
+    double distanceToNearestWall(double x, double y, double z, double maxRange = 28.0) const;
+    std::optional<Vec2> nearestBuildingAnchor(const Vec3& from, double maxRange,
+                                              double radius, const Vec2& biasTarget) const;
 
 private:
     struct Edge {

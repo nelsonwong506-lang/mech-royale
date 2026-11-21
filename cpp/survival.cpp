@@ -496,6 +496,17 @@ std::optional<CombatMove> planCombatPosition(const Vec3& from, const Threat& pri
         const bool staysElevated = ctx.onRoof && (*point)[2] >= from[2] - 1.5;
         const double roofBonus = ctx.onRoof ? (staysElevated ? 22.0 : -26.0) : 0.0;
 
+        // Open-ground cover pull: drag fights from the open Oval lawn toward the nearest building ring!
+        double pullBonus = 0.0;
+        if (ctx.coverPull && !ctx.onRoof && (exposedCount >= 1 || defensive)) {
+            const double pullProgress = distanceXY(from, *ctx.coverPull) - distanceXY(xy, *ctx.coverPull);
+            const double pullWeight = (multiEnemy || defensive) ? 1.25 : 0.60;
+            pullBonus = pullWeight * pullProgress;
+            if (pullProgress > 4.0 && multiEnemy && exposedCount >= 2) {
+                label = "pull-cover";
+            }
+        }
+
         // Penalize walking closer to non-focus enemies.
         double otherApproachPenalty = 0.0;
         for (const auto* e : nearby) {
@@ -507,7 +518,8 @@ std::optional<CombatMove> planCombatPosition(const Vec3& from, const Threat& pri
             }
         }
 
-        const double score = exposureScore + pinchBonus + repositionBonus + momentumBonus + dodgeBonus + roofBonus +
+        const double score = exposureScore + pinchBonus + repositionBonus + momentumBonus + dodgeBonus +
+            roofBonus + pullBonus +
             (defensive ? 3.5 : 8.0) * lateral + (preferredSide ? 2.5 : 0.0) -
             (defensive ? 0.15 : 0.45) * rangeError - weaponDangerPenalty - rearRiskPenalty -
             0.55 * otherApproachPenalty + 0.32 * progress + 0.025 * std::min(40.0, clearance);
@@ -537,6 +549,17 @@ std::optional<CombatMove> planCombatPosition(const Vec3& from, const Threat& pri
         if (multiEnemy && Clock::now() < deadline) {
             const Vec2 xy{from[0] + length * std::cos(escapeYaw), from[1] + length * std::sin(escapeYaw)};
             evaluateCandidate(xy, length, true, 0.7);
+        }
+        // Sample directly toward nearest building cover when caught in open ground.
+        if (ctx.coverPull && Clock::now() < deadline) {
+            const double pullYaw = std::atan2((*ctx.coverPull)[1] - from[1], (*ctx.coverPull)[0] - from[0]);
+            for (const int po : {0, 28, -28}) {
+                if (Clock::now() >= deadline) break;
+                const double yaw = pullYaw + radians(po);
+                const Vec2 xy{from[0] + length * std::cos(yaw), from[1] + length * std::sin(yaw)};
+                const double lat = std::abs(std::sin(yaw - toFocus));
+                evaluateCandidate(xy, length, true, lat);
+            }
         }
     }
     return best;

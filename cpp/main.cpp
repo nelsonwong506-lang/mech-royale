@@ -514,7 +514,8 @@ private:
 
         auto collect = [&](bool allowElevated) {
             Goals points;
-            for (const double radius : {safe, safe * 0.66, safe * 0.32, 0.0}) {
+            // Sample primarily along the outer safe rim to avoid getting 360-deg pinched in the center.
+            for (const double radius : {safe * 0.94, safe * 0.80, safe * 0.58, 0.0}) {
                 for (const int offset : offsets) {
                     if (radius == 0.0 && offset != 0) {
                         break;
@@ -542,8 +543,17 @@ private:
         if (points.empty()) {
             points = collect(true);
         }
+        // Prefer building-adjacent cover positions along the outer rim over exposed open-lawn center spots.
+        auto goalCost = [&](const Vec3& p) {
+            const double travel = distanceXY(start, p);
+            const double wallDist = arena_.distanceToNearestWall(p[0], p[1], p[2], 26.0);
+            const double coverBonus = wallDist <= 16.0 ? -36.0 : (wallDist <= 24.0 ? -16.0 : 0.0);
+            const double distFromCenter = distanceXY(p, zone.nextCenter);
+            const double centerPenalty = (zone.nextRadius >= 60.0 && distFromCenter < safe * 0.45) ? 28.0 : 0.0;
+            return travel + coverBonus + centerPenalty;
+        };
         std::stable_sort(points.begin(), points.end(), [&](const Vec3& a, const Vec3& b) {
-            return distanceXY(start, a) < distanceXY(start, b);
+            return goalCost(a) < goalCost(b);
         });
         if (points.size() > 16) {
             points.resize(16);
@@ -675,6 +685,14 @@ private:
                 ctx.velocity = {vel3[0], vel3[1]};
                 if (projDodge && !projDodge->urgent_mortar) {
                     ctx.bulletDodge = projDodge->direction;
+                }
+                // When caught in open ground (e.g., OSU Oval lawn), pull the fight toward the nearest building!
+                if (!onRoof && arena_.distanceToNearestWall(start[0], start[1], start[2], 24.0) > 16.0) {
+                    if (const auto anchor = arena_.nearestBuildingAnchor(start, 140.0, motion.radius, zone.nextCenter)) {
+                        if (zone.clearance(*anchor, zone.now + 10.0) >= motion.radius) {
+                            ctx.coverPull = *anchor;
+                        }
+                    }
                 }
 
                 auto tacticalEnemies = enemyInfos;
@@ -986,19 +1004,63 @@ private:
             if (const auto airborne = fly(me, start, zone, motion)) return {*airborne, "rotate-air"};
         }
         auto target = pickup(obs, start, threat, zone, motion, route, complete);
-        bool patrolling = false;
-        // Active early loot patrol inside nextZone instead of standing idle at move=[0,0]!
+        const char* labelOverride = nullptr;
         const auto& weapons = me.contains("weapons") && me["weapons"].is_array() ? me["weapons"] : Json::array();
-        const bool wantFarm = insideNext && !onRoof && !outside && !window.urgent &&
-            !(threat && (threat->hostile || threat->damaged_recently || threat->laser_charging)) &&
-            (me.value("cubes", 0.0) < 8.0 || countHeldWeapons(weapons) < 2) &&
-            zone.nextRadius >= 40.0;
+        const bool hostileNow = threat && (threat->hostile || threat->damaged_recently || threat->laser_charging);
+        const bool needsGear = me.value("cubes", 0.0) < 8.0 || countHeldWeapons(weapons) < 2;
+
+        // Edge-control slow rotation: when we have > 14s extra margin before the storm reaches us,
+        // stay along the building-rich outer rim to loot & avoid getting 360-deg surrounded early!
+        const bool slowEdgePhase = !outside && !window.urgent && !insideNext && !onRoof && !hostileNow &&
+            needsGear && zone.radius >= 150.0 &&
+            window.secondsUntilRisk > window.estimatedTravel + 14.0;
+        if (!target && slowEdgePhase) {
+            // 1. Grab any visible outer-ring weapon pickup or cube safe in the current zone.
+            if (const auto outerLoot = outerRimLoot(obs, start, zone, motion, weapons)) {
+                target = *outerLoot;
+                labelOverride = "edge-loot";
+            } else if (arena_.distanceToNearestWall(start[0], start[1], start[2], 26.0) > 22.0) {
+                // 2. Move out of open lawn toward the nearest safe campus building along the rim.
+                if (const auto anchor = arena_.nearestBuildingAnchor(start, 110.0, motion.radius, zone.nextCenter)) {
+                    if (zone.clearance(*anchor, zone.now + 12.0) > motion.radius + 2.0) {
+                        if (const auto pt = navigator_.support(*anchor, motion, arena_.ground((*anchor)[0], (*anchor)[1]) + motion.step + 0.1)) {
+                            auto bPlan = navigator_.plan(start, {*pt}, zone, motion, 8500,
+                                                         std::min(hardDeadline, tickStarted + 22ms));
+                            if (!bPlan.route.empty()) {
+                                target = bPlan.route.front();
+                                labelOverride = "edge-cover";
+                            }
+                        }
+                    }
+                }
+            } else if (distanceXY(start, zone.nextCenter) > zone.nextRadius + 25.0) {
+                // 3. Cruise tangentially along the outer rim (curving gently inward) to sweep buildings for loot.
+                const double toCenter = std::atan2(zone.nextCenter[1] - start[1], zone.nextCenter[0] - start[0]);
+                const double rimAngle = toCenter + strafeSign_ * radians(65.0);
+                const Vec2 rimXY{start[0] + 32.0 * std::cos(rimAngle), start[1] + 32.0 * std::sin(rimAngle)};
+                if (zone.clearance(rimXY, zone.now + 10.0) > motion.radius + 3.0) {
+                    if (const auto pt = navigator_.support(rimXY, motion, arena_.ground(rimXY[0], rimXY[1]) + motion.step + 0.1)) {
+                        auto rPlan = navigator_.plan(start, {*pt}, zone, motion, 8600,
+                                                     std::min(hardDeadline, tickStarted + 22ms));
+                        if (!rPlan.route.empty()) {
+                            target = rPlan.route.front();
+                            labelOverride = "edge-patrol";
+                        }
+                    }
+                }
+            }
+        }
+
+        // Active early loot patrol along the building-adjacent rim once inside nextZone (never idle!).
+        const bool wantFarm = insideNext && !onRoof && !outside && !window.urgent && !hostileNow &&
+            needsGear && zone.nextRadius >= 40.0;
         if (!target && wantFarm) {
-            const double r = std::min(90.0, zone.nextRadius * 0.45);
+            // Prefer orbiting the outer safe rim (0.78 * nextRadius) where buildings sit rather than open center.
+            const double r = std::min(140.0, zone.nextRadius * 0.72);
             const double wpAngle = patrolIndex_ * (std::numbers::pi * 0.5);
             const Vec2 wpXY{zone.nextCenter[0] + r * std::cos(wpAngle),
                             zone.nextCenter[1] + r * std::sin(wpAngle)};
-            if (distanceXY(start, wpXY) < 12.0) {
+            if (distanceXY(start, wpXY) < 14.0) {
                 patrolIndex_ = (patrolIndex_ + 1) % 4;
             }
             const auto wp = navigator_.support(wpXY, motion, arena_.ground(wpXY[0], wpXY[1]) + motion.step + 0.1);
@@ -1007,7 +1069,7 @@ private:
                                              std::min(hardDeadline, tickStarted + 22ms));
                 if (!pPlan.route.empty()) {
                     target = pPlan.route.front();
-                    patrolling = true;
+                    labelOverride = "patrol-loot";
                 }
             }
         }
@@ -1039,7 +1101,62 @@ private:
                 }
             }
         }
-        return {command, outside ? "recover-zone" : patrolling ? "patrol-loot" : "rotate"};
+        return {command, outside ? "recover-zone" : labelOverride ? labelOverride : "rotate"};
+    }
+
+    std::optional<Vec3> outerRimLoot(const Json& obs, const Vec3& start, const Zone& zone,
+                                     const Motion& motion, const Json& weapons) {
+        const auto& me = obs.contains("self") && obs["self"].is_object() ? obs["self"] : Json::object();
+        const bool needsSecondary = countHeldWeapons(weapons) < 2;
+        int slot1Prio = 0;
+        if (weapons.is_array() && weapons.size() >= 2 && weapons[1].is_object()) {
+            slot1Prio = weaponPriority(weapons[1].value("kind", std::string{}));
+        }
+        // 1. Visible weapon pickups in the current safe zone.
+        if (const auto it = obs.find("pickups"); it != obs.end() && it->is_array()) {
+            double bestScore = -infinity;
+            std::optional<Vec3> best;
+            for (const auto& item : *it) {
+                if (!item.is_object()) continue;
+                const auto kind = item.value("kind", std::string{});
+                if (kind.empty() || kind == "gun" || hasWeaponKind(weapons, kind)) continue;
+                const int prio = weaponPriority(kind);
+                if (!needsSecondary && prio <= slot1Prio) continue;
+                const auto pos = safeVec3(item, "pos", {infinity, infinity, 0.0});
+                if (!std::isfinite(pos[0])) continue;
+                const double dist = distanceXY(start, pos);
+                if (dist > 70.0 || zone.clearance(horizontal(pos), zone.now + 8.0) <= motion.radius + 2.0) continue;
+                const auto pt = navigator_.support(horizontal(pos), motion, pos[2] + 4.0);
+                if (!pt || !navigator_.direct(start, *pt, zone, motion)) continue;
+                const double score = prio - dist * 1.2;
+                if (score > bestScore) {
+                    bestScore = score;
+                    best = *pt;
+                }
+            }
+            if (best) return best;
+        }
+        // 2. Visible power cubes (< 10) in the current safe zone.
+        if (me.value("cubes", 0.0) < cubeStatCap_) {
+            if (const auto it = obs.find("cubes"); it != obs.end() && it->is_array()) {
+                double bestDist = 45.0;
+                std::optional<Vec3> best;
+                for (const auto& item : *it) {
+                    const auto pos = safeVec3(item, "pos", {infinity, infinity, 0.0});
+                    if (!std::isfinite(pos[0])) continue;
+                    const double dist = distanceXY(start, pos);
+                    if (dist <= pickupRadius_ || dist >= bestDist) continue;
+                    if (zone.clearance(horizontal(pos), zone.now + 6.0) <= motion.radius + 2.0) continue;
+                    const auto pt = navigator_.support(horizontal(pos), motion, pos[2] + 4.0);
+                    if (pt && navigator_.direct(start, *pt, zone, motion)) {
+                        bestDist = dist;
+                        best = *pt;
+                    }
+                }
+                if (best) return best;
+            }
+        }
+        return std::nullopt;
     }
 
     std::optional<Vec3> pickup(const Json& obs, const Vec3& start, const std::optional<Threat>& threat,

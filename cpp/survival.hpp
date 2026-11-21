@@ -42,6 +42,7 @@ struct CombatContext {
     Vec3 anchor{};
     Vec2 velocity{};
     std::optional<Vec2> bulletDodge;
+    std::optional<Vec2> coverPull;
 };
 
 struct CombatMove {
