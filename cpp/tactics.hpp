@@ -41,9 +41,11 @@ struct EnemyInfo {
     Vec3 pos{};
     Vec3 vel{};
     double hp = 1400.0;
+    double cubes = 0.0;
     double radius = 2.5;
     double height = 9.0;
     bool is_npc = false;
+    bool has_gun = true;
     bool has_lightning = false;
     bool has_laser = false;
     bool has_mortar = false;
@@ -103,6 +105,11 @@ public:
     double last_damage_time() const;
     std::optional<double> sound_heading(double now) const;
 
+    bool is_laser_shorted(double now) const { return now < laser_shorted_until_; }
+    bool had_recent_cookoff(double now) const { return now < last_cookoff_at_ + 2.5; }
+    std::optional<double> recent_rear_hit_bearing(double now) const;
+    std::optional<Vec3> recent_kill_pos(double now) const;
+
 private:
     Threat describe_enemy(const Json& actor, int id) const;
 
@@ -120,6 +127,7 @@ private:
 
     std::unordered_map<int, AttackMemory> attacks_{};
     std::unordered_map<int, HealthSample> health_samples_{};
+    std::unordered_map<int, Vec3> last_seen_pos_{};
     std::array<std::array<std::optional<double>, 16>, 16> duel_times_{};
     std::optional<Vec3> unknown_position_;
     double unknown_until_ = -std::numeric_limits<double>::infinity();
@@ -131,11 +139,19 @@ private:
     double last_hit_dealt_at_ = -std::numeric_limits<double>::infinity();
     double last_hostile_damage_at_ = -std::numeric_limits<double>::infinity();
     double last_duel_at_ = -std::numeric_limits<double>::infinity();
+    double laser_shorted_until_ = -std::numeric_limits<double>::infinity();
+    double last_cookoff_at_ = -std::numeric_limits<double>::infinity();
+    std::optional<double> last_rear_bearing_;
+    double last_rear_until_ = -std::numeric_limits<double>::infinity();
+    std::optional<Vec3> last_kill_pos_;
+    double last_kill_until_ = -std::numeric_limits<double>::infinity();
     double mech_radius_;
     double mech_height_;
     double muzzle_height_;
     double turn_rate_;
     double pitch_rate_;
+    double min_pitch_;
+    double max_pitch_;
     double size_per_cube_;
     double damage_per_cube_;
     double cube_stat_cap_;

@@ -37,6 +37,52 @@ std::filesystem::path findMapFile(const std::filesystem::path& directory,
     return defaultPath;
 }
 
+// Compute 3D segment length inside a vertical cylinder [zMin, zMax] with center (cx, cy) and radius r.
+double cylinderChordLength(const Vec3& start, const Vec3& end,
+                           double cx, double cy, double r, double zMin, double zMax) {
+    if (r <= 0.0 || zMax <= zMin) {
+        return 0.0;
+    }
+    const double dx = end[0] - start[0];
+    const double dy = end[1] - start[1];
+    const double dz = end[2] - start[2];
+    const double fx = start[0] - cx;
+    const double fy = start[1] - cy;
+    const double a = dx * dx + dy * dy;
+    double t0 = 0.0, t1 = 1.0;
+    if (a <= 1e-10) {
+        if (fx * fx + fy * fy > r * r) {
+            return 0.0;
+        }
+    } else {
+        const double b = 2.0 * (fx * dx + fy * dy);
+        const double c = fx * fx + fy * fy - r * r;
+        const double disc = b * b - 4.0 * a * c;
+        if (disc <= 0.0) {
+            return 0.0;
+        }
+        const double root = std::sqrt(disc);
+        t0 = std::max(t0, (-b - root) / (2.0 * a));
+        t1 = std::min(t1, (-b + root) / (2.0 * a));
+        if (t0 >= t1) {
+            return 0.0;
+        }
+    }
+    if (std::abs(dz) <= 1e-9) {
+        if (start[2] < zMin || start[2] > zMax) {
+            return 0.0;
+        }
+    } else {
+        const auto [zt0, zt1] = std::minmax({(zMin - start[2]) / dz, (zMax - start[2]) / dz});
+        t0 = std::max(t0, zt0);
+        t1 = std::min(t1, zt1);
+        if (t0 >= t1) {
+            return 0.0;
+        }
+    }
+    return (t1 - t0) * std::hypot(dx, dy, dz);
+}
+
 }  // namespace
 
 Arena::Ring Arena::ringEdges(const std::vector<double>& coordinates) {
@@ -80,6 +126,19 @@ bool Arena::ringNearPoint(const Ring& edges, double x, double y, double radiusSq
         }
     }
     return false;
+}
+
+double Arena::ringDistanceSquared(const Ring& edges, double x, double y) {
+    double best = std::numeric_limits<double>::infinity();
+    for (const auto& edge : edges) {
+        const double relativeX = x - edge.x, relativeY = y - edge.y;
+        const double fraction = std::clamp(
+            (relativeX * edge.dx + relativeY * edge.dy) * edge.inverseLengthSquared, 0.0, 1.0);
+        const double gapX = relativeX - fraction * edge.dx;
+        const double gapY = relativeY - fraction * edge.dy;
+        best = std::min(best, gapX * gapX + gapY * gapY);
+    }
+    return best;
 }
 
 bool Arena::crossesRing(const Ring& edges, double x, double y, double dx, double dy) {
@@ -146,6 +205,14 @@ bool Arena::Prism::touches(double x, double y, double radius) const {
         || std::any_of(holes.begin(), holes.end(), [&](const Ring& hole) {
             return ringNearPoint(hole, x, y, radiusSquared);
         });
+}
+
+double Arena::Prism::edgeClearance(double x, double y) const {
+    double minSq = ringDistanceSquared(outer, x, y);
+    for (const auto& hole : holes) {
+        minSq = std::min(minSq, ringDistanceSquared(hole, x, y));
+    }
+    return std::sqrt(std::max(0.0, minSq));
 }
 
 bool Arena::Prism::blocksLine(const Vec3& start, const Vec3& end) const {
@@ -235,6 +302,305 @@ Arena::Arena(const std::string& mapDir, const std::vector<std::string>& files) {
             }
         }
     }
+
+    loadTrees(world);
+    buildRooftopGraph();
+}
+
+void Arena::loadTrees(const Json& world) {
+    if (const auto rulesIt = world.find("rules"); rulesIt != world.end() && rulesIt->is_object()) {
+        const double density = std::max(0.05, rulesIt->value("canopyDensity", 0.35));
+        const double blockT = std::clamp(rulesIt->value("canopyBlockT", 0.25), 0.01, 0.95);
+        canopyBlockDist_ = -std::log(blockT) / density;
+    }
+    const auto treesIt = world.find("trees");
+    if (treesIt == world.end() || !treesIt->is_object()) {
+        return;
+    }
+    const auto fieldsIt = treesIt->find("fields");
+    const auto dataIt = treesIt->find("data");
+    if (fieldsIt == treesIt->end() || !fieldsIt->is_array() || fieldsIt->empty() ||
+        dataIt == treesIt->end() || !dataIt->is_array() || dataIt->empty()) {
+        return;
+    }
+    const std::size_t stride = fieldsIt->size();
+    int idxX = -1, idxY = -1, idxZ = -1, idxH = -1, idxCrownR = -1, idxCrownBase = -1, idxTrunkR = -1;
+    int idxCrownX = -1, idxCrownY = -1;
+    for (std::size_t i = 0; i < stride; ++i) {
+        if (!(*fieldsIt)[i].is_string()) continue;
+        const auto& name = (*fieldsIt)[i].get_ref<const std::string&>();
+        if (name == "x") idxX = static_cast<int>(i);
+        else if (name == "y") idxY = static_cast<int>(i);
+        else if (name == "z") idxZ = static_cast<int>(i);
+        else if (name == "height") idxH = static_cast<int>(i);
+        else if (name == "crownR") idxCrownR = static_cast<int>(i);
+        else if (name == "crownBase") idxCrownBase = static_cast<int>(i);
+        else if (name == "trunkR") idxTrunkR = static_cast<int>(i);
+        else if (name == "crownX") idxCrownX = static_cast<int>(i);
+        else if (name == "crownY") idxCrownY = static_cast<int>(i);
+    }
+    if (idxX < 0 || idxY < 0 || idxZ < 0) {
+        return;
+    }
+    const auto& data = *dataIt;
+    const std::size_t count = data.size() / stride;
+    trees_.reserve(count);
+    auto readVal = [&](std::size_t base, int offset, double fallback) -> double {
+        if (offset < 0) return fallback;
+        const auto& v = data[base + static_cast<std::size_t>(offset)];
+        return v.is_number() ? finiteOr(v.get<double>(), fallback) : fallback;
+    };
+    for (std::size_t i = 0; i < count; ++i) {
+        const std::size_t base = i * stride;
+        Tree t;
+        t.x = readVal(base, idxX, 0.0);
+        t.y = readVal(base, idxY, 0.0);
+        t.z = readVal(base, idxZ, ground(t.x, t.y));
+        t.height = readVal(base, idxH, 20.0);
+        t.crownR = readVal(base, idxCrownR, 2.5);
+        t.crownBase = readVal(base, idxCrownBase, 6.0);
+        t.trunkR = readVal(base, idxTrunkR, 0.6);
+        t.crownX = readVal(base, idxCrownX, t.x);
+        t.crownY = readVal(base, idxCrownY, t.y);
+        const std::size_t tIdx = trees_.size();
+        trees_.push_back(t);
+        const double maxR = std::max(t.trunkR, t.crownR + std::hypot(t.crownX - t.x, t.crownY - t.y));
+        const int bx0 = bin(t.x - maxR), bx1 = bin(t.x + maxR);
+        const int by0 = bin(t.y - maxR), by1 = bin(t.y + maxR);
+        for (int bx = bx0; bx <= bx1; ++bx) {
+            for (int by = by0; by <= by1; ++by) {
+                treeBins_[binKey(bx, by)].push_back(tIdx);
+            }
+        }
+    }
+}
+
+void Arena::buildRooftopGraph() {
+    prismToRoof_.assign(prisms_.size(), -1);
+    constexpr double standRadius = 2.6;
+    constexpr double standHeight = 9.1;
+    constexpr double edgeInset = 2.95;
+
+    for (std::size_t idx = 0; idx < prisms_.size(); ++idx) {
+        const auto& prism = prisms_[idx];
+        const double heightAboveBase = prism.top - prism.base;
+        if (heightAboveBase < 4.5 || heightAboveBase > 42.0) {
+            continue;
+        }
+        const double minX = prism.bounds[0], minY = prism.bounds[1];
+        const double maxX = prism.bounds[2], maxY = prism.bounds[3];
+        if (maxX - minX < 9.5 || maxY - minY < 9.5) {
+            continue;
+        }
+
+        auto validRoofPoint = [&](double x, double y) -> bool {
+            return prism.contains(x, y) &&
+                bodyClear(x, y, prism.top, standRadius, standHeight) &&
+                std::abs(surface(x, y, prism.top + 0.45) - prism.top) <= 0.22;
+        };
+
+        RooftopNode node;
+        node.index = rooftops_.size();
+        node.prismIndex = idx;
+        node.bounds = prism.bounds;
+        node.baseZ = prism.base;
+        node.topZ = prism.top;
+
+        // 1. Sample interior points to find safe 360-deg tuck spots (>= 3.1m from edges) and center.
+        struct CandidateSpot {
+            Vec3 pos;
+            double clearance;
+        };
+        std::vector<CandidateSpot> interior;
+        const double spanX = maxX - minX, spanY = maxY - minY;
+        const int stepsX = std::clamp(static_cast<int>(std::ceil(spanX / 4.5)), 2, 10);
+        const int stepsY = std::clamp(static_cast<int>(std::ceil(spanY / 4.5)), 2, 10);
+        for (int ix = 1; ix < stepsX; ++ix) {
+            const double x = minX + spanX * (static_cast<double>(ix) / stepsX);
+            for (int iy = 1; iy < stepsY; ++iy) {
+                const double y = minY + spanY * (static_cast<double>(iy) / stepsY);
+                if (!validRoofPoint(x, y)) continue;
+                const double clr = prism.edgeClearance(x, y);
+                interior.push_back({Vec3{x, y, prism.top}, clr});
+            }
+        }
+        const double cx = 0.5 * (minX + maxX), cy = 0.5 * (minY + maxY);
+        if (validRoofPoint(cx, cy)) {
+            interior.push_back({Vec3{cx, cy, prism.top}, prism.edgeClearance(cx, cy)});
+        }
+        std::sort(interior.begin(), interior.end(), [](const CandidateSpot& a, const CandidateSpot& b) {
+            return a.clearance > b.clearance;
+        });
+        for (const auto& c : interior) {
+            if (c.clearance < 3.05 && !node.tuckSpots.empty()) {
+                break;
+            }
+            if (std::any_of(node.tuckSpots.begin(), node.tuckSpots.end(), [&](const Vec3& p) {
+                    return distanceXY(p, c.pos) < 4.2;
+                })) {
+                continue;
+            }
+            node.tuckSpots.push_back(c.pos);
+            if (node.tuckSpots.size() >= 4) {
+                break;
+            }
+        }
+
+        // 2. Sample perimeter edge shooting ledges along outer ring segments.
+        for (const auto& edge : prism.outer) {
+            const double len = std::hypot(edge.dx, edge.dy);
+            if (len < 4.5) continue;
+            const double tx = edge.dx / len, ty = edge.dy / len;
+            // Test both perpendicular normals to identify which points inward vs outward.
+            const Vec2 n1{-ty, tx};
+            const Vec2 n2{ty, -tx};
+            const double midX = edge.x + 0.5 * edge.dx;
+            const double midY = edge.y + 0.5 * edge.dy;
+            Vec2 inward = n1;
+            Vec2 outward = n2;
+            if (!prism.contains(midX + inward[0] * edgeInset, midY + inward[1] * edgeInset) &&
+                prism.contains(midX + n2[0] * edgeInset, midY + n2[1] * edgeInset)) {
+                inward = n2;
+                outward = n1;
+            }
+            const int samples = std::clamp(static_cast<int>(std::floor(len / 8.0)), 1, 4);
+            for (int s = 1; s <= samples; ++s) {
+                const double frac = static_cast<double>(s) / (samples + 1);
+                const double ex = edge.x + edge.dx * frac + inward[0] * edgeInset;
+                const double ey = edge.y + edge.dy * frac + inward[1] * edgeInset;
+                if (!validRoofPoint(ex, ey)) continue;
+                if (std::any_of(node.edgeSpots.begin(), node.edgeSpots.end(), [&](const RoofEdgeSpot& spot) {
+                        return distanceXY(spot.pos, Vec2{ex, ey}) < 4.0;
+                    })) {
+                    continue;
+                }
+                node.edgeSpots.push_back(RoofEdgeSpot{Vec3{ex, ey, prism.top}, outward});
+                if (node.edgeSpots.size() >= 16) {
+                    break;
+                }
+            }
+            if (node.edgeSpots.size() >= 16) {
+                break;
+            }
+        }
+
+        if (node.tuckSpots.empty() && node.edgeSpots.empty()) {
+            continue;
+        }
+        if (!node.tuckSpots.empty()) {
+            node.center = node.tuckSpots.front();
+        } else {
+            node.center = node.edgeSpots.front().pos;
+            node.tuckSpots.push_back(node.center);
+        }
+        if (node.edgeSpots.empty()) {
+            node.edgeSpots.push_back(RoofEdgeSpot{node.center, {1.0, 0.0}});
+        }
+
+        prismToRoof_[idx] = static_cast<int>(rooftops_.size());
+        rooftops_.push_back(std::move(node));
+    }
+
+    // 3. Precompute roof-to-roof jump-jet links (within 36m horizontally, climb <= 24m).
+    for (std::size_t i = 0; i < rooftops_.size(); ++i) {
+        auto& src = rooftops_[i];
+        for (std::size_t j = 0; j < rooftops_.size(); ++j) {
+            if (i == j) continue;
+            const auto& dst = rooftops_[j];
+            const double climb = dst.topZ - src.topZ;
+            if (climb > 24.0 || climb < -28.0) continue;
+            // Bounding box quick reject (> 38m gap).
+            const double gapX = std::max(0.0, std::max(src.bounds[0] - dst.bounds[2], dst.bounds[0] - src.bounds[2]));
+            const double gapY = std::max(0.0, std::max(src.bounds[1] - dst.bounds[3], dst.bounds[1] - src.bounds[3]));
+            if ( std::hypot(gapX, gapY) > 36.0) continue;
+
+            double bestDist = 36.0;
+            Vec3 bestTakeoff = src.center;
+            Vec3 bestLanding = dst.center;
+            bool found = false;
+            for (const auto& se : src.edgeSpots) {
+                for (const auto& de : dst.edgeSpots) {
+                    const double d = distanceXY(se.pos, de.pos);
+                    if (d < bestDist && d >= 3.5) {
+                        bestDist = d;
+                        bestTakeoff = se.pos;
+                        bestLanding = de.pos;
+                        found = true;
+                    }
+                }
+            }
+            if (found) {
+                src.jumpLinks.push_back(RoofJumpLink{j, bestTakeoff, bestLanding, bestDist, climb});
+            }
+        }
+        std::sort(src.jumpLinks.begin(), src.jumpLinks.end(), [](const RoofJumpLink& a, const RoofJumpLink& b) {
+            return a.horizDist + std::max(0.0, a.climb) * 0.8 < b.horizDist + std::max(0.0, b.climb) * 0.8;
+        });
+        if (src.jumpLinks.size() > 6) {
+            src.jumpLinks.resize(6);
+        }
+    }
+}
+
+const RooftopNode* Arena::roofAt(const Vec3& pos) const {
+    if (pos[2] <= ground(pos[0], pos[1]) + 4.0) {
+        return nullptr;
+    }
+    const auto cell = bins_.find(binKey(bin(pos[0]), bin(pos[1])));
+    if (cell == bins_.end()) {
+        return nullptr;
+    }
+    const RooftopNode* best = nullptr;
+    double bestDz = 1.3;
+    for (const auto prismIdx : cell->second) {
+        if (prismIdx >= prismToRoof_.size() || prismToRoof_[prismIdx] < 0) continue;
+        const auto& prism = prisms_[prismIdx];
+        const double dz = std::abs(pos[2] - prism.top);
+        if (dz <= bestDz && prism.touches(pos[0], pos[1], 2.2)) {
+            bestDz = dz;
+            best = &rooftops_[static_cast<std::size_t>(prismToRoof_[prismIdx])];
+        }
+    }
+    return best;
+}
+
+std::vector<const RooftopNode*> Arena::nearbyRoofNodes(const Vec3& from, double maxRange,
+                                                       double minRise, double maxRise) const {
+    std::vector<const RooftopNode*> result;
+    const int firstX = bin(from[0] - maxRange), lastX = bin(from[0] + maxRange);
+    const int firstY = bin(from[1] - maxRange), lastY = bin(from[1] + maxRange);
+    std::vector<std::size_t> visited;
+    visited.reserve(32);
+
+    for (int bx = firstX; bx <= lastX; ++bx) {
+        for (int by = firstY; by <= lastY; ++by) {
+            const auto cell = bins_.find(binKey(bx, by));
+            if (cell == bins_.end()) continue;
+            for (const auto idx : cell->second) {
+                if (idx >= prismToRoof_.size() || prismToRoof_[idx] < 0) continue;
+                const auto rIdx = static_cast<std::size_t>(prismToRoof_[idx]);
+                if (std::find(visited.begin(), visited.end(), rIdx) != visited.end()) continue;
+                visited.push_back(rIdx);
+                const auto& roof = rooftops_[rIdx];
+                const double rise = roof.topZ - from[2];
+                if (rise < minRise || rise > maxRise) continue;
+                const double cx = std::clamp(from[0], roof.bounds[0], roof.bounds[2]);
+                const double cy = std::clamp(from[1], roof.bounds[1], roof.bounds[3]);
+                if (std::hypot(from[0] - cx, from[1] - cy) <= maxRange) {
+                    result.push_back(&roof);
+                }
+            }
+        }
+    }
+    std::sort(result.begin(), result.end(), [&](const RooftopNode* a, const RooftopNode* b) {
+        const double da = distanceXY(from, a->center);
+        const double db = distanceXY(from, b->center);
+        return da < db;
+    });
+    if (result.size() > 8) {
+        result.resize(8);
+    }
+    return result;
 }
 
 double Arena::ground(double x, double y) const {
@@ -423,47 +789,130 @@ bool Arena::blocksLine(const Vec3& start, const Vec3& end) const {
     return false;
 }
 
-std::vector<Vec3> Arena::nearbyRooftops(const Vec3& from, double maxRange, double minRise,
-                                        double maxRise, double radius, double height) const {
-    std::vector<Vec3> roofs;
-    const int firstX = bin(from[0] - maxRange), lastX = bin(from[0] + maxRange);
-    const int firstY = bin(from[1] - maxRange), lastY = bin(from[1] + maxRange);
-    std::vector<std::size_t> visited;
-    visited.reserve(32);
+bool Arena::blocksVisionTree(const Vec3& start, const Vec3& end) const {
+    if (trees_.empty()) {
+        return false;
+    }
+    int bx = bin(start[0]), by = bin(start[1]);
+    const int endBx = bin(end[0]), endBy = bin(end[1]);
+    const double dx = end[0] - start[0], dy = end[1] - start[1];
+    const int stepX = dx > 0.0 ? 1 : (dx < 0.0 ? -1 : 0);
+    const int stepY = dy > 0.0 ? 1 : (dy < 0.0 ? -1 : 0);
+    constexpr double inf = std::numeric_limits<double>::infinity();
+    const double tDeltaX = stepX != 0 ? std::abs(binSize / dx) : inf;
+    const double tDeltaY = stepY != 0 ? std::abs(binSize / dy) : inf;
+    double tMaxX = stepX != 0
+        ? (((stepX > 0 ? bx + 1 : bx) * binSize) - start[0]) / dx
+        : inf;
+    double tMaxY = stepY != 0
+        ? (((stepY > 0 ? by + 1 : by) * binSize) - start[1]) / dy
+        : inf;
+    const int maxSteps = std::abs(endBx - bx) + std::abs(endBy - by) + 2;
 
-    for (int bx = firstX; bx <= lastX; ++bx) {
-        for (int by = firstY; by <= lastY; ++by) {
-            const auto cell = bins_.find(binKey(bx, by));
-            if (cell == bins_.end()) continue;
-            for (const auto idx : cell->second) {
-                if (std::find(visited.begin(), visited.end(), idx) != visited.end()) continue;
-                visited.push_back(idx);
-                const auto& prism = prisms_[idx];
-                const double rise = prism.top - from[2];
-                if (rise < minRise || rise > maxRise) continue;
-                const double minX = prism.bounds[0], minY = prism.bounds[1];
-                const double maxX = prism.bounds[2], maxY = prism.bounds[3];
-                if (maxX - minX < radius * 2.4 || maxY - minY < radius * 2.4) continue;
-                const double cx = 0.5 * (minX + maxX), cy = 0.5 * (minY + maxY);
-                const double inset = radius + 1.4;
-                // Sample a point near the closest climbable edge of the roof plus its center.
-                const double nearX = std::clamp(from[0], minX + inset, maxX - inset);
-                const double nearY = std::clamp(from[1], minY + inset, maxY - inset);
-                const std::array<Vec2, 3> samples{{
-                    {nearX, nearY},
-                    {0.5 * (nearX + cx), 0.5 * (nearY + cy)},
-                    {cx, cy}
-                }};
-                for (const auto& s : samples) {
-                    if (distanceXY(from, s) > maxRange) continue;
-                    if (!prism.contains(s[0], s[1])) continue;
-                    if (bodyClear(s[0], s[1], prism.top, radius, height) &&
-                        std::abs(surface(s[0], s[1], prism.top + 0.5) - prism.top) <= 0.2) {
-                        roofs.push_back(Vec3{s[0], s[1], prism.top});
+    std::array<std::size_t, 48> checked{};
+    std::size_t checkedCount = 0;
+    double canopyAccum = 0.0;
+
+    for (int step = 0; step < maxSteps; ++step) {
+        const auto cell = treeBins_.find(binKey(bx, by));
+        if (cell != treeBins_.end()) {
+            for (const auto index : cell->second) {
+                bool seen = false;
+                for (std::size_t k = 0; k < checkedCount; ++k) {
+                    if (checked[k] == index) {
+                        seen = true;
                         break;
                     }
                 }
+                if (seen) continue;
+                if (checkedCount < checked.size()) {
+                    checked[checkedCount++] = index;
+                }
+                const auto& tree = trees_[index];
+                // 1. Solid tree trunk blocks sight outright.
+                if (cylinderChordLength(start, end, tree.x, tree.y, tree.trunkR,
+                                        tree.z, tree.z + tree.crownBase) > 0.05) {
+                    return true;
+                }
+                // 2. Canopy crown attenuates sight (Beer-Lambert).
+                canopyAccum += cylinderChordLength(start, end, tree.crownX, tree.crownY, tree.crownR,
+                                                   tree.z + tree.crownBase, tree.z + tree.height);
+                if (canopyAccum >= canopyBlockDist_) {
+                    return true;
+                }
             }
+        }
+        if (bx == endBx && by == endBy) {
+            break;
+        }
+        if (tMaxX < tMaxY) {
+            bx += stepX;
+            tMaxX += tDeltaX;
+        } else {
+            by += stepY;
+            tMaxY += tDeltaY;
+        }
+    }
+    return false;
+}
+
+bool Arena::blocksVision(const Vec3& start, const Vec3& end) const {
+    return blocksLine(start, end) || blocksVisionTree(start, end);
+}
+
+std::optional<Vec2> Arena::nearestTreeCover(const Vec3& from, const Vec3& threatPos,
+                                            double maxRange, double radius) const {
+    if (trees_.empty() || distanceXY(from, threatPos) <= 46.0) {
+        return std::nullopt;
+    }
+    const int firstX = bin(from[0] - maxRange), lastX = bin(from[0] + maxRange);
+    const int firstY = bin(from[1] - maxRange), lastY = bin(from[1] + maxRange);
+    const Vec3 threatEye{threatPos[0], threatPos[1], threatPos[2] + 8.0};
+    double bestDist = maxRange + 1.0;
+    std::optional<Vec2> bestSpot;
+
+    for (int bx = firstX; bx <= lastX; ++bx) {
+        for (int by = firstY; by <= lastY; ++by) {
+            const auto cell = treeBins_.find(binKey(bx, by));
+            if (cell == treeBins_.end()) continue;
+            for (const auto idx : cell->second) {
+                const auto& tree = trees_[idx];
+                if (tree.crownBase > 9.0 || tree.crownR < 2.0) continue;
+                const double dist = std::hypot(from[0] - tree.crownX, from[1] - tree.crownY);
+                if (dist >= bestDist || dist > maxRange) continue;
+                const Vec2 away = direction(threatPos, Vec2{tree.crownX, tree.crownY}, tree.trunkR + radius + 1.6);
+                const Vec2 spot{tree.crownX + away[0], tree.crownY + away[1]};
+                const double g = ground(spot[0], spot[1]);
+                if (!bodyClear(spot[0], spot[1], g, radius, 9.0)) continue;
+                const Vec3 ourEye{spot[0], spot[1], g + 8.0};
+                if (blocksVisionTree(threatEye, ourEye)) {
+                    bestDist = dist;
+                    bestSpot = spot;
+                }
+            }
+        }
+    }
+    return bestSpot;
+}
+
+std::vector<Vec3> Arena::nearbyRooftops(const Vec3& from, double maxRange, double minRise,
+                                        double maxRise, double radius, double height) const {
+    std::vector<Vec3> roofs;
+    const auto nodes = nearbyRoofNodes(from, maxRange, minRise, maxRise);
+    roofs.reserve(nodes.size());
+    for (const auto* node : nodes) {
+        // Pick the closest valid edge or center landing spot on this precomputed roof node.
+        const Vec3* bestPt = &node->center;
+        double bestDist = distanceXY(from, node->center);
+        for (const auto& edge : node->edgeSpots) {
+            const double d = distanceXY(from, edge.pos);
+            if (d < bestDist && bodyClear(edge.pos[0], edge.pos[1], node->topZ, radius, height)) {
+                bestDist = d;
+                bestPt = &edge.pos;
+            }
+        }
+        if (bestDist <= maxRange && bodyClear((*bestPt)[0], (*bestPt)[1], node->topZ, radius, height)) {
+            roofs.push_back(*bestPt);
         }
     }
     std::sort(roofs.begin(), roofs.end(), [&](const Vec3& a, const Vec3& b) {

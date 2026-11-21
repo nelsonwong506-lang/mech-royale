@@ -34,6 +34,7 @@ struct Zone {
     double nextRadius;
     double start;
     double end;
+    double dps;
 };
 
 struct Motion {

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "arena.hpp"
 #include "common.hpp"
 #include "tactics.hpp"
 
@@ -8,7 +9,6 @@
 
 namespace mr {
 
-class Arena;
 class Navigator;
 struct Motion;
 struct Zone;
@@ -29,20 +29,24 @@ struct CombatContext {
     double maxHp = 1400.0;
     double energy = 100.0;
     double maxEnergy = 100.0;
+    double cubes = 0.0;
     double muzzleHeight = 7.0;
     double strafeSign = 1.0;
     bool hasLightning = false;
     bool hasLaser = false;
     bool hasMortar = false;
+    bool hasReadyMortar = false;
     bool laserCharging = false;
     bool reloading = false;
     bool wantRegen = false;
     bool needReposition = false;
     bool onRoof = false;
+    const RooftopNode* currentRoof = nullptr;
     Vec3 anchor{};
     Vec2 velocity{};
     std::optional<Vec2> bulletDodge;
     std::optional<Vec2> coverPull;
+    std::optional<Vec2> treeCover;
 };
 
 struct CombatMove {

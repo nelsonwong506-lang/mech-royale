@@ -29,7 +29,8 @@ Zone::Zone(const Json& state, double observedAt)
       nextCenter(safeVec2(state, "next_center", center)),
       nextRadius(finiteOr(state.value("next_radius", radius), radius)),
       start(finiteOr(state.value("shrink_start", now), now)),
-      end(finiteOr(state.value("shrink_end", now), now)) {}
+      end(finiteOr(state.value("shrink_end", now), now)),
+      dps(finiteOr(state.value("dps", 0.0), 0.0)) {}
 
 std::pair<Vec2, double> Zone::circle(double at) const {
     const double effectiveStart = std::max(now, start);
