@@ -35,7 +35,8 @@ public:
     bool canStep(int a, int b, bool diag) const;
     bool lineWalkable(double x0, double y0, double x1, double y1) const;
 
-    std::pair<std::vector<int32_t>, bool> path(double sx, double sy, double gx, double gy, int maxExpand = 22000);
+    std::pair<std::vector<int32_t>, bool> path(double sx, double sy, double gx, double gy,
+                                               int maxExpand = 22000, float extraRadius = 0.0f);
 
     std::optional<Vec2> findCoverBFS(double sx, double sy,
                                      const std::function<bool(double, double)>& isHidden,

@@ -40,7 +40,9 @@ NavGrid::NavGrid(const Arena& arena, double navRadius, double step)
             const std::size_t c = static_cast<std::size_t>(j) * nnx_ + i;
             const auto [z, nonBridgeRoof] = arena_.walkSurfaceInfo(x, y);
             surf_[c] = static_cast<float>(z);
-            const bool standable = !nonBridgeRoof && arena_.prismClear(x, y, z, navRadius, 9.0, 1.2);
+            const bool inMargin = x >= arena_.bounds[0] + navRadius && x <= arena_.bounds[2] - navRadius &&
+                                  y >= arena_.bounds[1] + navRadius && y <= arena_.bounds[3] - navRadius;
+            const bool standable = inMargin && !nonBridgeRoof && arena_.prismClear(x, y, z, navRadius, 9.0, 1.2);
             blocked_[c] = standable ? 0 : 1;
         }
     }
@@ -222,7 +224,8 @@ NavGrid::HeapItem NavGrid::popHeap() {
     return top;
 }
 
-std::pair<std::vector<int32_t>, bool> NavGrid::path(double sx, double sy, double gx, double gy, int maxExpand) {
+std::pair<std::vector<int32_t>, bool> NavGrid::path(double sx, double sy, double gx, double gy,
+                                                    int maxExpand, float extraRadius) {
     const int s = nearestFree(cell(sx, sy));
     const int g = nearestFree(cell(gx, gy));
     if (s < 0 || g < 0) return {{}, false};
@@ -279,8 +282,10 @@ std::pair<std::vector<int32_t>, bool> NavGrid::path(double sx, double sy, double
                 step *= 1.4142f;
             }
             const float cl = clearance_[static_cast<std::size_t>(nb)];
-            if (cl < 4.0f) {
-                step *= 1.0f + (4.0f - cl) * 0.15f;
+            if (extraRadius > 0.2f && cl <= extraRadius) {
+                step *= 8.0f;
+            } else if (cl < 4.0f + extraRadius) {
+                step *= 1.0f + (4.0f + extraRadius - cl) * 0.15f;
             }
             const float ng = g_[static_cast<std::size_t>(c)] + step;
             if (stamp_[static_cast<std::size_t>(nb)] != gen || ng < g_[static_cast<std::size_t>(nb)]) {
