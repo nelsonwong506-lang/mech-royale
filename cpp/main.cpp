@@ -294,7 +294,7 @@ public:
         const bool defending = effectiveFireAllowed && !joining && !(shot && shot->firing()) && !laserCharging &&
             return_fire(obs, threat, command.move, arena_, decision.returningToCover);
 
-        // Aim priority: active shot > duel > visible front-armor facing > rear-hit event snap > blind-spot sound > threat > scan.
+        // Aim priority: active shot > duel > visible front-armor facing > rear-hit snap > known threat pre-aim > immediate blind-spot alert > 360-deg scan!
         std::optional<Vec2> aim;
         if (shot) {
             aim = shot->aim;
@@ -304,12 +304,14 @@ public:
             aim = Vec2{*armorYaw, 0.0};
         } else if (const auto rearYaw = threats_.rear_hit_bearing(now)) {
             aim = Vec2{*rearYaw, 0.0};
+        } else if (threat && threat->position) {
+            aim = retreat_aim(obs, threat);
         } else if (!blindSounds.empty()) {
             const bool haveLaser = hasWeaponKind(weapons, "laser");
             const SoundContact* bestSc = nullptr;
             int bestPrio = -1;
             for (const auto& sc : blindSounds) {
-                int p = sc.near ? 20 : 5;
+                int p = -1;
                 if (onRoof && sc.jet) p = 100;
                 else if (sc.laser_charging) p = 90;
                 else if (haveLaser && sc.weapon == "mortar") p = 75;
@@ -322,10 +324,8 @@ public:
             if (bestSc) {
                 aim = Vec2{bestSc->bearing, (onRoof && bestSc->jet) ? -0.35 : 0.0};
             }
-        } else if (soundAlert && (soundAlert->laser_charge || (onRoof && soundAlert->near_jet) || soundAlert->near_hostile)) {
+        } else if (soundAlert && (soundAlert->laser_charge || (onRoof && soundAlert->near_jet))) {
             aim = Vec2{soundAlert->bearing, (onRoof && soundAlert->near_jet) ? -0.35 : 0.0};
-        } else if (threat && threat->position) {
-            aim = retreat_aim(obs, threat);
         }
         if (aim) {
             action["aim"] = sanitizeAim(*aim, minPitch_, maxPitch_);
@@ -755,6 +755,16 @@ private:
             }
         }
 
+        // Grab safe nearby cubes (< 16m, e.g. dropped by our own kills!) and desired weapons (< 22m)
+        // without leaving hard cover or walking into close enemy crossfire!
+        if (inZone && !window.urgent && !regenMode_ && !(threat && threat->laser_charging) &&
+            (exposedNow == 0 || close80 == 0)) {
+            if (const auto grab = closeSafeLoot(obs, start, enemyInfos, zone, motion, weapons, hpFrac)) {
+                const bool sprint = grounded && energy > 0.45 * maxEnergy;
+                return {groundCommand(start, *grab, me, zone, motion, sprint, enemies), "grab-loot", true};
+            }
+        }
+
         // Allow tanking light/mid storm (dps <= 60) briefly to finish a close 1v1 kill before rotating in!
         const double zoneDps = obs.contains("zone") && obs["zone"].is_object() ? obs["zone"].value("dps", 20.0) : 20.0;
         const double distToSafe = std::max(0.0, distanceXY(start, zone.nextCenter) - zone.nextRadius);
@@ -970,11 +980,10 @@ private:
         const bool blocked = threat->facing_us && wallBehind(start, away, motion);
         if (zone.now >= nextHopAt_ && exposed && (laser || threat->damaged_recently || blocked)) {
             const auto path = planDefensiveHop(me, *threat, enemies, zone, motion, arena_, navigator_, laser, blocked, deadline);
-            // Allow defensive hop when it gains cover (>=2/3), or under close-range/multi-enemy pressure;
-            // only skip pointless open-field single-bullet hops at long range (> 45m, 1v1, 0 cover).
-            const bool goodHop = path && (wallCover(path->landing, enemy, motion.height, arena_) >= 2 ||
-                                          distanceXY(start, enemy) <= 45.0 || enemies.size() >= 2);
-            if (path && (laser || blocked || goodHop) && keepsRotation(start, path->landing, zone, window)) {
+            // Never jump into open air (5x slower air_accel, predictable parabolic arc -> 25% of all deaths!);
+            // only take a damage-triggered hop if it actually lands in FULL hard cover (wallCover == 3)!
+            const bool landsInFullCover = path && wallCover(path->landing, enemy, motion.height, arena_) == 3;
+            if (path && (laser || blocked || landsInFullCover) && keepsRotation(start, path->landing, zone, window)) {
                 const auto label = laser ? "laser-hop" : blocked ? "wall-hop" : "cover-hop";
                 hop_ = ActiveHop{*path, zone.now, label};
                 nextHopAt_ = zone.now + 2.4;
@@ -1214,17 +1223,23 @@ private:
         }
         if (!target && !route.empty()) target = route.front();
         if (!target && !insideNext) {
-            target = recover(start, zone, motion, std::min(hardDeadline, Clock::now() + 4ms), enemies);
+            target = recover(start, zone, motion, std::min(hardDeadline, Clock::now() + 4ms),
+                             outside ? std::vector<Vec3>{} : enemies);
         }
-        if (target && !enemies.empty() && !avoidsApproach(start, horizontal(*target), enemies)) {
+        if (target && !outside && !window.urgent && !enemies.empty() && !avoidsApproach(start, horizontal(*target), enemies)) {
             const auto escape = recover(start, zone, motion, std::min(hardDeadline, Clock::now() + 3ms), enemies);
             if (escape) target = escape;
         }
         monitorProgress(start, target, zone.now, navigator_.isSearching());
-        const bool boost = grounded && target && !insideNext && (outside || eta + 3 > window.secondsUntilRisk) &&
+        // If trapped outside the zone by a building (A* exhausted), conserve energy to fly over the wall!
+        const bool savingForFlight = outside && navigator_.searchExhausted() && energy < 0.42 * maximum;
+        const bool boost = grounded && target && !insideNext && !savingForFlight &&
+            (outside || eta + 3 > window.secondsUntilRisk) &&
             energy > 0.2 * maximum + motion.boostDrain * 0.2;
-        auto command = groundCommand(start, target, me, zone, motion, boost, enemies, window.urgent);
-        if (window.urgent && (outside || zone.clearance(start, zone.now + 0.55) < 0) &&
+        const std::vector<Vec3> noEnemies;
+        auto command = groundCommand(start, target, me, zone, motion, boost,
+                                     outside ? noEnemies : enemies, window.urgent || outside);
+        if ((window.urgent || outside) && (outside || zone.clearance(start, zone.now + 0.55) < 0) &&
             std::hypot(command.move[0], command.move[1]) < 0.12) {
             auto current = zone;
             current.nextCenter = current.center;
@@ -1315,17 +1330,71 @@ private:
         return std::nullopt;
     }
 
+    std::optional<Vec3> closeSafeLoot(const Json& obs, const Vec3& start, const std::vector<EnemyInfo>& enemyInfos,
+                                      const Zone& zone, const Motion& motion, const Json& weapons, double hpFrac) {
+        // 1. Grab nearby desired secondary weapon (< 22m) if direct & safe.
+        if (const auto it = obs.find("pickups"); it != obs.end() && it->is_array()) {
+            double bestScore = -infinity;
+            std::optional<Vec3> best;
+            for (const auto& item : *it) {
+                if (!item.is_object()) continue;
+                const auto kind = item.value("kind", std::string{});
+                const auto [want, dropSlot] = desiredSwapSlot(weapons, kind);
+                (void)dropSlot;
+                if (!want) continue;
+                const auto pos = safeVec3(item, "pos", {infinity, infinity, 0.0});
+                if (!std::isfinite(pos[0])) continue;
+                const double dist = distanceXY(start, pos);
+                if (dist > 22.0 || std::abs(start[2] - pos[2]) > 3.9) continue;
+                if (zone.clearance(horizontal(pos), zone.now + 4.0) <= motion.radius + 1.5) continue;
+                const auto pt = navigator_.support(horizontal(pos), motion, pos[2] + 3.5);
+                if (pt && navigator_.direct(start, *pt, zone, motion) &&
+                    lootPointSafe(start, *pt, enemyInfos, motion, hpFrac)) {
+                    const double score = weaponPriority(kind) - dist * 2.0;
+                    if (score > bestScore) { bestScore = score; best = *pt; }
+                }
+            }
+            if (best) return best;
+        }
+        // 2. Grab nearby cubes (< 16m, e.g. freshly dropped from our kills!) when < 10 cubes.
+        const auto& me = obs.contains("self") && obs["self"].is_object() ? obs["self"] : Json::object();
+        if (me.value("cubes", 0.0) < cubeStatCap_) {
+            if (const auto it = obs.find("cubes"); it != obs.end() && it->is_array()) {
+                double bestDist = 16.0;
+                std::optional<Vec3> best;
+                for (const auto& item : *it) {
+                    const auto pos = safeVec3(item, "pos", {infinity, infinity, 0.0});
+                    if (!std::isfinite(pos[0])) continue;
+                    const double dist = distanceXY(start, pos);
+                    if (dist <= pickupRadius_ || dist >= bestDist || std::abs(start[2] - pos[2]) > 3.9) continue;
+                    if (zone.clearance(horizontal(pos), zone.now + 4.0) <= motion.radius + 1.5) continue;
+                    const auto pt = navigator_.support(horizontal(pos), motion, pos[2] + 3.5);
+                    if (pt && navigator_.direct(start, *pt, zone, motion) &&
+                        lootPointSafe(start, *pt, enemyInfos, motion, hpFrac)) {
+                        bestDist = dist;
+                        best = *pt;
+                    }
+                }
+                if (best) return best;
+            }
+        }
+        return std::nullopt;
+    }
+
     std::optional<Vec3> pickup(const Json& obs, const Vec3& start, const std::optional<Threat>& threat,
                                const std::vector<EnemyInfo>& enemyInfos, const Zone& zone,
                                const Motion& motion, const Goals& route, bool complete, bool urgentZone) {
-        (void)urgentZone;
         const auto& me = obs.contains("self") && obs["self"].is_object() ? obs["self"] : Json::object();
         const double hpFrac = me.value("hp", 1400.0) / std::max(1.0, me.value("max_hp", 1400.0));
         const bool hostileThreat = threat && (threat->hostile || threat->damaged_recently || threat->laser_charging);
-        if (hostileThreat || !me.value("in_zone", false) ||
-            (!complete && !zone.inNext(start, motion.radius + 4))) {
+        if (hostileThreat || !me.value("in_zone", false)) {
             return {};
         }
+        const bool partialRouteMode = !complete && !zone.inNext(start, motion.radius + 4);
+        if (partialRouteMode && urgentZone) {
+            return {};
+        }
+        const double startDistToNext = distanceXY(start, zone.nextCenter);
         const double base = navigator_.pathTime(start, route, motion.walk);
         auto evaluateItem = [&](const Vec3& pos, double maxDetourSec) -> std::optional<Vec3> {
             const auto point = navigator_.support(horizontal(pos), motion, pos[2] + 4.0);
@@ -1333,6 +1402,15 @@ private:
                 return std::nullopt;
             }
             if (!lootPointSafe(start, *point, enemyInfos, motion, hpFrac)) {
+                return std::nullopt;
+            }
+            if (partialRouteMode) {
+                // Only grab close forward-compatible items while A* is still searching (never backtrack!).
+                if (distanceXY(start, *point) <= 20.0 &&
+                    distanceXY(*point, zone.nextCenter) <= startDistToNext + 10.0 &&
+                    zone.clearance(horizontal(*point), zone.now + 6.0) > motion.radius + 2.0) {
+                    return point;
+                }
                 return std::nullopt;
             }
             if (!route.empty() && !navigator_.walkable(*point, route.front(), motion)) {

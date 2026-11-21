@@ -769,6 +769,12 @@ std::optional<Threat> ThreatTracker::update(const Json& obs, const Arena& arena,
                 last_hit_dealt_at_ = now;
                 continue;
             }
+            if (etype == "kill") {
+                if (const auto dead_id = actor_id(event, "target")) {
+                    attacks_.erase(*dead_id);
+                }
+                continue;
+            }
             if (etype == "effect") {
                 if (text(field(event, "effect")) == "short") {
                     laser_shorted_until_ = std::max(laser_shorted_until_, now + 2.0);
@@ -1491,8 +1497,10 @@ std::optional<GunShot> ThreatTracker::visible_shot(const Json& obs, const Arena&
                     if (!aim_pt) continue;
                     const double dist = distance_3d(shot.origin, *aim_pt);
                     if (dist > slot.range) continue;
-                    const auto aim = clamp_hit_pitch(shot.lead_origin, *aim_pt, *target.position,
-                                                     target.attack_height, min_pitch_, max_pitch_);
+                    const auto aim = is_npc
+                        ? std::optional<Vec2>(angles(shot.lead_origin, *aim_pt))
+                        : clamp_hit_pitch(shot.lead_origin, *aim_pt, *target.position,
+                                          target.attack_height, min_pitch_, max_pitch_);
                     if (!aim) continue;
                     const double slack = dist > 90.0 ? 0.012 : 0.025;
                     const bool fire = slot.ready && aim_aligned(*aim, actual, dist, target.attack_radius, slack) &&

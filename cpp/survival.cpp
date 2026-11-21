@@ -12,7 +12,7 @@
 namespace mr {
 namespace {
 
-constexpr double rotationReserve = 7.0;
+constexpr double rotationReserve = 9.5;
 constexpr double infinity = std::numeric_limits<double>::infinity();
 constexpr double tau = 6.283185307179586;
 
@@ -181,7 +181,7 @@ std::optional<double> frontArmorYaw(const Vec3& from, const std::vector<EnemyInf
     double sumX = 0.0, sumY = 0.0;
     for (const auto& e : enemies) {
         const double dist = distanceXY(from, e.pos);
-        if (dist > 180.0 || wallCover(from, e.pos, ownHeight, arena) == 3) {
+        if (dist > 240.0 || wallCover(from, e.pos, ownHeight, arena) == 3) {
             continue;
         }
         const double weight = (e.facing_us ? 2.5 : 1.0) * (e.charging ? 2.0 : 1.0) / std::max(10.0, dist);
