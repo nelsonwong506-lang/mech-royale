@@ -100,6 +100,7 @@ public:
                                         std::optional<int> sticky_target_id = std::nullopt,
                                         double jet_energy_reserve = 0.0) const;
     std::vector<EnemyInfo> visible_enemies(const Json& obs, const Arena& arena) const;
+    std::optional<Threat> recovery_attacker(const Json& obs, const Arena& arena) const;
     std::optional<Threat> combat_focus(const Json& obs, const Arena& arena,
                                        const std::vector<EnemyInfo>& enemies,
                                        const std::optional<Threat>& current,
@@ -120,6 +121,7 @@ private:
 
     struct AttackMemory {
         double time = -std::numeric_limits<double>::infinity();
+        double damageTime = -std::numeric_limits<double>::infinity();
         std::optional<Vec3> position;
         bool is_npc = false;
     };
@@ -134,6 +136,8 @@ private:
     std::unordered_map<int, HealthSample> health_samples_{};
     std::array<std::array<std::optional<double>, 16>, 16> duel_times_{};
     std::optional<Vec3> unknown_position_;
+    std::optional<Vec3> unknown_damage_position_;
+    double unknown_damage_at_ = -std::numeric_limits<double>::infinity();
     double unknown_until_ = -std::numeric_limits<double>::infinity();
     std::optional<double> sound_heading_;
     double sound_until_ = -std::numeric_limits<double>::infinity();

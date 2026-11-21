@@ -43,6 +43,7 @@ struct Intent {
     const char* reason;
     bool sprint = false;
     bool jumpToPeek = false;
+    bool finalRotation = false;
 };
 
 struct Frame {
@@ -54,6 +55,7 @@ struct Frame {
     const Motion& motion;
     Vec3 pos;
     const std::optional<Threat>& threat;
+    const std::optional<Threat>& recoveryAttacker;
     const std::vector<EnemyInfo>& enemies;
     RotationWindow window;
     Clock::time_point deadline;
@@ -186,8 +188,11 @@ public:
         if (routePhase_ != std::pair{zone.start, zone.end}) {
             routePhase_ = {zone.start, zone.end};
             routeEstimate_.reset();
-            rotationGoal_.reset();
+            rotationDestinations_.clear();
+            routeGoal_.reset();
+            if (flight_ && !flight_->airborne && flightOwner_.mode == Mode::Rotate) flight_.reset();
         }
+        if (routeEstimate_ && distanceXY(pos, routeEstimateOrigin_) > 18.0) routeEstimate_.reset();
         const auto deadline = tickStarted + 29ms;
         auto threat = threats_.update(obs, arena_, std::min(deadline, Clock::now() + 5ms));
         const auto enemies = threats_.visible_enemies(obs, arena_);
@@ -197,11 +202,13 @@ public:
         const bool grounded = me.value("grounded", true);
         const bool onRoof = grounded && arena_.roofAt(pos);
         const int exposed = exposureAt(pos, enemies, motion.height);
+        const auto recoveryAttacker = !exposed && (mode_ == Mode::Regen || hp < 0.8 * maxHp)
+            ? threats_.recovery_attacker(obs, arena_) : std::nullopt;
         int close = 0;
         for (const auto& enemy : enemies) {
             if (distanceXY(pos, enemy.pos) < 35.0) ++close;
         }
-        const Frame frame{obs, me, stats, weapons, zone, motion, pos, threat, enemies,
+        const Frame frame{obs, me, stats, weapons, zone, motion, pos, threat, recoveryAttacker, enemies,
                           rotationWindow(pos, zone, motion, routeEstimate_), deadline,
                           hp, hp / maxHp, me.value("energy", 0.0), me.value("in_zone", false),
                           grounded, onRoof, exposed};
@@ -210,7 +217,9 @@ public:
         mode_ = intent.mode;
         Json action = {{"move", sanitizeMove(command.move)}, {"jump", command.jump}, {"boost", command.boost}};
         const bool charging = isLaserCharging(weapons);
-        const bool mayFire = intent.mode != Mode::Regen || exposed > 0;
+        const bool counterDrone = intent.mode == Mode::Regen && recoveryAttacker &&
+                                  recoveryAttacker->is_npc && recoveryAttacker->attack_position;
+        const bool mayFire = intent.mode != Mode::Regen || exposed > 0 || counterDrone;
         const bool farm = intent.mode == Mode::Snowball;
         const bool chargeAllowed = mayFire && !frame.window.urgent && !command.jump &&
                                    !(flight_ && flight_->airborne) && !(command.boost && !grounded);
@@ -225,7 +234,8 @@ public:
         if (lastTargetId_ && threats_.eliminated(*lastTargetId_)) lastTargetId_.reset();
         std::optional<GunShot> shot;
         if (mayFire || charging) {
-            shot = threats_.visible_shot(obs, arena_, threat, std::min(tickStarted + 39ms, Clock::now() + 8ms),
+            shot = threats_.visible_shot(obs, arena_, counterDrone ? recoveryAttacker : threat,
+                                         std::min(tickStarted + 39ms, Clock::now() + 8ms),
                                          farm, farm, chargeAllowed, lastTargetId_, jetReserve);
         }
         std::optional<Vec2> aim;
@@ -244,7 +254,8 @@ public:
         action["aim"] = sanitizeAim(aim ? *aim : scanAim(me, command.move, now), stats);
         const std::array<bool,2> fire = shot ? shot->fire : std::array{false, false};
         action["fire"] = fire;
-        action["reload"] = !fire[0] && !fire[1] && !charging && canReload(frame);
+        action["reload"] = !fire[0] && !fire[1] && !charging &&
+                           (intent.mode != Mode::Regen || !recoveryAttacker) && canReload(frame);
         attachWeaponTake(obs, me, weapons, pos, charging, exposed, close, action);
         if (obs.contains("offer") && !obs.at("offer").is_null()) action["pick"] = chooseOfferPick(obs.at("offer"));
         if (config_.value("debug", Json::object()).value("max_text_chars", 0) >= 16)
@@ -472,23 +483,22 @@ private:
 
     Intent rotation(const Frame& f) {
         if (f.inZone && f.zone.inNext(f.pos, f.motion.radius + 3)) return {Mode::Rotate, f.pos, "rotate"};
-        if (!rotationGoal_ || !f.zone.inNext(*rotationGoal_) || distanceXY(f.pos, *rotationGoal_) < 1.0) {
-            auto options = rotationGoals(f.pos, f.zone, f.motion);
-            rotationGoal_ = options.empty() ? std::optional<Vec3>{} : options.front();
-        }
-        const Vec3 goal = rotationGoal_.value_or(Vec3{f.zone.nextCenter[0], f.zone.nextCenter[1],
-            arena_.ground(f.zone.nextCenter[0], f.zone.nextCenter[1])});
-        if (distanceXY(f.pos, goal) > 18) {
+        if (rotationDestinations_.empty())
+            rotationDestinations_ = rotationGoals(f.pos, f.zone, f.motion);
+        const auto [x, y] = f.zone.nextCenter;
+        const Vec3 goal = rotationDestinations_.empty() ? Vec3{x, y, arena_.ground(x, y)}
+                                                       : rotationDestinations_.front();
+        if (!f.window.urgent && distanceXY(f.pos, goal) > 18) {
             const auto stop = arena_.rotationWaypoint(f.pos, horizontal(goal), 52, f.motion.radius, f.motion.height);
             if (stop && (!failedGoal_ || f.zone.now >= retryAt_ || distanceXY(*stop, *failedGoal_) > 3)) {
                 const double extra = distanceXY(f.pos, *stop) + distanceXY(*stop, goal) - distanceXY(f.pos, goal);
                 const double travel = distanceXY(f.pos, *stop) / std::max(1.0, f.motion.walk);
-                if (extra < f.motion.walk * (f.window.urgent ? 0.5 : 2.0) &&
+                if (extra < f.motion.walk * 2.0 &&
                     f.zone.segment(f.pos, *stop, f.zone.now, travel))
-                    return {Mode::Rotate, *stop, f.inZone ? "cover-rotate" : "recover-zone", f.window.urgent};
+                    return {Mode::Rotate, *stop, "cover-rotate"};
             }
         }
-        return {Mode::Rotate, goal, f.inZone ? "rotate" : "recover-zone", f.window.urgent};
+        return {Mode::Rotate, goal, f.inZone ? "rotate" : "recover-zone", f.window.urgent, false, true};
     }
 
     std::optional<Intent> snowball(const Frame& f) {
@@ -547,7 +557,62 @@ private:
             if (seen != searched_.end() && f.zone.now - seen->second < 45.0) continue;
             consider(roof, 25, "search-roof");
         }
-        return best;
+        if (best) return best;
+        return scoutGround(f);
+    }
+
+    std::optional<Intent> scoutGround(const Frame& f) {
+        if (!f.grounded || f.onRoof || f.exposed || !f.zone.inNext(f.pos, f.motion.radius + 4)) return {};
+        auto safe = [&](const Vec3& goal) {
+            const double travel = distanceXY(f.pos, goal) / std::max(1., f.motion.walk);
+            if (!f.zone.inNext(goal, f.motion.radius + 4) ||
+                f.zone.clearance(goal, f.zone.now + travel + 2) < f.motion.radius ||
+                !navigator_.direct(f.pos, goal, f.zone, f.motion)) return false;
+            const Vec3 mid{(f.pos[0] + goal[0]) / 2, (f.pos[1] + goal[1]) / 2, (f.pos[2] + goal[2]) / 2};
+            for (const auto& enemy : f.enemies) {
+                const double range = enemy.has_laser ? 280. : 235.;
+                if (distanceXY(mid, enemy.pos) > range + distanceXY(f.pos, goal) * 0.5) continue;
+                if (wallCover(mid, enemy, f.motion.height, arena_) != 3 ||
+                    wallCover(goal, enemy, f.motion.height, arena_) != 3) return false;
+            }
+            return true;
+        };
+        if (scoutGoal_ && f.zone.now < scoutUntil_ && distanceXY(f.pos, *scoutGoal_) > 3 && safe(*scoutGoal_))
+            return Intent{Mode::Snowball, *scoutGoal_, "scout-ground"};
+        if (!scoutGoal_ && f.zone.now < scoutUntil_) return {};
+        scoutGoal_.reset();
+        if (scoutOrigins_.empty() || distanceXY(f.pos, scoutOrigins_.back()) > 6) {
+            if (scoutOrigins_.size() >= 8) scoutOrigins_.erase(scoutOrigins_.begin());
+            scoutOrigins_.push_back(horizontal(f.pos));
+        }
+        const double forward = scoutHeading_.value_or(safeVec2(f.me, "aim")[0]);
+        double best = -infinity;
+        for (double reach : {25., 12.}) {
+            for (int offset : {0, 45, -45, 90, -90, 140, -140, 180}) {
+                if (Clock::now() >= f.deadline) break;
+                const double yaw = forward + radians(offset);
+                const Vec2 xy{f.pos[0] + reach * std::cos(yaw), f.pos[1] + reach * std::sin(yaw)};
+                const auto point = navigator_.support(xy, f.motion, arena_.ground(xy[0], xy[1]) + f.motion.step);
+                if (!point || !safe(*point)) continue;
+                double novelty = reach;
+                for (const auto& origin : scoutOrigins_) novelty = std::min(novelty, distanceXY(origin, xy));
+                const double gap = arena_.distanceToNearestWall(xy[0], xy[1], (*point)[2], 24.);
+                const double value = novelty + 0.2 * reach + 2. * std::cos(radians(offset)) +
+                                     0.3 * std::max(0., 24. - gap);
+                if (value > best) {
+                    best = value;
+                    scoutGoal_ = *point;
+                    scoutHeading_ = yaw;
+                }
+            }
+            if (scoutGoal_) break;
+        }
+        if (!scoutGoal_) {
+            scoutUntil_ = f.zone.now + 0.4;
+            return {};
+        }
+        scoutUntil_ = f.zone.now + distanceXY(f.pos, *scoutGoal_) / std::max(1., f.motion.walk) + 1.;
+        return Intent{Mode::Snowball, *scoutGoal_, "scout-ground"};
     }
 
     int exposureAt(const Vec3& point, const std::vector<EnemyInfo>& enemies, double height) const {
@@ -734,6 +799,11 @@ private:
                                    std::max(1.0, f.stats.value("regen_per_s",45.0));
             if (delay + healing + f.window.estimatedTravel + 1 >= f.window.secondsUntilRisk)
                 return rotation(f);
+            if (f.recoveryAttacker) {
+                const auto retreat = planRetreat(f.pos, *f.recoveryAttacker, {}, f.zone, f.motion, arena_, navigator_,
+                                                 std::min(f.deadline, Clock::now() + 4ms));
+                if (retreat) return {Mode::Regen, retreat->target, "seek-cover", true};
+            }
             if (auto shelter = roofCombat(f, true)) return *shelter;
             if (opponent && f.exposed) {
                 std::vector<Vec3> positions;
@@ -780,7 +850,8 @@ private:
     }
     Command execute(const Frame& f, Intent& intent) {
         if (flight_) {
-            if (!flight_->airborne && (flightOwner_.mode != intent.mode || distanceXY(intent.goal, flightOwner_.goal) > 5))
+            if (!flight_->airborne && (flightOwner_.mode != intent.mode ||
+                (!flightOwner_.finalRotation && distanceXY(intent.goal, flightOwner_.goal) > 5)))
                 flight_.reset();
             if (flight_) {
                 if (auto command = fly(f.me, f.pos, f.zone, f.motion)) {
@@ -828,8 +899,12 @@ private:
         }
         if (distanceXY(f.pos, intent.goal) < 0.55 && std::abs(f.pos[2] - intent.goal[2]) < 1) return {};
         const bool sprint = intent.sprint && f.grounded && f.energy > 18 && !isLaserCharging(f.weapons);
-        if (navigator_.direct(f.pos, intent.goal, f.zone, f.motion)) {
-            if (intent.mode == Mode::Rotate) routeEstimate_ = distanceXY(f.pos, intent.goal) / std::max(1.0, f.motion.walk);
+        if ((!intent.finalRotation || rotationDestinations_.size() <= 1) &&
+            navigator_.direct(f.pos, intent.goal, f.zone, f.motion)) {
+            if (intent.finalRotation) {
+                routeEstimate_ = distanceXY(f.pos, intent.goal) / std::max(1.0, f.motion.walk);
+                routeEstimateOrigin_ = f.pos;
+            }
             return groundCommand(f.pos, intent.goal, f.me, f.zone, f.motion, sprint);
         }
         if (!routeGoal_ || distanceXY(*routeGoal_, intent.goal) > 1 || std::abs((*routeGoal_)[2] - intent.goal[2]) > 1 ||
@@ -838,17 +913,23 @@ private:
             routeMode_ = intent.mode;
             ++routeId_;
         }
-        const auto route = navigator_.plan(f.pos, {intent.goal}, f.zone, f.motion, routeId_,
+        const Goals goals = intent.finalRotation && !rotationDestinations_.empty()
+            ? rotationDestinations_ : Goals{intent.goal};
+        const auto route = navigator_.plan(f.pos, goals, f.zone, f.motion, routeId_,
                                           std::min(f.deadline, Clock::now() + 5ms));
         const double walkTime = route.complete ? navigator_.pathTime(f.pos, route.route, f.motion.walk) : infinity;
-        if (intent.mode == Mode::Rotate && route.complete) routeEstimate_ = walkTime;
+        if (intent.finalRotation) {
+            routeEstimate_ = route.complete ? std::optional(walkTime) : std::nullopt;
+            routeEstimateOrigin_ = f.pos;
+            if (route.complete) intent.goal = route.route.back();
+        }
         if (f.grounded && f.zone.now >= considerFlightAt_ && f.energy > 20 &&
             (intent.goal[2] > f.pos[2] + f.motion.step || intent.mode == Mode::Rotate)) {
             considerFlightAt_ = f.zone.now + 0.45;
             if (intent.goal[2] > f.pos[2] + f.motion.step)
                 flight_ = navigator_.flightToRoof(f.pos, intent.goal, f.zone, f.motion, f.energy, f.me.value("max_energy",100.0), f.deadline, horizontal(safeVec3(f.me,"vel")));
             else
-                flight_ = navigator_.flightPlan(f.pos, {intent.goal}, f.zone, f.motion, f.energy, f.me.value("max_energy",100.0), f.deadline, horizontal(safeVec3(f.me,"vel")));
+                flight_ = navigator_.flightPlan(f.pos, goals, f.zone, f.motion, f.energy, f.me.value("max_energy",100.0), f.deadline, horizontal(safeVec3(f.me,"vel")));
             if (flight_ && flight_->seconds + distanceXY(f.pos, flight_->takeoff) / std::max(1.0, f.motion.walk) < walkTime) {
                 flightOwner_ = intent;
                 plannedFlightAt_ = f.zone.now;
@@ -859,11 +940,18 @@ private:
             }
             flight_.reset();
         }
-        if (!route.route.empty()) return groundCommand(f.pos, route.route.front(), f.me, f.zone, f.motion, sprint);
+        if (!route.route.empty()) {
+            const auto command = groundCommand(f.pos, route.route.front(), f.me, f.zone, f.motion, sprint);
+            if (intent.mode != Mode::Rotate || !f.window.urgent || distanceXY(command.move, Vec2{}) >= 0.12)
+                return command;
+        }
         if (navigator_.searchExhausted()) {
             failedGoal_ = intent.goal;
             retryAt_ = f.zone.now + 5.0;
-            if (intent.mode == Mode::Rotate) rotationGoal_.reset();
+            if (intent.finalRotation) {
+                rotationDestinations_.clear();
+                routeGoal_.reset();
+            }
             intent.reason = "unreachable";
         }
         if (intent.goal[2] > f.pos[2] + f.motion.step && f.grounded) {
@@ -875,10 +963,39 @@ private:
                 return groundCommand(f.pos, *approach, f.me, f.zone, f.motion, false);
             }
         }
-        if (intent.mode == Mode::Rotate)
-            return groundCommand(f.pos, intent.goal, f.me, f.zone, f.motion, sprint);
+        if (intent.mode == Mode::Rotate) {
+            const auto command = groundCommand(f.pos, intent.goal, f.me, f.zone, f.motion, sprint);
+            if (!f.window.urgent || distanceXY(command.move, Vec2{}) >= 0.12) return command;
+            if (const auto step = inwardRecoveryStep(f)) {
+                intent.goal = *step;
+                return groundCommand(f.pos, *step, f.me, f.zone, f.motion, sprint);
+            }
+        }
         return {};
     }
+
+    std::optional<Vec3> inwardRecoveryStep(const Frame& f) {
+        const auto center = f.zone.circle(f.zone.now + 0.6).first;
+        const double inward = std::atan2(center[1] - f.pos[1], center[0] - f.pos[0]);
+        double bestProgress = 0.1;
+        std::optional<Vec3> best;
+        for (double length : {6.0, 3.0}) {
+            for (int offset : {0, 30, -30, 60, -60, 85, -85}) {
+                if (Clock::now() >= f.deadline) return best;
+                const double heading = inward + radians(offset);
+                const Vec2 point{f.pos[0] + length * std::cos(heading), f.pos[1] + length * std::sin(heading)};
+                const double progress = distanceXY(f.pos, center) - distanceXY(point, center);
+                if (progress <= bestProgress) continue;
+                const auto candidate = navigator_.support(point, f.motion, f.pos[2] + f.motion.step);
+                if (candidate && navigator_.direct(f.pos, *candidate, f.zone, f.motion)) {
+                    best = candidate;
+                    bestProgress = progress;
+                }
+            }
+        }
+        return best;
+    }
+
     Command groundCommand(const Vec3& start, const std::optional<Vec3>& target, const Json& me,
                           const Zone& zone, const Motion& motion, bool boost) {
         const auto guarded = [&](const Vec2& move, bool sprint) {
@@ -1005,11 +1122,17 @@ private:
     double hopEnds_ = 0, steerAt_ = 0, nextHopAt_ = 0, considerFlightAt_ = 0;
     std::optional<int> lastTargetId_;
     std::optional<double> scanHeading_, routeEstimate_;
-    std::optional<Vec3> routeGoal_, rotationGoal_, failedGoal_;
+    Vec3 routeEstimateOrigin_{};
+    std::optional<Vec3> routeGoal_, failedGoal_;
+    Goals rotationDestinations_;
     std::pair<double,double> routePhase_{-1,-1};
     Mode routeMode_ = Mode::Rotate;
     std::size_t routeId_ = 0;
     std::map<Vec3,double> searched_;
+    std::optional<Vec3> scoutGoal_;
+    std::optional<double> scoutHeading_;
+    std::vector<Vec2> scoutOrigins_;
+    double scoutUntil_ = 0;
     double retryAt_ = 0;
 };
 

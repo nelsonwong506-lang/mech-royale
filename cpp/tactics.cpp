@@ -730,6 +730,53 @@ std::vector<EnemyInfo> ThreatTracker::visible_enemies(const Json& obs, const Are
     return list;
 }
 
+std::optional<Threat> ThreatTracker::recovery_attacker(const Json& obs, const Arena& arena) const {
+    const double now = match_time(obs);
+    const auto& me = field(obs, "self");
+    const auto& actors = field(obs, "mechs");
+    const auto feet = point_or(me, "pos");
+    const double height = number(field(me, "stats"), "height", mech_height_);
+    std::optional<Threat> result;
+    double newest = now - RetaliationSeconds;
+    auto consider = [&](Threat source, double hitTime) {
+        if (!source.position || hitTime <= newest) return;
+        const Vec3 muzzlePos = above(*source.position, source.enemy_muzzle_height);
+        for (double fraction : {0.22, 0.54, 0.9}) {
+            if (!arena.blocksLine(muzzlePos, above(feet, height * fraction))) {
+                source.hostile = true;
+                result = std::move(source);
+                newest = hitTime;
+                break;
+            }
+        }
+    };
+    if (unknown_damage_position_ && unknown_damage_at_ > newest) {
+        Threat unknown;
+        unknown.position = unknown_damage_position_;
+        consider(unknown, unknown_damage_at_);
+    }
+    for (const auto& [id, memory] : attacks_) {
+        if (memory.damageTime <= newest || eliminated(id)) continue;
+        Threat source;
+        source.actor_id = id;
+        source.is_npc = memory.is_npc;
+        source.position = memory.position;
+        source.enemy_muzzle_height = memory.is_npc ? 2.5 : muzzle_height_;
+        for (const auto& actor : actors) {
+            if (actor_id(actor, "id") != id) continue;
+            // Reported player positions already go through the normal exposure and retreat policy.
+            if (text(field(actor, "kind")) != "npc") { source.position.reset(); break; }
+            source = describe_enemy(actor, id);
+            source.attack_position = source.position;
+            source.attack_id = id;
+            source.attack_velocity = point_or(actor, "vel");
+            break;
+        }
+        consider(source, memory.damageTime);
+    }
+    return result;
+}
+
 std::optional<Threat> ThreatTracker::combat_focus(const Json& obs, const Arena& arena,
                                                   const std::vector<EnemyInfo>& enemies,
                                                   const std::optional<Threat>& current,
@@ -899,10 +946,11 @@ std::optional<Threat> ThreatTracker::update(const Json& obs, const Arena& arena,
                 rear_until_ = now + FreshHostileDamageSeconds;
             }
             if (id && eliminated(*id)) continue;
-            const bool is_npc = weapon == "npc" || (id && npcs.count(*id) > 0);
+            const bool is_npc = weapon == "npc" || (id && (*id >= 100 || npcs.count(*id) > 0));
             if (id) {
                 auto& mem = attacks_[*id];
                 mem.time = now;
+                mem.damageTime = now;
                 mem.is_npc = is_npc;
                 if (const auto it = enemies.find(*id); it != enemies.end()) {
                     mem.position = point_or(*it->second, "pos");
@@ -917,6 +965,8 @@ std::optional<Threat> ThreatTracker::update(const Json& obs, const Arena& arena,
                 const double angle = finiteOr(bearing.get<double>());
                 unknown_position_ = Vec3{position[0] + 40 * std::cos(angle),
                                          position[1] + 40 * std::sin(angle), position[2]};
+                unknown_damage_position_ = unknown_position_;
+                unknown_damage_at_ = now;
                 unknown_until_ = now + 2.0;
             }
         }

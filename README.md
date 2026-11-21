@@ -26,6 +26,7 @@ Run the mechanism scenarios and the existing firing regressions from the reposit
 ```sh
 python3 tests/vnext_scenarios.py /path/to/mechfight-kit mech-royale
 python3 tests/firing_replay.py /path/to/mechfight-kit mech-royale
+python3 tests/damage_and_exploration.py /path/to/mechfight-kit mech-royale
 ```
 
 For a paired comparison, add `--baseline OLD_IMAGE --report actions.json` to the first command. The comparison runs both images on the same 300 observations. It records the chosen mode, movement reason, destination and airborne firing decisions. Local tools can also request this per-observation JSON on stderr by setting `MECH_TRACE=1` in the bot container.
