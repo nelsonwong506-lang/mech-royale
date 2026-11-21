@@ -327,7 +327,7 @@ public:
         action["reload"] = shouldReload;
 
         // Explicit weapon pickup / upgrade swap (protocol.md §7: must send "take": id within 4 m).
-        attachWeaponTake(obs, me, weapons, start, laserCharging, action);
+        attachWeaponTake(obs, me, weapons, start, laserCharging, exposedNow, close35, action);
 
         if (const auto offerIt = obs.find("offer"); offerIt != obs.end() && !offerIt->is_null()) {
             action["pick"] = chooseOfferPick(*offerIt);
@@ -399,7 +399,7 @@ private:
     }
 
     void attachWeaponTake(const Json& obs, const Json& me, const Json& weapons,
-                          const Vec3& start, bool laserCharging, Json& action) const {
+                          const Vec3& start, bool laserCharging, int exposedNow, int close35, Json& action) const {
         (void)me;
         const auto it = obs.find("pickups");
         if (it == obs.end() || !it->is_array() || it->empty()) {
@@ -415,9 +415,13 @@ private:
             }
         }
         int slot1Prio = 0;
+        bool slot1Ready = false;
         if (weapons.is_array() && weapons.size() >= 2 && weapons[1].is_object()) {
             slot1Prio = weaponPriority(weapons[1].value("kind", std::string{}));
+            slot1Ready = weapons[1].value("cooldown", 0.0) <= 0.15;
         }
+        // Avoid swapping away a ready secondary mid-brawl (swapping incurs a 1.0-1.65s equip cooldown).
+        const bool safeToSwap = !laserCharging && (exposedNow == 0 || !slot1Ready || close35 == 0);
 
         int bestId = -1;
         int bestPrio = 0;
@@ -442,7 +446,7 @@ private:
                 bestId = pid;
                 bestPrio = prio;
                 needDrop1 = false;
-            } else if (!laserCharging && prio > slot1Prio) {
+            } else if (safeToSwap && prio > slot1Prio) {
                 bestId = pid;
                 bestPrio = prio;
                 needDrop1 = true;
