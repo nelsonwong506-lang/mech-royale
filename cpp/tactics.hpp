@@ -6,6 +6,7 @@
 #include <functional>
 #include <limits>
 #include <optional>
+#include <unordered_map>
 #include <vector>
 
 namespace mr {
@@ -16,6 +17,9 @@ struct Threat {
     std::optional<Vec3> position;
     std::optional<int> actor_id;
     bool hostile = false;
+    bool is_npc = false;
+    bool mortar_only = false;
+    double hp = 1400.0;
     std::optional<Vec3> attack_position;
     std::optional<int> attack_id;
     std::optional<Vec3> attack_velocity;
@@ -35,18 +39,27 @@ struct Cube {
 };
 
 struct GunShot {
-    Vec2 aim;
-    bool fire;
+    Vec2 aim{};
+    std::array<bool, 2> fire{false, false};
+    bool crate = false;
+
+    bool firing() const { return fire[0] || fire[1]; }
 };
 
 class ThreatTracker {
 public:
     explicit ThreatTracker(const Json& config);
 
-    std::optional<Threat> update(const Json& obs, const Arena& arena);
-    std::optional<Threat> duel_target(const Json& obs, const Arena& arena);
-    std::optional<GunShot> visible_shot(const Json& obs, const Arena& arena) const;
+    std::optional<Threat> update(const Json& obs, const Arena& arena,
+                                 Clock::time_point deadline = Clock::time_point::max());
+    std::optional<Threat> duel_target(const Json& obs, const Arena& arena,
+                                      Clock::time_point deadline = Clock::time_point::max());
+    std::optional<GunShot> visible_shot(const Json& obs, const Arena& arena,
+                                        const std::optional<Threat>& primary_threat = std::nullopt,
+                                        Clock::time_point deadline = Clock::time_point::max(),
+                                        bool allow_crates = false) const;
     bool can_collect_cubes(const Json& obs) const;
+    std::optional<double> sound_heading(double now) const;
 
 private:
     Threat describe_enemy(const Json& actor, int id) const;
@@ -54,6 +67,7 @@ private:
     struct AttackMemory {
         double time = -std::numeric_limits<double>::infinity();
         std::optional<Vec3> position;
+        bool is_npc = false;
     };
 
     struct HealthSample {
@@ -62,11 +76,13 @@ private:
         bool in_zone = false;
     };
 
-    std::array<AttackMemory, 16> attacks_{};
-    std::array<HealthSample, 16> health_samples_{};
+    std::unordered_map<int, AttackMemory> attacks_{};
+    std::unordered_map<int, HealthSample> health_samples_{};
     std::array<std::array<std::optional<double>, 16>, 16> duel_times_{};
     std::optional<Vec3> unknown_position_;
     double unknown_until_ = -std::numeric_limits<double>::infinity();
+    std::optional<double> sound_heading_;
+    double sound_until_ = -std::numeric_limits<double>::infinity();
     double last_damage_at_ = -std::numeric_limits<double>::infinity();
     double last_hostile_damage_at_ = -std::numeric_limits<double>::infinity();
     double last_duel_at_ = -std::numeric_limits<double>::infinity();

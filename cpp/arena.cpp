@@ -216,10 +216,13 @@ Arena::Arena(const std::string& mapDir, const std::vector<std::string>& files) {
         throw std::runtime_error("Cannot read arena terrain: " + terrainPath.string());
     }
     terrain_.resize(cellCount);
+    std::int16_t maxRaw = std::numeric_limits<std::int16_t>::min();
     for (std::size_t i = 0; i < cellCount; ++i) {
         const int value = bytes[2 * i] | (bytes[2 * i + 1] << 8);
         terrain_[i] = static_cast<std::int16_t>(value < 32768 ? value : value - 65536);
+        maxRaw = std::max(maxRaw, terrain_[i]);
     }
+    maxTerrain_ = static_cast<double>(maxRaw) * terrainScale_;
 
     const auto& definitions = world.at("prisms");
     prisms_.reserve(definitions.size());
@@ -235,6 +238,9 @@ Arena::Arena(const std::string& mapDir, const std::vector<std::string>& files) {
 }
 
 double Arena::ground(double x, double y) const {
+    if (!std::isfinite(x) || !std::isfinite(y)) {
+        return 0.0;
+    }
     const double tx = std::clamp((x - terrainOrigin_[0]) / terrainStep_, 0.0, double(terrainWidth_ - 1));
     const double ty = std::clamp((y - terrainOrigin_[1]) / terrainStep_, 0.0, double(terrainHeight_ - 1));
     const int column = std::min(static_cast<int>(tx), terrainWidth_ - 2);
@@ -312,9 +318,16 @@ bool Arena::walkSegment(const Vec3& start, const Vec3& end, double radius, doubl
         const double support = surfaceAboveTerrain(x, y, z + stepUp + supportEpsilon, terrainZ);
         const double rise = support - z;
         const bool bothOnTerrain = z == previousGround && support == terrainZ;
-        if (rise > (bothOnTerrain ? maxRise : stepUp) + supportEpsilon || rise < -stepUp - supportEpsilon
-            || !prismClear(x, y, support, radius, height, stepUp)) {
+        const double maxClimb = (bothOnTerrain ? maxRise : stepUp) + supportEpsilon;
+        const bool steepDrop = rise < -(bothOnTerrain ? maxRise : stepUp) - supportEpsilon;
+        if (rise > maxClimb || !prismClear(x, y, support, radius, height, stepUp)) {
             return false;
+        }
+        if (steepDrop) {
+            // Allow stepping down off a rooftop or ledge when the drop path is unobstructed.
+            if (bothOnTerrain || rise < -24.0 || !prismClear(x, y, z, radius, height, 0.0)) {
+                return false;
+            }
         }
         z = support;
         previousGround = terrainZ;
@@ -336,22 +349,55 @@ bool Arena::flightSegment(const Vec3& start, const Vec3& end, double radius, dou
 }
 
 bool Arena::blocksPrismLine(const Vec3& start, const Vec3& end) const {
-    const int firstX = bin(std::min(start[0], end[0])), lastX = bin(std::max(start[0], end[0]));
-    const int firstY = bin(std::min(start[1], end[1])), lastY = bin(std::max(start[1], end[1]));
-    for (int x = firstX; x <= lastX; ++x) {
-        for (int y = firstY; y <= lastY; ++y) {
-            const auto cell = bins_.find(binKey(x, y));
-            if (cell == bins_.end()) {
-                continue;
-            }
-            for (auto index : cell->second) {
-                const auto& prism = prisms_[index];
-                // The first shared bin owns the check, even when a prism spans many bins.
-                if (x == std::max(firstX, prism.firstBinX) && y == std::max(firstY, prism.firstBinY)
-                    && prism.blocksLine(start, end)) {
+    int bx = bin(start[0]), by = bin(start[1]);
+    const int endBx = bin(end[0]), endBy = bin(end[1]);
+    const double dx = end[0] - start[0], dy = end[1] - start[1];
+    const int stepX = dx > 0.0 ? 1 : (dx < 0.0 ? -1 : 0);
+    const int stepY = dy > 0.0 ? 1 : (dy < 0.0 ? -1 : 0);
+    constexpr double inf = std::numeric_limits<double>::infinity();
+    const double tDeltaX = stepX != 0 ? std::abs(binSize / dx) : inf;
+    const double tDeltaY = stepY != 0 ? std::abs(binSize / dy) : inf;
+    double tMaxX = stepX != 0
+        ? (((stepX > 0 ? bx + 1 : bx) * binSize) - start[0]) / dx
+        : inf;
+    double tMaxY = stepY != 0
+        ? (((stepY > 0 ? by + 1 : by) * binSize) - start[1]) / dy
+        : inf;
+    const int maxSteps = std::abs(endBx - bx) + std::abs(endBy - by) + 2;
+
+    std::array<std::size_t, 32> checked{};
+    std::size_t checkedCount = 0;
+    for (int step = 0; step < maxSteps; ++step) {
+        const auto cell = bins_.find(binKey(bx, by));
+        if (cell != bins_.end()) {
+            for (const auto index : cell->second) {
+                bool seen = false;
+                for (std::size_t k = 0; k < checkedCount; ++k) {
+                    if (checked[k] == index) {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (seen) {
+                    continue;
+                }
+                if (checkedCount < checked.size()) {
+                    checked[checkedCount++] = index;
+                }
+                if (prisms_[index].blocksLine(start, end)) {
                     return true;
                 }
             }
+        }
+        if (bx == endBx && by == endBy) {
+            break;
+        }
+        if (tMaxX < tMaxY) {
+            bx += stepX;
+            tMaxX += tDeltaX;
+        } else {
+            by += stepY;
+            tMaxY += tDeltaY;
         }
     }
     return false;
@@ -361,8 +407,13 @@ bool Arena::blocksLine(const Vec3& start, const Vec3& end) const {
     if (blocksPrismLine(start, end)) {
         return true;
     }
+    if (start[2] > maxTerrain_ && end[2] > maxTerrain_) {
+        return false;
+    }
     const double dx = end[0] - start[0], dy = end[1] - start[1], dz = end[2] - start[2];
-    const int count = std::max(1, static_cast<int>(std::ceil(std::hypot(dx, dy) / sampleSpacing)));
+    const double horiz = std::hypot(dx, dy);
+    const double spacing = std::max(sampleSpacing, horiz / 64.0);
+    const int count = std::max(1, static_cast<int>(std::ceil(horiz / spacing)));
     for (int i = 0; i <= count; ++i) {
         const double fraction = static_cast<double>(i) / count;
         if (start[2] + dz * fraction <= ground(start[0] + dx * fraction, start[1] + dy * fraction)) {

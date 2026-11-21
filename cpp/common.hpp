@@ -36,4 +36,31 @@ inline double radians(double degrees) {
     return degrees * (std::numbers::pi / 180.0);
 }
 
+inline double finiteOr(double value, double fallback = 0.0) {
+    return std::isfinite(value) ? value : fallback;
+}
+
+inline Vec2 safeVec2(const Json& object, const char* key, Vec2 fallback = {0.0, 0.0}) {
+    if (!object.is_object()) return fallback;
+    const auto it = object.find(key);
+    if (it == object.end() || !it->is_array() || it->size() < 2
+        || !(*it)[0].is_number() || !(*it)[1].is_number()) {
+        return fallback;
+    }
+    return {finiteOr((*it)[0].get<double>(), fallback[0]),
+            finiteOr((*it)[1].get<double>(), fallback[1])};
+}
+
+inline Vec3 safeVec3(const Json& object, const char* key, Vec3 fallback = {0.0, 0.0, 0.0}) {
+    if (!object.is_object()) return fallback;
+    const auto it = object.find(key);
+    if (it == object.end() || !it->is_array() || it->size() < 3
+        || !(*it)[0].is_number() || !(*it)[1].is_number() || !(*it)[2].is_number()) {
+        return fallback;
+    }
+    return {finiteOr((*it)[0].get<double>(), fallback[0]),
+            finiteOr((*it)[1].get<double>(), fallback[1]),
+            finiteOr((*it)[2].get<double>(), fallback[2])};
+}
+
 } // namespace mr

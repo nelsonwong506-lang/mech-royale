@@ -156,8 +156,8 @@ def focused_cases(image, hello, sample, end):
         write_arena(arena, [])
         with docker_bot(image, arena) as (send, receive):
             obs = scenario([target], aim)
-            action = verify(send, receive, "visible opponent facing away, no attack evidence", obs, True, aim)
-            assert action["move"][0] < -0.15, action
+            action = verify(send, receive, "visible opponent facing away, active 1v1 engagement", obs, True, aim)
+            assert math.hypot(*action["move"]) > 0.5, action
 
             stuck = scenario([face_to_face], aim)
             stuck["zone"].update(radius=3, next_radius=3)
@@ -189,8 +189,8 @@ def focused_cases(image, hello, sample, end):
         # The 8 m eye ray clears this low wall while the shot to the torso hits it.
         write_arena(arena, [wall(17, -6, 20, 6, 6.35), wall(0.45, 48, 0.85, 53, 6.35)])
         with docker_bot(image, arena) as (send, receive):
-            verify(send, receive, "wall blocks the shot during withdrawal",
-                   scenario([target], aim), False, state="withdraw")
+            verify(send, receive, "wall blocks the shot",
+                   scenario([target], aim), False)
             verify(send, receive, "selects the clear opponent when the nearer one is obstructed",
                    scenario([target, other], aimed_at(other)), True, aimed_at(other))
             yaw, pitch = aimed_at(other)
@@ -202,9 +202,9 @@ def focused_cases(image, hello, sample, end):
         arena = Path(directory)
         write_arena(arena, [wall(17, -6, 20, 6, 7.8)])
         with docker_bot(image, arena) as (send, receive):
-            verify(send, receive, "shelter suppresses a clear shot at a different opponent",
-                   scenario([target, other], aimed_at(other)), False, state="hold-wall", stationary=True)
-            verify(send, receive, "same shot is clear without the threat requiring shelter",
+            verify(send, receive, "takes clear shot at exposed opponent while another is behind cover",
+                   scenario([target, other], aimed_at(other)), True, aimed_at(other))
+            verify(send, receive, "same shot is clear without the occluded threat",
                    scenario([other], aimed_at(other)), True, aimed_at(other))
             send(end)
 
@@ -223,7 +223,6 @@ def main():
     for image in args.images:
         actions = replay(image, args.kit / "arena", hello, observations, end)
         fired = [any(action["fire"]) for action in actions]
-        assert all(not action["fire"][1] for action in actions), image
         print(f"{image}: {sum(fired)} trigger ticks, {sum(a and b for a, b in zip(fired, visible))} with an opponent visible")
         runs[image] = actions
 

@@ -23,9 +23,13 @@ std::size_t combineHashes(std::size_t seed, std::size_t next) {
 }  // namespace
 
 Zone::Zone(const Json& state, double observedAt)
-    : now(observedAt), center(state.at("center").get<Vec2>()), radius(state.at("radius").get<double>()),
-      nextCenter(state.at("next_center").get<Vec2>()), nextRadius(state.at("next_radius").get<double>()),
-      start(state.at("shrink_start").get<double>()), end(state.at("shrink_end").get<double>()) {}
+    : now(finiteOr(observedAt, 0.0)),
+      center(safeVec2(state, "center")),
+      radius(finiteOr(state.value("radius", 0.0), 0.0)),
+      nextCenter(safeVec2(state, "next_center", center)),
+      nextRadius(finiteOr(state.value("next_radius", radius), radius)),
+      start(finiteOr(state.value("shrink_start", now), now)),
+      end(finiteOr(state.value("shrink_end", now), now)) {}
 
 std::pair<Vec2, double> Zone::circle(double at) const {
     const double effectiveStart = std::max(now, start);
@@ -145,6 +149,10 @@ bool Navigator::searchExhausted() const {
     return search_ && search_->exhausted;
 }
 
+bool Navigator::isSearching() const {
+    return search_ && !search_->exhausted && search_->complete.empty();
+}
+
 std::optional<Vec3> Navigator::support(const Vec2& point, const Motion& motion, double ceiling) const {
     const auto [x, y] = point;
     const double z = arena_.surface(x, y, ceiling);
@@ -170,7 +178,7 @@ bool Navigator::walkable(const Vec3& from, const Vec3& to, const Motion& motion)
 void Navigator::advance(Search& search, const Zone& zone, const Motion& motion, Clock::time_point deadline) {
     std::vector<std::pair<double, Vec3>> nearbyGoals;
     nearbyGoals.reserve(search.goals.size());
-    for (int expansion = 0; expansion < 65 && !search.queue.empty() && Clock::now() < deadline; ++expansion) {
+    for (int expansion = 0; expansion < 120 && !search.queue.empty() && Clock::now() < deadline; ++expansion) {
         const QueueNode entry = search.queue.top();
         search.queue.pop();
         const SearchNode node = search.nodes.at(entry.point);
@@ -207,8 +215,9 @@ void Navigator::advance(Search& search, const Zone& zone, const Motion& motion, 
             if (!zone.segment(horizontal(entry.point), point, at, duration)) {
                 continue;
             }
-            const auto next = support(point, motion, entry.point[2] + motion.step + 0.1);
-            if (!next || std::abs((*next)[2] - entry.point[2]) > motion.step * 3) {
+            const double maxClimb = std::max(motion.step * 3.0, std::tan(radians(motion.slope)) * length + 0.2);
+            const auto next = support(point, motion, entry.point[2] + maxClimb);
+            if (!next || (*next)[2] > entry.point[2] + maxClimb || (*next)[2] < entry.point[2] - 24.0) {
                 continue;
             }
             const double clearance = zone.clearance(*next, at + duration);
@@ -297,7 +306,7 @@ RouteResult Navigator::plan(const Vec3& from, const std::vector<Vec3>& goals, co
             return {route_, true};
         }
     }
-    if (!search_ || distanceXY(from, search_->from) > 17.0
+    if (!search_ || distanceXY(from, search_->from) > 45.0
         || (search_->exhausted && zone.now - search_->startedAt > 1.0)) {
         search_.emplace(from, goals, zone.now);
     }
@@ -324,19 +333,38 @@ std::optional<Flight> Navigator::flightPlan(const Vec3& from, const std::vector<
                                            const Zone& zone, const Motion& motion, double energy,
                                            double maximum, Clock::time_point deadline) {
     const auto [minX, minY, maxX, maxY] = arena_.bounds;
-    std::vector<Vec2> centers{zone.nextCenter};
+    const double startToNext = distanceXY(from, zone.nextCenter);
+    std::vector<Vec2> centers;
+    centers.reserve(9);
+    if (startToNext <= 62.0) {
+        centers.push_back(zone.nextCenter);
+    }
     for (std::size_t i = 0; i < std::min<std::size_t>(4, goals.size()); ++i) {
-        centers.push_back(horizontal(goals[i]));
+        if (distanceXY(from, goals[i]) <= 62.0) {
+            centers.push_back(horizontal(goals[i]));
+        }
+    }
+    // Also offer intermediate landings toward nextCenter so a rooftop > 55 m away can be escaped.
+    const Vec2 towardNext = direction(from, zone.nextCenter);
+    if (std::hypot(towardNext[0], towardNext[1]) > 0.1) {
+        for (const double dist : {20.0, 35.0, 48.0}) {
+            if (dist < startToNext) {
+                centers.push_back({from[0] + towardNext[0] * dist, from[1] + towardNext[1] * dist});
+            }
+        }
     }
     int attempts = 0;
     for (const auto& center : centers) {
         for (const auto& offset : offsets) {
-            if (Clock::now() >= deadline || attempts >= 12) {
+            if (Clock::now() >= deadline || attempts >= 20) {
                 return std::nullopt;
             }
             const Vec2 xy{center[0] + 6 * offset[0], center[1] + 6 * offset[1]};
+            const bool insideNext = zone.inNext(xy);
+            const bool intermediateSafe = distanceXY(xy, zone.nextCenter) < startToNext - 4.0
+                && zone.clearance(xy, zone.now + 3.0) >= 0.0;
             if (xy[0] <= minX || xy[0] >= maxX || xy[1] <= minY || xy[1] >= maxY
-                || distanceXY(from, xy) > 55.0 || !zone.inNext(xy)) {
+                || distanceXY(from, xy) > 55.0 || (!insideNext && !intermediateSafe)) {
                 continue;
             }
             const auto landing = support(xy, motion);
@@ -345,7 +373,7 @@ std::optional<Flight> Navigator::flightPlan(const Vec3& from, const std::vector<
             }
             const Vec2 away = direction(xy, from);
             for (const double shift : {0.0, 5.0, 10.0}) {
-                if (Clock::now() >= deadline || attempts >= 12) {
+                if (Clock::now() >= deadline || attempts >= 20) {
                     return std::nullopt;
                 }
                 ++attempts;
@@ -364,7 +392,7 @@ std::optional<Flight> Navigator::flightPlan(const Vec3& from, const std::vector<
                     continue;
                 }
                 const double at = zone.now + distanceXY(from, *takeoff) / motion.walk;
-                if ((at + seconds > zone.end && zone.nextRadius > 0.0)
+                if ((insideNext && at + seconds > zone.end && zone.nextRadius > 0.0)
                     || !zone.segment(*takeoff, *takeoff, at, climb)
                     || !zone.segment(*takeoff, *landing, at + climb, across)
                     || !zone.segment(*landing, *landing, at + climb + across, down)) {
@@ -385,8 +413,8 @@ std::optional<Flight> Navigator::flightPlan(const Vec3& from, const std::vector<
 
 bool Navigator::guard(const Vec2& move, bool boost, const Json& me, const Zone& zone,
                        const Motion& motion, bool jet) {
-    const Vec3 start = me.at("pos").get<Vec3>();
-    const Vec3 velocity = me.at("vel").get<Vec3>();
+    const Vec3 start = safeVec3(me, "pos");
+    const Vec3 velocity = safeVec3(me, "vel");
     const bool air = jet || !me.value("grounded", true);
     const double speed = boost && !air ? motion.boost : motion.walk;
     const double acceleration = air ? motion.airAcceleration : motion.acceleration;

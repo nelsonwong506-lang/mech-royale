@@ -77,6 +77,7 @@ public:
 
     void reset();
     bool searchExhausted() const;
+    bool isSearching() const;
     std::optional<Vec3> support(const Vec2& point, const Motion& motion,
                                 double ceiling = std::numeric_limits<double>::infinity()) const;
     bool walkable(const Vec3& from, const Vec3& to, const Motion& motion);

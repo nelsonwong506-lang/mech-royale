@@ -1,8 +1,8 @@
 # Mech Royale
 
-Survival-first bot for the Builders Buildathon. It starts rotating early when the route is clear. While threatened, it chooses an escape in the current safe zone until the shrinking boundary makes rotation urgent. It scans while travelling and returns fire while withdrawing when an enemy aims at it with a clear shot. It uses solid structures for cover and reserves short single-shot peeks for safe situations.
+Placement-focused C++20 bot for the Builders Buildathon. It rotates early into the next safe zone when clear, actively kites and finishes favorable 1v1 engagements (prioritizing low-HP targets and using equipped secondary weapons such as lightning, laser, and mortar), and switches to soft-scored evasion, cover, or lateral dodging when outnumbered or targeted by a charging laser.
 
-An exposed enemy laser charge triggers lateral evasion. Short defensive jumps are checked against the ceiling, terrain, landing space, and moving zone. The bot can also fire on a participant in a confirmed fight between other mechs while keeping its current survival movement.
+It pre-aims known threats even behind cover, breaks crates and collects safe pickups/cubes opportunistically, handles rooftop drop-offs and wide-building A* routing without thrashing, and uses 2D grid-DDA raycasting with strict per-tick time budgets to stay well under the 50 ms response limit.
 
 Build the competition image from the repository root:
 

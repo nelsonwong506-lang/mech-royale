@@ -11,12 +11,13 @@ namespace mr {
 namespace {
 
 constexpr double RetaliationSeconds = 3.0;
-constexpr double CubeDamageQuietSeconds = 5.0;
-constexpr double FreshHostileDamageSeconds = 0.3;
-constexpr double ProjectileLookahead = 0.4;
-constexpr double CubeDetourMeters = 20.0;
+constexpr double CubeDamageQuietSeconds = 4.0;
+constexpr double FreshHostileDamageSeconds = 0.35;
+constexpr double ProjectileLookahead = 0.45;
+constexpr double CubeDetourMeters = 22.0;
 constexpr double DuelEvidenceSeconds = 0.25;
 constexpr double DuelMemorySeconds = 1.2;
+constexpr double SoundMemorySeconds = 1.8;
 constexpr double Tau = 6.283185307179586;
 constexpr std::array<std::string_view, 4> WeaponKinds{"gun", "mortar", "laser", "lightning"};
 constexpr std::size_t MortarIndex = 1;
@@ -24,13 +25,16 @@ constexpr std::size_t LaserIndex = 2;
 
 const Json& field(const Json& value, const char* key) {
     static const Json missing;
+    if (!value.is_object()) {
+        return missing;
+    }
     const auto item = value.find(key);
     return item == value.end() ? missing : *item;
 }
 
 double number(const Json& value, const char* key, double fallback) {
     const auto& item = field(value, key);
-    return item.is_number() ? item.get<double>() : fallback;
+    return item.is_number() ? finiteOr(item.get<double>(), fallback) : fallback;
 }
 
 std::string_view text(const Json& value) {
@@ -38,12 +42,38 @@ std::string_view text(const Json& value) {
     return string ? std::string_view(*string) : std::string_view{};
 }
 
-Vec3 point(const Json& value) {
-    return {value.at(0).get<double>(), value.at(1).get<double>(), value.at(2).get<double>()};
+std::optional<Vec3> try_point(const Json& value) {
+    if (!value.is_array() || value.size() < 3
+        || !value[0].is_number() || !value[1].is_number() || !value[2].is_number()) {
+        return std::nullopt;
+    }
+    const Vec3 p{value[0].get<double>(), value[1].get<double>(), value[2].get<double>()};
+    if (!std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2])) {
+        return std::nullopt;
+    }
+    return p;
 }
 
-Vec2 pair(const Json& value) {
-    return {value.at(0).get<double>(), value.at(1).get<double>()};
+std::optional<Vec2> try_pair(const Json& value) {
+    if (!value.is_array() || value.size() < 2
+        || !value[0].is_number() || !value[1].is_number()) {
+        return std::nullopt;
+    }
+    const Vec2 p{value[0].get<double>(), value[1].get<double>()};
+    if (!std::isfinite(p[0]) || !std::isfinite(p[1])) {
+        return std::nullopt;
+    }
+    return p;
+}
+
+Vec3 point_or(const Json& object, const char* key, Vec3 fallback = {}) {
+    const auto p = try_point(field(object, key));
+    return p.value_or(fallback);
+}
+
+Vec2 pair_or(const Json& object, const char* key, Vec2 fallback = {}) {
+    const auto p = try_pair(field(object, key));
+    return p.value_or(fallback);
 }
 
 Vec3 above(Vec3 position, double height) {
@@ -56,8 +86,10 @@ double distance_3d(const Vec3& first, const Vec3& second) {
 }
 
 Vec2 angles(const Vec3& origin, const Vec3& target) {
-    return {std::atan2(target[1] - origin[1], target[0] - origin[0]),
-            std::atan2(target[2] - origin[2], distanceXY(origin, target))};
+    const double horiz = distanceXY(origin, target);
+    const double yaw = horiz > 1e-9 ? std::atan2(target[1] - origin[1], target[0] - origin[0]) : 0.0;
+    const double pitch = std::clamp(std::atan2(target[2] - origin[2], std::max(horiz, 1e-6)), -1.48, 1.48);
+    return {finiteOr(yaw), finiteOr(pitch)};
 }
 
 double match_time(const Json& obs) {
@@ -66,7 +98,7 @@ double match_time(const Json& obs) {
 
 std::optional<int> actor_id(const Json& object, const char* key) {
     const double id = number(object, key, -1.0);
-    if (id >= 0 && id < 16 && std::trunc(id) == id) {
+    if (id >= 0 && id <= 1000000 && std::trunc(id) == id) {
         return static_cast<int>(id);
     }
     return std::nullopt;
@@ -112,18 +144,22 @@ std::optional<double> collision_time(const Vec3& position, const Vec3& velocity,
 bool could_have_fired(const Json& opponent, const Projectile& projectile, double size_per_cube,
                        double mech_radius, double muzzle_height, double turn_rate,
                        double pitch_rate, const Arena& arena) {
-    const auto& aim = field(opponent, "aim");
+    const auto aim_opt = try_pair(field(opponent, "aim"));
     const auto& weapons = field(opponent, "weapons");
     const std::string_view kind = projectile.mortar ? "mortar" : "gun";
-    if (aim.is_null() || std::none_of(weapons.begin(), weapons.end(), [kind](const auto& weapon) {
+    if (!aim_opt || !weapons.is_array() || std::none_of(weapons.begin(), weapons.end(), [kind](const auto& weapon) {
             return text(weapon) == kind;
         })) {
         return false;
     }
+    const auto opp_pos = try_point(field(opponent, "pos"));
+    if (!opp_pos) {
+        return false;
+    }
     const auto [px, py, pz] = projectile.position;
     const auto [vx, vy, vz] = projectile.velocity;
-    const auto [ax, ay, az] = point(opponent.at("pos"));
-    const auto [avx, avy, avz] = point(opponent.at("vel"));
+    const auto [ax, ay, az] = *opp_pos;
+    const auto [avx, avy, avz] = point_or(opponent, "vel");
     const double dx = px - ax;
     const double dy = py - ay;
     const double rvx = vx - avx;
@@ -143,7 +179,7 @@ bool could_have_fired(const Json& opponent, const Projectile& projectile, double
         return false;
     }
 
-    const auto [yaw, pitch] = pair(aim);
+    const auto [yaw, pitch] = *aim_opt;
     const double launch_yaw = std::atan2(vy, vx);
     const double launch_pitch = std::atan2(vz + projectile.gravity * age, std::hypot(vx, vy));
     if (std::abs(std::remainder(launch_yaw - yaw, Tau)) > std::min(0.8, 0.15 + turn_rate * age) ||
@@ -156,7 +192,11 @@ bool could_have_fired(const Json& opponent, const Projectile& projectile, double
 
 const Json& gun(const Json& me) {
     static const Json unarmed;
-    for (const auto& weapon : field(me, "weapons")) {
+    const auto& weapons = field(me, "weapons");
+    if (!weapons.is_array()) {
+        return unarmed;
+    }
+    for (const auto& weapon : weapons) {
         if (text(field(weapon, "kind")) == "gun") {
             return weapon;
         }
@@ -165,7 +205,7 @@ const Json& gun(const Json& me) {
 }
 
 Vec3 muzzle(const Json& me) {
-    return above(point(me.at("pos")), number(field(me, "stats"), "muzzle_height", 7.0));
+    return above(point_or(me, "pos"), number(field(me, "stats"), "muzzle_height", 7.0));
 }
 
 struct Shot {
@@ -174,9 +214,17 @@ struct Shot {
     Vec3 intercept;
 };
 
-Shot shot_points(const Json& me, const Threat& threat, const Json& weapon_stats) {
-    const Vec3 origin = muzzle(me);
+Shot shot_points(const Json& me, const Threat& threat, const Json& weapon_stats, bool hitscan = false) {
+    const Vec3 self_vel = point_or(me, "vel");
+    const Vec3 base_origin = muzzle(me);
+    // Lead origin slightly by half a tick (50 ms) to reduce strafe-induced aim lag.
+    const Vec3 origin{base_origin[0] + self_vel[0] * 0.05,
+                      base_origin[1] + self_vel[1] * 0.05,
+                      base_origin[2]};
     const Vec3 target = above(*threat.attack_position, threat.attack_height / 2);
+    if (hitscan) {
+        return {base_origin, target, target};
+    }
     const double speed = std::max(1.0, number(weapon_stats, "speed", 252.0));
     const Vec3 velocity = threat.attack_velocity.value_or(Vec3{});
     Vec3 intercept = target;
@@ -186,14 +234,13 @@ Shot shot_points(const Json& me, const Threat& threat, const Json& weapon_stats)
             intercept[axis] = target[axis] + velocity[axis] * flight_time;
         }
     }
-    return {origin, target, intercept};
+    return {base_origin, target, intercept};
 }
 
-bool segment_hits_mech(const Vec3& start, const Vec3& end, const Threat& mech) {
-    constexpr double contact_slack = 0.15;
-    const Vec3& feet = *mech.position;
-    const double bottom = feet[2] - contact_slack;
-    const double top = feet[2] + mech.attack_height + contact_slack;
+bool segment_near_cylinder(const Vec3& start, const Vec3& end, const Vec3& feet,
+                           double radius, double height, double slack) {
+    const double bottom = feet[2] - slack;
+    const double top = feet[2] + height + slack;
     const double delta_z = end[2] - start[2];
     double begin = 0;
     double finish = 1;
@@ -215,14 +262,117 @@ bool segment_hits_mech(const Vec3& start, const Vec3& end, const Threat& mech) {
     const double nearest = std::clamp(projection, begin, finish);
     const double gap_x = start[0] + dx * nearest - feet[0];
     const double gap_y = start[1] + dy * nearest - feet[1];
-    const double radius = mech.attack_radius + contact_slack;
-    return gap_x * gap_x + gap_y * gap_y <= radius * radius;
+    const double total_radius = radius + slack;
+    return gap_x * gap_x + gap_y * gap_y <= total_radius * total_radius;
+}
+
+bool segment_hits_mech(const Vec3& start, const Vec3& end, const Threat& mech) {
+    return mech.position && segment_near_cylinder(start, end, *mech.position, mech.attack_radius, mech.attack_height, 0.15);
 }
 
 double mortar_range(const Json& mortar) {
     const double speed = number(mortar, "speed", 72.0);
     const double gravity = std::max(1.0, number(mortar, "gravity", 22.0));
     return number(mortar, "range", speed * speed / gravity);
+}
+
+std::optional<Vec2> mortar_solution(const Vec3& origin, const Vec3& target, double speed,
+                                    double gravity, const Arena& arena) {
+    const double horiz = distanceXY(origin, target);
+    if (horiz < 6.0 || speed <= 1.0 || gravity <= 0.1) {
+        return std::nullopt;
+    }
+    const double dz = target[2] - origin[2];
+    const double v2 = speed * speed;
+    const double disc = v2 * v2 - gravity * (gravity * horiz * horiz + 2.0 * dz * v2);
+    if (disc < 0.0) {
+        return std::nullopt;
+    }
+    const double root = std::sqrt(disc);
+    const double yaw = std::atan2(target[1] - origin[1], target[0] - origin[0]);
+    const double ux = std::cos(yaw), uy = std::sin(yaw);
+    // Try low arc first (shorter flight time), then high arc to lob over walls/buildings.
+    for (const double sign : {-1.0, 1.0}) {
+        const double pitch = std::atan((v2 + sign * root) / (gravity * horiz));
+        if (pitch < -1.2 || pitch > 1.50) {
+            continue;
+        }
+        const double cos_p = std::cos(pitch);
+        const double sin_p = std::sin(pitch);
+        if (cos_p <= 1e-3) {
+            continue;
+        }
+        const double flight_time = horiz / (speed * cos_p);
+        Vec3 prev = origin;
+        bool blocked = false;
+        constexpr int samples = 8;
+        for (int i = 1; i <= samples; ++i) {
+            const double t = flight_time * (0.94 * i / samples);
+            const Vec3 next{origin[0] + speed * cos_p * ux * t,
+                            origin[1] + speed * cos_p * uy * t,
+                            origin[2] + speed * sin_p * t - 0.5 * gravity * t * t};
+            if (arena.blocksPrismLine(prev, next)) {
+                blocked = true;
+                break;
+            }
+            prev = next;
+        }
+        if (!blocked) {
+            return Vec2{finiteOr(yaw), finiteOr(pitch)};
+        }
+    }
+    return std::nullopt;
+}
+
+bool weapon_ready(const Json& weapon) {
+    return weapon.is_object() && number(weapon, "cooldown", 0.0) <= 0.1 &&
+           number(weapon, "reload", 0.0) <= 0.0 && number(weapon, "ammo", 1.0) > 0.0;
+}
+
+bool aim_aligned(const Vec2& desired, const Vec2& actual, double distance, double radius, double extra_slack = 0.025) {
+    const auto [yaw, pitch] = desired;
+    const auto [actual_yaw, actual_pitch] = actual;
+    const double yaw_error = std::remainder(yaw - actual_yaw, Tau) * std::cos(pitch);
+    const double pitch_error = pitch - actual_pitch;
+    const double tolerance = std::min(0.18, std::atan2(radius, std::max(distance, 1.0)) + extra_slack);
+    return yaw_error * yaw_error + pitch_error * pitch_error <= tolerance * tolerance;
+}
+
+bool clear_aim_line(const Vec3& origin, const Vec2& actual, double distance, const Arena& arena) {
+    const auto [actual_yaw, actual_pitch] = actual;
+    const double horizontal = distance * std::cos(actual_pitch);
+    const Vec3 actual_end{origin[0] + horizontal * std::cos(actual_yaw),
+                          origin[1] + horizontal * std::sin(actual_yaw),
+                          origin[2] + distance * std::sin(actual_pitch)};
+    return !arena.blocksLine(origin, actual_end);
+}
+
+std::optional<Vec3> clear_aim_point(const Shot& shot, const Arena& arena) {
+    if (!arena.blocksLine(shot.origin, shot.target)) {
+        if (!arena.blocksLine(shot.origin, shot.intercept)) {
+            return shot.intercept;
+        }
+        return shot.target;
+    }
+    return std::nullopt;
+}
+
+bool ready_aligned_shot(const Json& me, const Threat& target, const Arena& arena) {
+    const auto& weapon = gun(me);
+    if (!weapon_ready(weapon) || !target.attack_position) {
+        return false;
+    }
+    const auto& weapon_stats = field(weapon, "stats");
+    const Shot shot = shot_points(me, target, weapon_stats);
+    const auto aim_point = clear_aim_point(shot, arena);
+    if (!aim_point) {
+        return false;
+    }
+    const double distance = distance_3d(shot.origin, *aim_point);
+    const auto actual = pair_or(me, "aim");
+    return distance <= number(weapon_stats, "range", 230.0) &&
+           aim_aligned(angles(shot.origin, *aim_point), actual, distance, target.attack_radius) &&
+           clear_aim_line(shot.origin, actual, distance, arena);
 }
 
 }  // namespace
@@ -243,13 +393,14 @@ ThreatTracker::ThreatTracker(const Json& config)
 Threat ThreatTracker::describe_enemy(const Json& actor, int id) const {
     const double scale = 1 + size_per_cube_ * number(actor, "cubes", 0.0);
     Threat threat;
-    threat.position = point(actor.at("pos"));
+    threat.position = point_or(actor, "pos");
     threat.actor_id = id;
+    threat.is_npc = text(field(actor, "kind")) == "npc";
+    threat.hp = number(actor, "hp", 1400.0);
     threat.attack_radius = mech_radius_ * scale;
     threat.attack_height = mech_height_ * scale;
-    const auto& aim = field(actor, "aim");
-    if (aim.is_array() && aim.size() >= 2) {
-        threat.enemy_aim = pair(aim);
+    if (const auto aim = try_pair(field(actor, "aim"))) {
+        threat.enemy_aim = *aim;
     }
 
     const auto& weapons = field(actor, "weapons");
@@ -260,6 +411,7 @@ Threat ThreatTracker::describe_enemy(const Json& actor, int id) const {
         return threat;
     }
     bool has_straight_weapon = false;
+    bool has_mortar = false;
     for (const auto& weapon : weapons) {
         const auto kind = std::find(WeaponKinds.begin(), WeaponKinds.end(), text(weapon));
         if (kind == WeaponKinds.end()) {
@@ -268,9 +420,11 @@ Threat ThreatTracker::describe_enemy(const Json& actor, int id) const {
         const auto index = static_cast<std::size_t>(kind - WeaponKinds.begin());
         threat.enemy_range = std::max(threat.enemy_range, weapon_ranges_[index]);
         has_straight_weapon = has_straight_weapon || index != MortarIndex;
+        has_mortar = has_mortar || index == MortarIndex;
     }
     if (threat.enemy_range > 0 && !has_straight_weapon) {
         threat.enemy_muzzle_height = (mech_height_ + 0.5) * scale;
+        threat.mortar_only = has_mortar;
     }
     return threat;
 }
@@ -291,6 +445,10 @@ bool enemy_aims_at(const Threat& threat, const Vec3& feet, double radius, double
     if (horizontal_distance > radius && std::abs(std::remainder(yaw - enemy_yaw, Tau)) > yaw_tolerance) {
         return false;
     }
+    // Mortar-only opponents aim upward on a ballistic arc rather than straight at our torso.
+    if (threat.mortar_only) {
+        return enemy_pitch > radians(5) && enemy_pitch < radians(82);
+    }
     // Check the height hit by the aim first. Sampling the chassis lets a partially
     // exposed target count only when its exposed part is also inside the aim cone.
     const double aimed_height = std::clamp(source[2] - feet[2] + horizontal_distance * std::tan(enemy_pitch),
@@ -310,61 +468,168 @@ bool ThreatTracker::can_collect_cubes(const Json& obs) const {
     return match_time(obs) - last_damage_at_ >= CubeDamageQuietSeconds;
 }
 
-std::optional<Threat> ThreatTracker::update(const Json& obs, const Arena& arena) {
-    const auto& me = obs.at("self");
+std::optional<double> ThreatTracker::sound_heading(double now) const {
+    if (sound_heading_ && now <= sound_until_) {
+        return sound_heading_;
+    }
+    return std::nullopt;
+}
+
+std::optional<Threat> ThreatTracker::update(const Json& obs, const Arena& arena, Clock::time_point deadline) {
+    const auto& me = field(obs, "self");
     const auto self_id = actor_id(me, "id");
-    const Vec3 position = point(me.at("pos"));
+    const Vec3 position = point_or(me, "pos");
     const auto& self_stats = field(me, "stats");
     const double now = match_time(obs);
-    std::array<const Json*, 16> enemies{};
-    for (const auto& actor : field(obs, "mechs")) {
-        if (text(field(actor, "kind")) == "mech") {
+    const double radius = number(self_stats, "radius", mech_radius_);
+    const double height = number(self_stats, "height", mech_height_);
+
+    std::unordered_map<int, const Json*> enemies;
+    std::unordered_map<int, const Json*> npcs;
+    const auto& mechs = field(obs, "mechs");
+    if (mechs.is_array()) {
+        for (const auto& actor : mechs) {
             const auto id = actor_id(actor, "id");
-            if (id && id != self_id) {
+            if (!id || id == self_id || !try_point(field(actor, "pos"))) {
+                continue;
+            }
+            const auto kind = text(field(actor, "kind"));
+            if (kind == "mech") {
                 enemies[*id] = &actor;
+            } else if (kind == "npc") {
+                npcs[*id] = &actor;
             }
         }
     }
-    for (auto& attack : attacks_) {
-        if (now - attack.time >= RetaliationSeconds) {
-            attack = {};
+
+    for (auto it = attacks_.begin(); it != attacks_.end();) {
+        if (now - it->second.time >= RetaliationSeconds) {
+            it = attacks_.erase(it);
+        } else {
+            ++it;
         }
     }
-    for (const auto& event : field(obs, "events")) {
-        if (text(field(event, "type")) != "damaged") {
-            continue;
+
+    const auto& events = field(obs, "events");
+    if (events.is_array()) {
+        for (const auto& event : events) {
+            if (text(field(event, "type")) != "damaged") {
+                continue;
+            }
+            last_damage_at_ = now;
+            const auto weapon = text(field(event, "weapon"));
+            if (weapon == "zone") {
+                continue;
+            }
+            const auto id = actor_id(event, "by");
+            if (id && id == self_id) {
+                continue;
+            }
+            last_hostile_damage_at_ = now;
+            const auto& bearing = field(event, "bearing");
+            const bool is_npc = weapon == "npc" || (id && npcs.count(*id) > 0);
+            if (id) {
+                auto& mem = attacks_[*id];
+                mem.time = now;
+                mem.is_npc = is_npc;
+                if (const auto it = enemies.find(*id); it != enemies.end()) {
+                    mem.position = point_or(*it->second, "pos");
+                } else if (const auto it = npcs.find(*id); it != npcs.end()) {
+                    mem.position = point_or(*it->second, "pos");
+                } else if (bearing.is_number()) {
+                    const double angle = finiteOr(bearing.get<double>());
+                    mem.position = Vec3{position[0] + 40 * std::cos(angle),
+                                        position[1] + 40 * std::sin(angle), position[2]};
+                }
+            } else if (bearing.is_number()) {
+                const double angle = finiteOr(bearing.get<double>());
+                unknown_position_ = Vec3{position[0] + 40 * std::cos(angle),
+                                         position[1] + 40 * std::sin(angle), position[2]};
+                unknown_until_ = now + 2.0;
+            }
         }
-        last_damage_at_ = now;
-        const auto id = actor_id(event, "by");
-        const auto weapon = text(field(event, "weapon"));
-        if (!id || id == self_id || weapon == "zone" || weapon == "npc") {
-            continue;
+    }
+
+    // Track hostile beams grazing or hitting near us even if they missed.
+    const auto& beams = field(obs, "beams");
+    if (beams.is_array()) {
+        for (const auto& beam : beams) {
+            if (Clock::now() >= deadline) {
+                break;
+            }
+            const auto shooter = actor_id(beam, "by");
+            if (shooter && shooter == self_id) {
+                continue;
+            }
+            const auto& path = field(beam, "path");
+            if (!path.is_array() || path.size() < 2) {
+                continue;
+            }
+            bool near_us = false;
+            for (std::size_t i = 1; i < path.size(); ++i) {
+                const auto a = try_point(path[i - 1]);
+                const auto b = try_point(path[i]);
+                if (a && b && segment_near_cylinder(*a, *b, position, radius, height, 4.0)) {
+                    near_us = true;
+                    break;
+                }
+            }
+            if (near_us) {
+                if (shooter) {
+                    auto& mem = attacks_[*shooter];
+                    mem.time = now;
+                    mem.is_npc = npcs.count(*shooter) > 0;
+                    if (const auto a = try_point(path[0])) {
+                        mem.position = *a;
+                    }
+                } else if (const auto a = try_point(path[0])) {
+                    unknown_position_ = *a;
+                    unknown_until_ = now + 1.5;
+                }
+            }
         }
-        last_hostile_damage_at_ = now;
-        attacks_[*id].time = now;
-        const auto& bearing = field(event, "bearing");
-        if (!enemies[*id] && bearing.is_number()) {
-            const double angle = bearing.get<double>();
-            attacks_[*id].position = Vec3{position[0] + 40 * std::cos(angle),
-                                          position[1] + 40 * std::sin(angle), position[2]};
+    }
+
+    // Remember loud nearby sounds to orient scanning when no visual threat exists.
+    const auto& sounds = field(obs, "sounds");
+    if (sounds.is_array()) {
+        double closest_sound = std::numeric_limits<double>::infinity();
+        for (const auto& sound : sounds) {
+            if (const auto p = try_point(field(sound, "pos"))) {
+                const double dist = distanceXY(position, *p);
+                if (dist > 3.0 && dist < closest_sound) {
+                    closest_sound = dist;
+                    sound_heading_ = std::atan2((*p)[1] - position[1], (*p)[0] - position[0]);
+                    sound_until_ = now + SoundMemorySeconds;
+                }
+            } else if (const auto& b = field(sound, "bearing"); b.is_number()) {
+                sound_heading_ = finiteOr(b.get<double>());
+                sound_until_ = now + SoundMemorySeconds;
+            }
         }
     }
 
     const auto& projectiles = field(obs, "projectiles");
-    if (!projectiles.empty()) {
-        const Vec3 velocity = point(me.at("vel"));
-        const double radius = number(self_stats, "radius", 2.5) + 0.5;
-        const double height = number(self_stats, "height", 9.0);
+    if (projectiles.is_array() && !projectiles.empty()) {
+        const Vec3 velocity = point_or(me, "vel");
+        const double hit_radius = radius + 0.5;
         double soonest = std::numeric_limits<double>::infinity();
         std::optional<Projectile> imminent;
         for (const auto& object : projectiles) {
+            if (Clock::now() >= deadline) {
+                break;
+            }
             const auto kind = text(field(object, "kind"));
             if (kind != "gun" && kind != "mortar") {
                 continue;
             }
-            const Projectile projectile{point(object.at("pos")), point(object.at("vel")),
-                                        kind == "mortar", kind == "mortar" ? mortar_gravity_ : 0.0};
-            const auto time = collision_time(position, velocity, radius, height, projectile, soonest, arena);
+            const auto pos = try_point(field(object, "pos"));
+            const auto vel = try_point(field(object, "vel"));
+            if (!pos || !vel) {
+                continue;
+            }
+            const Projectile projectile{*pos, *vel, kind == "mortar", kind == "mortar" ? mortar_gravity_ : 0.0};
+            const auto time = collision_time(position, velocity, hit_radius, height, projectile, soonest, arena);
             if (time) {
                 soonest = *time;
                 imminent = projectile;
@@ -372,13 +637,15 @@ std::optional<Threat> ThreatTracker::update(const Json& obs, const Arena& arena)
         }
         if (imminent) {
             std::optional<int> shooter;
-            for (int id = 0; id < static_cast<int>(enemies.size()); ++id) {
-                if (!enemies[id] || !could_have_fired(*enemies[id], *imminent, size_per_cube_, mech_radius_,
-                                                       imminent->mortar ? mech_height_ + 0.5 : muzzle_height_,
-                                                       turn_rate_, pitch_rate_, arena)) {
+            for (const auto& [id, actor] : enemies) {
+                if (Clock::now() >= deadline) {
+                    break;
+                }
+                if (!could_have_fired(*actor, *imminent, size_per_cube_, mech_radius_,
+                                      imminent->mortar ? mech_height_ + 0.5 : muzzle_height_,
+                                      turn_rate_, pitch_rate_, arena)) {
                     continue;
                 }
-                // Ownerless projectiles only justify return fire under a unique match.
                 if (shooter) {
                     shooter.reset();
                     break;
@@ -387,6 +654,7 @@ std::optional<Threat> ThreatTracker::update(const Json& obs, const Arena& arena)
             }
             if (shooter) {
                 attacks_[*shooter].time = now;
+                attacks_[*shooter].is_npc = false;
             } else {
                 const auto [x, y, z] = imminent->position;
                 const double vx = imminent->velocity[0];
@@ -398,18 +666,33 @@ std::optional<Threat> ThreatTracker::update(const Json& obs, const Arena& arena)
         }
     }
 
-    int attacker = -1;
-    for (int id = 0; id < static_cast<int>(attacks_.size()); ++id) {
-        auto& attack = attacks_[id];
+    int attacker_id = -1;
+    double attacker_dist = std::numeric_limits<double>::infinity();
+    bool attacker_visible = false;
+    double attacker_time = -std::numeric_limits<double>::infinity();
+    for (auto& [id, attack] : attacks_) {
         if (now - attack.time >= RetaliationSeconds) {
             continue;
         }
-        if (enemies[id]) {
-            attack.position = point(enemies[id]->at("pos"));
+        const Json* actor = nullptr;
+        if (const auto it = enemies.find(id); it != enemies.end()) {
+            actor = it->second;
+            attack.is_npc = false;
+        } else if (const auto it = npcs.find(id); it != npcs.end()) {
+            actor = it->second;
+            attack.is_npc = true;
         }
-        if (attacker < 0 || std::tuple{!enemies[id], -attack.time} <
-                                std::tuple{!enemies[attacker], -attacks_[attacker].time}) {
-            attacker = id;
+        if (actor) {
+            attack.position = point_or(*actor, "pos");
+        }
+        const bool visible = actor != nullptr;
+        const double dist = attack.position ? distanceXY(position, *attack.position) : 1000.0;
+        if (attacker_id < 0 || std::tuple{!visible, dist > 90.0, -attack.time, dist} <
+                                   std::tuple{!attacker_visible, attacker_dist > 90.0, -attacker_time, attacker_dist}) {
+            attacker_id = id;
+            attacker_visible = visible;
+            attacker_dist = dist;
+            attacker_time = attack.time;
         }
     }
 
@@ -418,25 +701,29 @@ std::optional<Threat> ThreatTracker::update(const Json& obs, const Arena& arena)
     double nearest_distance = std::numeric_limits<double>::infinity();
     double facing_distance = std::numeric_limits<double>::infinity();
     const bool damaged_recently = now <= last_hostile_damage_at_ + FreshHostileDamageSeconds;
-    const double radius = number(self_stats, "radius", mech_radius_);
-    const double height = number(self_stats, "height", mech_height_);
-    for (int id = 0; id < static_cast<int>(enemies.size()); ++id) {
-        if (!enemies[id]) {
-            continue;
+    for (const auto& [id, actor] : enemies) {
+        if (Clock::now() >= deadline) {
+            break;
         }
-        Threat observed = describe_enemy(*enemies[id], id);
+        Threat observed = describe_enemy(*actor, id);
         const double distance = distanceXY(position, *observed.position);
         if (distance < nearest_distance) {
             nearest = observed;
             nearest_distance = distance;
         }
-        const auto& charging = field(*enemies[id], "charging");
+        const auto& charging = field(*actor, "charging");
         if (charging.is_boolean() && charging.get<bool>() &&
             (!facing || !facing->laser_charging || distance < facing_distance)) {
             auto laser = observed;
             laser.enemy_range = weapon_ranges_[LaserIndex];
-            laser.enemy_muzzle_height = muzzle_height_ * (1 + size_per_cube_ * number(*enemies[id], "cubes", 0.0));
-            if (enemy_aims_at(laser, position, radius, height, arena)) {
+            laser.enemy_muzzle_height = muzzle_height_ * (1 + size_per_cube_ * number(*actor, "cubes", 0.0));
+            const Vec3 src = above(*laser.position, laser.enemy_muzzle_height);
+            const Vec3 torso = above(position, height * 0.5);
+            const double yaw_to_us = std::atan2(position[1] - src[1], position[0] - src[0]);
+            const bool sweeping_toward_us = laser.enemy_aim && distance <= laser.enemy_range + radius &&
+                std::abs(std::remainder(yaw_to_us - (*laser.enemy_aim)[0], Tau)) <= radians(25) &&
+                !arena.blocksLine(src, torso);
+            if (sweeping_toward_us || enemy_aims_at(laser, position, radius, height, arena)) {
                 observed = laser;
                 observed.laser_charging = true;
             }
@@ -449,27 +736,45 @@ std::optional<Threat> ThreatTracker::update(const Json& obs, const Arena& arena)
             observed.damaged_recently = damaged_recently;
             observed.attack_id = id;
             observed.attack_position = observed.position;
-            observed.attack_velocity = point(enemies[id]->at("vel"));
+            observed.attack_velocity = point_or(*actor, "vel");
             facing = observed;
             facing_distance = distance;
         }
     }
+
+    auto build_attacker = [&]() -> Threat {
+        const Json* actor = nullptr;
+        if (const auto it = enemies.find(attacker_id); it != enemies.end()) {
+            actor = it->second;
+        } else if (const auto it = npcs.find(attacker_id); it != npcs.end()) {
+            actor = it->second;
+        }
+        Threat threat = actor ? describe_enemy(*actor, attacker_id) : Threat{};
+        threat.position = attacks_[attacker_id].position;
+        threat.actor_id = attacker_id;
+        threat.is_npc = attacks_[attacker_id].is_npc;
+        threat.hostile = true;
+        threat.damaged_recently = damaged_recently;
+        threat.attack_id = attacker_id;
+        if (actor) {
+            threat.attack_position = threat.position;
+            threat.attack_velocity = point_or(*actor, "vel");
+        }
+        return threat;
+    };
+
+    // Priority: charging laser > closer/immediate active attacker > closest facing > other attacker > unknown > nearest.
+    if (facing && facing->laser_charging) {
+        return facing;
+    }
+    if (attacker_id >= 0 && (!facing || (attacker_visible && (attacker_dist < facing_distance || attacker_dist <= 80.0)))) {
+        return build_attacker();
+    }
     if (facing) {
         return facing;
     }
-    if (attacker >= 0) {
-        const auto* enemy = enemies[attacker];
-        Threat threat = enemy ? describe_enemy(*enemy, attacker) : Threat{};
-        threat.position = attacks_[attacker].position;
-        threat.actor_id = attacker;
-        threat.hostile = true;
-        threat.damaged_recently = damaged_recently;
-        threat.attack_id = attacker;
-        if (enemy) {
-            threat.attack_position = threat.position;
-            threat.attack_velocity = point(enemy->at("vel"));
-        }
-        return threat;
+    if (attacker_id >= 0) {
+        return build_attacker();
     }
     if (now < unknown_until_) {
         Threat threat;
@@ -481,43 +786,53 @@ std::optional<Threat> ThreatTracker::update(const Json& obs, const Arena& arena)
     return nearest;
 }
 
-std::optional<Threat> ThreatTracker::duel_target(const Json& obs, const Arena& arena) {
-    const auto& me = obs.at("self");
+std::optional<Threat> ThreatTracker::duel_target(const Json& obs, const Arena& arena, Clock::time_point deadline) {
+    if (Clock::now() >= deadline) {
+        return std::nullopt;
+    }
+    const auto& me = field(obs, "self");
     const auto own_id = actor_id(me, "id");
     const auto& actors = field(obs, "mechs");
     const auto& beams = field(obs, "beams");
     const double now = match_time(obs);
     const auto& zone = field(obs, "zone");
-    const auto& center = field(zone, "center");
-    const Vec2 circle_center = center.is_array() && center.size() >= 2 ? pair(center) : Vec2{};
+    const Vec2 circle_center = pair_or(zone, "center");
     const double circle_radius = number(zone, "radius", -1.0);
     std::array<const Json*, 16> opponents{};
     std::array<bool, 16> hurt_by_us{};
     std::array<bool, 16> lost_health{};
-    for (const auto& event : field(obs, "events")) {
-        if (text(field(event, "type")) == "hit") {
-            if (const auto victim = actor_id(event, "target")) {
-                hurt_by_us[*victim] = true;
+    const auto& events = field(obs, "events");
+    if (events.is_array()) {
+        for (const auto& event : events) {
+            if (text(field(event, "type")) == "hit") {
+                if (const auto victim = actor_id(event, "target"); victim && *victim < 16) {
+                    hurt_by_us[*victim] = true;
+                }
             }
         }
     }
     std::size_t opponent_count = 0;
-    for (const auto& actor : actors) {
-        const auto id = actor_id(actor, "id");
-        if (!id || id == own_id || text(field(actor, "kind")) != "mech" || opponents[*id]) {
-            continue;
+    if (actors.is_array()) {
+        for (const auto& actor : actors) {
+            const auto id = actor_id(actor, "id");
+            if (!id || *id >= 16 || id == own_id || text(field(actor, "kind")) != "mech" || opponents[*id]) {
+                continue;
+            }
+            const auto pos = try_point(field(actor, "pos"));
+            if (!pos) {
+                continue;
+            }
+            opponents[*id] = &actor;
+            ++opponent_count;
+            const double hp = number(actor, "hp", -1.0);
+            const bool in_zone = distanceXY(*pos, circle_center) <= circle_radius;
+            const auto previous = health_samples_[*id];
+            if (!hurt_by_us[*id] && in_zone && previous.in_zone && now > previous.time &&
+                now <= previous.time + DuelEvidenceSeconds && hp >= 0 && previous.hp - hp > 0.5) {
+                lost_health[*id] = true;
+            }
+            health_samples_[*id] = {now, hp, in_zone};
         }
-        opponents[*id] = &actor;
-        ++opponent_count;
-        const double hp = number(actor, "hp", -1.0);
-        const Vec3 position = point(actor.at("pos"));
-        const bool in_zone = distanceXY(position, circle_center) <= circle_radius;
-        const auto previous = health_samples_[*id];
-        if (!hurt_by_us[*id] && in_zone && previous.in_zone && now > previous.time &&
-            now <= previous.time + DuelEvidenceSeconds && hp >= 0 && previous.hp - hp > 0.5) {
-            lost_health[*id] = true;
-        }
-        health_samples_[*id] = {now, hp, in_zone};
     }
     if (opponent_count < 2) {
         if (now <= last_duel_at_ + DuelMemorySeconds) {
@@ -526,7 +841,7 @@ std::optional<Threat> ThreatTracker::duel_target(const Json& obs, const Arena& a
         }
         return std::nullopt;
     }
-    if (now > last_duel_at_ + DuelMemorySeconds && beams.empty() &&
+    if (now > last_duel_at_ + DuelMemorySeconds && (!beams.is_array() || beams.empty()) &&
         std::none_of(lost_health.begin(), lost_health.end(), [](bool lost) {
             return lost;
         })) {
@@ -534,16 +849,15 @@ std::optional<Threat> ThreatTracker::duel_target(const Json& obs, const Arena& a
     }
 
     const auto& stats = field(me, "stats");
-    const Vec3 own_position = point(me.at("pos"));
+    const Vec3 own_position = point_or(me, "pos");
     const Vec3 eye = above(own_position, number(stats, "eye_height", 8.0));
     std::array<std::optional<Threat>, 16> seen;
     for (int id = 0; id < static_cast<int>(opponents.size()); ++id) {
-        if (!opponents[id]) {
+        if (!opponents[id] || Clock::now() >= deadline) {
             continue;
         }
         auto actor = describe_enemy(*opponents[id], id);
         const auto body = above(*actor.position, actor.attack_height / 2);
-        // The server continues reporting actors recently seen behind solid walls.
         if (!arena.blocksLine(eye, body)) {
             seen[id] = std::move(actor);
         }
@@ -553,35 +867,42 @@ std::optional<Threat> ThreatTracker::duel_target(const Json& obs, const Arena& a
         duel_times_[std::min(first, second)][std::max(first, second)] = now;
         last_duel_at_ = now;
     };
-    for (const auto& beam : beams) {
-        const auto kind = text(field(beam, "kind"));
-        const auto shooter = actor_id(beam, "by");
-        const auto& path = field(beam, "path");
-        if ((kind != "laser" && kind != "lightning") || !shooter || !seen[*shooter] ||
-            number(beam, "age", DuelEvidenceSeconds + 1) > DuelEvidenceSeconds || !path.is_array() || path.size() < 2) {
-            continue;
-        }
-        const auto& source = *seen[*shooter];
-        for (int id = 0; id < static_cast<int>(seen.size()); ++id) {
-            if (id == *shooter || !seen[id]) {
+    if (beams.is_array()) {
+        for (const auto& beam : beams) {
+            if (Clock::now() >= deadline) {
+                break;
+            }
+            const auto kind = text(field(beam, "kind"));
+            const auto shooter = actor_id(beam, "by");
+            const auto& path = field(beam, "path");
+            if ((kind != "laser" && kind != "lightning") || !shooter || *shooter >= 16 || !seen[*shooter] ||
+                number(beam, "age", DuelEvidenceSeconds + 1) > DuelEvidenceSeconds || !path.is_array() || path.size() < 2) {
                 continue;
             }
-            const auto& target = *seen[id];
-            for (std::size_t index = 1; index < path.size(); ++index) {
-                if (segment_hits_mech(point(path[index - 1]), point(path[index]), target) &&
-                    enemy_aims_at(target, *source.position, source.attack_radius, source.attack_height, arena)) {
-                    remember_duel(id, *shooter);
-                    break;
+            const auto& source = *seen[*shooter];
+            for (int id = 0; id < static_cast<int>(seen.size()) && Clock::now() < deadline; ++id) {
+                if (id == *shooter || !seen[id]) {
+                    continue;
+                }
+                const auto& target = *seen[id];
+                for (std::size_t index = 1; index < path.size(); ++index) {
+                    const auto p0 = try_point(path[index - 1]);
+                    const auto p1 = try_point(path[index]);
+                    if (p0 && p1 && segment_hits_mech(*p0, *p1, target) &&
+                        enemy_aims_at(target, *source.position, source.attack_radius, source.attack_height, arena)) {
+                        remember_duel(id, *shooter);
+                        break;
+                    }
                 }
             }
         }
     }
-    for (int id = 0; id < static_cast<int>(seen.size()); ++id) {
+    for (int id = 0; id < static_cast<int>(seen.size()) && Clock::now() < deadline; ++id) {
         if (!seen[id] || !lost_health[id]) {
             continue;
         }
         const auto& victim = *seen[id];
-        for (int other = 0; other < static_cast<int>(seen.size()); ++other) {
+        for (int other = 0; other < static_cast<int>(seen.size()) && Clock::now() < deadline; ++other) {
             if (other == id || !seen[other]) {
                 continue;
             }
@@ -611,8 +932,8 @@ std::optional<Threat> ThreatTracker::duel_target(const Json& obs, const Arena& a
     const double radius = number(stats, "radius", mech_radius_);
     const double height = number(stats, "height", mech_height_);
     std::optional<Threat> preferred;
-    double nearest = std::numeric_limits<double>::infinity();
-    for (int id = 0; id < static_cast<int>(seen.size()); ++id) {
+    double best_score = -std::numeric_limits<double>::infinity();
+    for (int id = 0; id < static_cast<int>(seen.size()) && Clock::now() < deadline; ++id) {
         if (weapon.is_null() || !fighting[id] || !seen[id]->enemy_aim) {
             continue;
         }
@@ -622,13 +943,17 @@ std::optional<Threat> ThreatTracker::duel_target(const Json& obs, const Arena& a
         }
         target.attack_position = target.position;
         target.attack_id = id;
-        target.attack_velocity = point(opponents[id]->at("vel"));
+        target.attack_velocity = point_or(*opponents[id], "vel");
         const auto shot = shot_points(me, target, weapon_stats);
-        const double distance = distance_3d(shot.origin, shot.intercept);
-        if (distance < nearest && distance <= range && !arena.blocksLine(shot.origin, shot.target) &&
-            !arena.blocksLine(shot.origin, shot.intercept)) {
+        const auto aim_point = clear_aim_point(shot, arena);
+        if (!aim_point) {
+            continue;
+        }
+        const double distance = distance_3d(shot.origin, *aim_point);
+        const double score = (1400.0 - std::min(1400.0, target.hp)) * 0.2 - distance;
+        if (distance <= range && score > best_score) {
             preferred = std::move(target);
-            nearest = distance;
+            best_score = score;
         }
     }
     return preferred;
@@ -638,92 +963,225 @@ std::optional<Vec2> retreat_aim(const Json& obs, const std::optional<Threat>& th
     if (!threat || !threat->position) {
         return std::nullopt;
     }
-    const auto& me = obs.at("self");
+    const auto& me = field(obs, "self");
     if (threat->attack_position) {
         const Shot shot = shot_points(me, *threat, field(gun(me), "stats"));
         return angles(shot.origin, shot.intercept);
     }
-    return angles(muzzle(me), above(*threat->position, 4.5));
+    return angles(muzzle(me), above(*threat->position, threat->attack_height * 0.5));
 }
 
-namespace {
-
-bool gun_ready(const Json& weapon) {
-    return !weapon.is_null() && number(weapon, "cooldown", 0.0) <= 0.1 &&
-           number(weapon, "reload", 0.0) <= 0 && number(weapon, "ammo", 1.0) > 0;
-}
-
-bool aim_aligned(const Vec2& desired, const Vec2& actual, double distance, double radius) {
-    const auto [yaw, pitch] = desired;
-    const auto [actual_yaw, actual_pitch] = actual;
-    const double yaw_error = std::remainder(yaw - actual_yaw, Tau) * std::cos(pitch);
-    const double pitch_error = pitch - actual_pitch;
-    const double tolerance = std::min(0.18, std::atan2(0.75 * radius, std::max(distance, 1.0)));
-    return yaw_error * yaw_error + pitch_error * pitch_error <= tolerance * tolerance;
-}
-
-bool clear_target_line(const Shot& shot, const Arena& arena) {
-    return !arena.blocksLine(shot.origin, shot.target) && !arena.blocksLine(shot.origin, shot.intercept);
-}
-
-bool clear_aim_line(const Shot& shot, const Vec2& actual, double distance, const Arena& arena) {
-    const auto [actual_yaw, actual_pitch] = actual;
-    const double horizontal = distance * std::cos(actual_pitch);
-    const Vec3 actual_end{shot.origin[0] + horizontal * std::cos(actual_yaw),
-                          shot.origin[1] + horizontal * std::sin(actual_yaw),
-                          shot.origin[2] + distance * std::sin(actual_pitch)};
-    return !arena.blocksLine(shot.origin, actual_end);
-}
-
-bool ready_aligned_shot(const Json& me, const Threat& target, const Arena& arena) {
-    const auto& weapon = gun(me);
-    if (!gun_ready(weapon)) {
-        return false;
-    }
-    const auto& weapon_stats = field(weapon, "stats");
-    const Shot shot = shot_points(me, target, weapon_stats);
-    const double distance = distance_3d(shot.origin, shot.intercept);
-    const auto actual = pair(me.at("aim"));
-    return distance <= number(weapon_stats, "range", 230.0) &&
-           aim_aligned(angles(shot.origin, shot.intercept), actual, distance, target.attack_radius) &&
-           clear_target_line(shot, arena) && clear_aim_line(shot, actual, distance, arena);
-}
-
-}  // namespace
-
-std::optional<GunShot> ThreatTracker::visible_shot(const Json& obs, const Arena& arena) const {
-    const auto& me = obs.at("self");
-    const auto& weapon = gun(me);
-    if (weapon.is_null()) {
+std::optional<GunShot> ThreatTracker::visible_shot(const Json& obs, const Arena& arena,
+                                                   const std::optional<Threat>& primary_threat,
+                                                   Clock::time_point deadline, bool allow_crates) const {
+    const auto& me = field(obs, "self");
+    const auto& weapons = field(me, "weapons");
+    if (!weapons.is_array() || weapons.empty()) {
         return std::nullopt;
     }
-    const auto& stats = field(weapon, "stats");
-    const double range = number(stats, "range", 230.0);
-    const bool ready = gun_ready(weapon);
-    const auto actual = pair(me.at("aim"));
+
+    struct SlotInfo {
+        int index = -1;
+        std::string_view kind;
+        const Json* weapon = nullptr;
+        const Json* stats = nullptr;
+        double range = 0.0;
+        bool ready = false;
+    };
+    std::array<SlotInfo, 2> slots{};
+    std::size_t slot_count = 0;
+    for (std::size_t i = 0; i < std::min<std::size_t>(2, weapons.size()); ++i) {
+        if (!weapons[i].is_object()) {
+            continue;
+        }
+        const auto kind = text(field(weapons[i], "kind"));
+        const auto& wstats = field(weapons[i], "stats");
+        double default_range = 230.0;
+        if (kind == "mortar") default_range = mortar_range(wstats);
+        else if (kind == "laser") default_range = weapon_ranges_[2];
+        else if (kind == "lightning") default_range = weapon_ranges_[3];
+        slots[slot_count++] = SlotInfo{static_cast<int>(i), kind, &weapons[i], &wstats,
+                                       number(wstats, "range", default_range), weapon_ready(weapons[i])};
+    }
+    if (slot_count == 0) {
+        return std::nullopt;
+    }
+
+    const auto actual = pair_or(me, "aim");
     const auto self_id = actor_id(me, "id");
-    double best_distance = std::numeric_limits<double>::infinity();
+    const Vec3 self_pos = point_or(me, "pos");
+    const double self_height = number(field(me, "stats"), "height", mech_height_);
+    const Vec3 mortar_origin = above(self_pos, self_height + 0.5);
+
+    double best_score = -std::numeric_limits<double>::infinity();
     std::optional<GunShot> best;
-    for (const auto& actor : field(obs, "mechs")) {
-        const auto id = actor_id(actor, "id");
-        if (!id || id == self_id || text(field(actor, "kind")) != "mech") {
-            continue;
+
+    const auto& mechs = field(obs, "mechs");
+    if (mechs.is_array()) {
+        for (const auto& actor : mechs) {
+            if (Clock::now() >= deadline) {
+                break;
+            }
+            const auto id = actor_id(actor, "id");
+            if (!id || id == self_id || !try_point(field(actor, "pos"))) {
+                continue;
+            }
+            const auto kind = text(field(actor, "kind"));
+            const bool attacking_npc = kind == "npc" && primary_threat && primary_threat->is_npc
+                && primary_threat->actor_id && *primary_threat->actor_id == *id;
+            if (kind != "mech" && !attacking_npc) {
+                continue;
+            }
+
+            auto target = describe_enemy(actor, *id);
+            target.attack_position = target.position;
+            target.attack_velocity = point_or(actor, "vel");
+
+            const bool is_primary = primary_threat && primary_threat->actor_id && *primary_threat->actor_id == *id;
+            const double hp = std::clamp(target.hp, 1.0, 2000.0);
+            // Strongly prefer finishing wounded opponents and prioritizing active threats.
+            const double hp_bonus = (hp <= 350.0 ? 220.0 : 0.0) + std::max(0.0, 1400.0 - hp) * 0.14;
+            const double threat_bonus = is_primary && primary_threat->hostile
+                ? (primary_threat->laser_charging ? 180.0 : 90.0) : 0.0;
+
+            std::optional<GunShot> candidate;
+            double candidate_dist = std::numeric_limits<double>::infinity();
+
+            // 1. Evaluate direct-fire weapons (gun, lightning, laser).
+            std::optional<Vec2> gun_aim;
+            bool gun_can_fire = false;
+            int gun_slot = -1;
+            double gun_dist = std::numeric_limits<double>::infinity();
+
+            std::optional<Vec2> beam_aim;
+            bool beam_can_fire = false;
+            int beam_slot = -1;
+            double beam_dist = std::numeric_limits<double>::infinity();
+
+            for (std::size_t s = 0; s < slot_count; ++s) {
+                const auto& slot = slots[s];
+                if (slot.kind == "gun") {
+                    const Shot shot = shot_points(me, target, *slot.stats, false);
+                    const auto aim_pt = clear_aim_point(shot, arena);
+                    if (!aim_pt) continue;
+                    const double dist = distance_3d(shot.origin, *aim_pt);
+                    if (dist > slot.range) continue;
+                    const Vec2 aim = angles(shot.origin, *aim_pt);
+                    const bool fire = slot.ready && aim_aligned(aim, actual, dist, target.attack_radius) &&
+                                      clear_aim_line(shot.origin, actual, dist, arena);
+                    gun_aim = aim;
+                    gun_can_fire = fire;
+                    gun_slot = slot.index;
+                    gun_dist = dist;
+                } else if (slot.kind == "lightning" || slot.kind == "laser") {
+                    const Shot shot = shot_points(me, target, *slot.stats, true);
+                    if (arena.blocksLine(shot.origin, shot.target)) continue;
+                    const double dist = distance_3d(shot.origin, shot.target);
+                    if (dist > slot.range) continue;
+                    const Vec2 aim = angles(shot.origin, shot.target);
+                    const bool fire = slot.ready && aim_aligned(aim, actual, dist, target.attack_radius) &&
+                                      clear_aim_line(shot.origin, actual, dist, arena);
+                    if (!beam_aim || (fire && !beam_can_fire) || slot.kind == "lightning") {
+                        beam_aim = aim;
+                        beam_can_fire = fire;
+                        beam_slot = slot.index;
+                        beam_dist = dist;
+                    }
+                }
+            }
+
+            if (gun_aim || beam_aim) {
+                GunShot gs;
+                if (gun_aim && beam_aim) {
+                    const bool prefer_beam = (!gun_can_fire && beam_can_fire) ||
+                        (!slots[static_cast<std::size_t>(gun_slot)].ready && slots[static_cast<std::size_t>(beam_slot)].ready);
+                    gs.aim = prefer_beam ? *beam_aim : *gun_aim;
+                    candidate_dist = prefer_beam ? beam_dist : gun_dist;
+                    gs.fire[static_cast<std::size_t>(gun_slot)] = gun_can_fire;
+                    gs.fire[static_cast<std::size_t>(beam_slot)] = beam_can_fire;
+                } else if (gun_aim) {
+                    gs.aim = *gun_aim;
+                    candidate_dist = gun_dist;
+                    gs.fire[static_cast<std::size_t>(gun_slot)] = gun_can_fire;
+                } else {
+                    gs.aim = *beam_aim;
+                    candidate_dist = beam_dist;
+                    gs.fire[static_cast<std::size_t>(beam_slot)] = beam_can_fire;
+                }
+                candidate = gs;
+            } else {
+                // 2. No direct LOS: try mortar arc over cover if equipped and ready.
+                for (std::size_t s = 0; s < slot_count; ++s) {
+                    const auto& slot = slots[s];
+                    if (slot.kind != "mortar" || !slot.ready) continue;
+                    const double speed = number(*slot.stats, "speed", 72.0);
+                    const double grav = number(*slot.stats, "gravity", mortar_gravity_);
+                    const Vec3 aim_target = above(*target.attack_position, target.attack_height * 0.4);
+                    const double dist = distanceXY(mortar_origin, aim_target);
+                    if (dist > slot.range) continue;
+                    if (const auto m_aim = mortar_solution(mortar_origin, aim_target, speed, grav, arena)) {
+                        GunShot gs;
+                        gs.aim = *m_aim;
+                        gs.fire[static_cast<std::size_t>(slot.index)] =
+                            aim_aligned(*m_aim, actual, dist, target.attack_radius + 1.5, 0.04);
+                        candidate = gs;
+                        candidate_dist = dist;
+                        break;
+                    }
+                }
+            }
+
+            if (!candidate) {
+                continue;
+            }
+            const double fire_bonus = candidate->firing() ? 85.0 : 0.0;
+            const double score = fire_bonus + hp_bonus + threat_bonus - candidate_dist;
+            if (score > best_score) {
+                best_score = score;
+                best = candidate;
+            }
         }
-        auto target = describe_enemy(actor, *id);
-        target.attack_position = target.position;
-        target.attack_velocity = point(actor.at("vel"));
-        const Shot shot = shot_points(me, target, stats);
-        const double distance = distance_3d(shot.origin, shot.intercept);
-        if (distance > range || !clear_target_line(shot, arena)) {
-            continue;
+    }
+
+    if (best || !allow_crates || Clock::now() >= deadline) {
+        return best;
+    }
+
+    // No visible enemy shot: break nearby crates with spare gun ammo to farm power cubes.
+    int gun_slot = -1;
+    double gun_range = 65.0;
+    bool gun_spare_ready = false;
+    for (std::size_t s = 0; s < slot_count; ++s) {
+        if (slots[s].kind == "gun") {
+            gun_slot = slots[s].index;
+            gun_range = std::min(65.0, slots[s].range);
+            gun_spare_ready = slots[s].ready && number(*slots[s].weapon, "ammo", 0.0) > 4.0;
+            break;
         }
-        const auto aim = angles(shot.origin, shot.intercept);
-        const bool fire = ready && aim_aligned(aim, actual, distance, target.attack_radius) &&
-                          clear_aim_line(shot, actual, distance, arena);
-        // Prefer a shot that can leave now, then the nearest clear target to aim at.
-        if (!best || (fire && !best->fire) || (fire == best->fire && distance < best_distance)) {
-            best = GunShot{aim, fire};
-            best_distance = distance;
+    }
+    const auto& crates = field(obs, "crates");
+    if (gun_slot >= 0 && gun_spare_ready && crates.is_array()) {
+        const Vec3 origin = muzzle(me);
+        double nearest_crate = std::numeric_limits<double>::infinity();
+        for (const auto& crate : crates) {
+            if (Clock::now() >= deadline) {
+                break;
+            }
+            const auto pos = try_point(field(crate, "pos"));
+            if (!pos) continue;
+            const Vec3 center = above(*pos, 1.5);
+            const double dist = distance_3d(origin, center);
+            if (dist > gun_range || dist >= nearest_crate || arena.blocksLine(origin, center)) {
+                continue;
+            }
+            const Vec2 aim = angles(origin, center);
+            const bool fire = aim_aligned(aim, actual, dist, 1.8) && clear_aim_line(origin, actual, dist, arena);
+            GunShot gs;
+            gs.aim = aim;
+            gs.fire[static_cast<std::size_t>(gun_slot)] = fire;
+            gs.crate = true;
+            best = gs;
+            nearest_crate = dist;
         }
     }
     return best;
@@ -734,11 +1192,10 @@ bool return_fire(const Json& obs, const std::optional<Threat>& threat, const Vec
     if (!threat || !threat->facing_us || !threat->attack_id || !threat->attack_position) {
         return false;
     }
-    const auto& me = obs.at("self");
-    const auto position = point(me.at("pos"));
+    const auto& me = field(obs, "self");
+    const auto position = point_or(me, "pos");
     const double dx = (*threat->attack_position)[0] - position[0];
     const double dy = (*threat->attack_position)[1] - position[1];
-    // The caller may validate a short return route to cover that points towards the attacker.
     if (std::hypot(move[0], move[1]) < 0.15 ||
         (!returning_to_cover && dx * move[0] + dy * move[1] > 0.05 * std::hypot(dx, dy))) {
         return false;
@@ -748,29 +1205,38 @@ bool return_fire(const Json& obs, const std::optional<Threat>& threat, const Vec
 
 bool opportunity_fire(const Json& obs, const std::optional<Threat>& target, const Arena& arena) {
     return target && !target->hostile && !target->facing_us && target->attack_id && target->attack_position &&
-           ready_aligned_shot(obs.at("self"), *target, arena);
+           ready_aligned_shot(field(obs, "self"), *target, arena);
 }
 
 std::vector<Cube> safe_cubes(const Json& obs, const std::optional<Threat>& threat,
                              double pickup_radius, const std::function<bool(const Vec2&)>& safe_point) {
     const auto& events = field(obs, "events");
-    if (threat || std::any_of(events.begin(), events.end(), [](const auto& event) {
+    const bool hostile_threat = threat && (threat->hostile || threat->damaged_recently || threat->laser_charging);
+    if (hostile_threat || (events.is_array() && std::any_of(events.begin(), events.end(), [](const auto& event) {
             return text(field(event, "type")) == "damaged";
-        })) {
+        }))) {
         return {};
     }
-    const auto position = point(obs.at("self").at("pos"));
-    for (const auto& actor : field(obs, "mechs")) {
-        if (text(field(actor, "kind")) == "npc" && distanceXY(point(actor.at("pos")), position) < 45) {
-            return {};
+    const auto position = point_or(field(obs, "self"), "pos");
+    const auto& mechs = field(obs, "mechs");
+    if (mechs.is_array()) {
+        for (const auto& actor : mechs) {
+            const auto pos = try_point(field(actor, "pos"));
+            if (pos && text(field(actor, "kind")) == "npc" && distanceXY(*pos, position) < 35) {
+                return {};
+            }
         }
     }
     std::vector<std::pair<double, Cube>> candidates;
-    for (const auto& cube : field(obs, "cubes")) {
-        const Vec3 cube_pos = point(cube.at("pos"));
-        const double distance = distanceXY(cube_pos, position);
-        if (distance <= CubeDetourMeters + pickup_radius && safe_point({cube_pos[0], cube_pos[1]})) {
-            candidates.push_back({distance, Cube{cube.at("id").get<double>(), cube_pos}});
+    const auto& raw_cubes = field(obs, "cubes");
+    if (raw_cubes.is_array()) {
+        for (const auto& cube : raw_cubes) {
+            const auto cube_pos = try_point(field(cube, "pos"));
+            if (!cube_pos) continue;
+            const double distance = distanceXY(*cube_pos, position);
+            if (distance <= CubeDetourMeters + pickup_radius && safe_point({(*cube_pos)[0], (*cube_pos)[1]})) {
+                candidates.push_back({distance, Cube{number(cube, "id", 0.0), *cube_pos}});
+            }
         }
     }
     std::sort(candidates.begin(), candidates.end(), [](const auto& first, const auto& second) {

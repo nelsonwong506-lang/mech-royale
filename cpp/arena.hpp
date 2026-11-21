@@ -60,6 +60,7 @@ private:
     Vec2 terrainOrigin_;
     int terrainWidth_, terrainHeight_;
     double terrainStep_, terrainScale_;
+    double maxTerrain_ = -std::numeric_limits<double>::infinity();
     std::vector<std::int16_t> terrain_;
     std::vector<Prism> prisms_;
     std::unordered_map<std::uint64_t, std::vector<std::size_t>> bins_;
