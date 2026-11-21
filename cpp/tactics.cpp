@@ -648,35 +648,86 @@ std::optional<Vec2> retreat_aim(const Json& obs, const std::optional<Threat>& th
 
 namespace {
 
+bool gun_ready(const Json& weapon) {
+    return !weapon.is_null() && number(weapon, "cooldown", 0.0) <= 0.1 &&
+           number(weapon, "reload", 0.0) <= 0 && number(weapon, "ammo", 1.0) > 0;
+}
+
+bool aim_aligned(const Vec2& desired, const Vec2& actual, double distance, double radius) {
+    const auto [yaw, pitch] = desired;
+    const auto [actual_yaw, actual_pitch] = actual;
+    const double yaw_error = std::remainder(yaw - actual_yaw, Tau) * std::cos(pitch);
+    const double pitch_error = pitch - actual_pitch;
+    const double tolerance = std::min(0.18, std::atan2(0.75 * radius, std::max(distance, 1.0)));
+    return yaw_error * yaw_error + pitch_error * pitch_error <= tolerance * tolerance;
+}
+
+bool clear_target_line(const Shot& shot, const Arena& arena) {
+    return !arena.blocksLine(shot.origin, shot.target) && !arena.blocksLine(shot.origin, shot.intercept);
+}
+
+bool clear_aim_line(const Shot& shot, const Vec2& actual, double distance, const Arena& arena) {
+    const auto [actual_yaw, actual_pitch] = actual;
+    const double horizontal = distance * std::cos(actual_pitch);
+    const Vec3 actual_end{shot.origin[0] + horizontal * std::cos(actual_yaw),
+                          shot.origin[1] + horizontal * std::sin(actual_yaw),
+                          shot.origin[2] + distance * std::sin(actual_pitch)};
+    return !arena.blocksLine(shot.origin, actual_end);
+}
+
 bool ready_aligned_shot(const Json& me, const Threat& target, const Arena& arena) {
     const auto& weapon = gun(me);
-    if (weapon.is_null() || number(weapon, "cooldown", 0.0) > 0.1 ||
-        number(weapon, "reload", 0.0) > 0 || number(weapon, "ammo", 1.0) <= 0) {
+    if (!gun_ready(weapon)) {
         return false;
     }
     const auto& weapon_stats = field(weapon, "stats");
     const Shot shot = shot_points(me, target, weapon_stats);
     const double distance = distance_3d(shot.origin, shot.intercept);
-    if (distance > number(weapon_stats, "range", 230.0)) {
-        return false;
-    }
-    const auto [yaw, pitch] = angles(shot.origin, shot.intercept);
-    const auto [actual_yaw, actual_pitch] = pair(me.at("aim"));
-    const double yaw_error = std::remainder(yaw - actual_yaw, Tau) * std::cos(pitch);
-    const double pitch_error = pitch - actual_pitch;
-    const double tolerance = std::min(0.18, std::atan2(0.75 * target.attack_radius, std::max(distance, 1.0)));
-    if (yaw_error * yaw_error + pitch_error * pitch_error > tolerance * tolerance) {
-        return false;
-    }
-    const double horizontal = distance * std::cos(actual_pitch);
-    const Vec3 actual_end{shot.origin[0] + horizontal * std::cos(actual_yaw),
-                          shot.origin[1] + horizontal * std::sin(actual_yaw),
-                          shot.origin[2] + distance * std::sin(actual_pitch)};
-    return !arena.blocksLine(shot.origin, shot.target) && !arena.blocksLine(shot.origin, shot.intercept) &&
-           !arena.blocksLine(shot.origin, actual_end);
+    const auto actual = pair(me.at("aim"));
+    return distance <= number(weapon_stats, "range", 230.0) &&
+           aim_aligned(angles(shot.origin, shot.intercept), actual, distance, target.attack_radius) &&
+           clear_target_line(shot, arena) && clear_aim_line(shot, actual, distance, arena);
 }
 
 }  // namespace
+
+std::optional<GunShot> ThreatTracker::visible_shot(const Json& obs, const Arena& arena) const {
+    const auto& me = obs.at("self");
+    const auto& weapon = gun(me);
+    if (weapon.is_null()) {
+        return std::nullopt;
+    }
+    const auto& stats = field(weapon, "stats");
+    const double range = number(stats, "range", 230.0);
+    const bool ready = gun_ready(weapon);
+    const auto actual = pair(me.at("aim"));
+    const auto self_id = actor_id(me, "id");
+    double best_distance = std::numeric_limits<double>::infinity();
+    std::optional<GunShot> best;
+    for (const auto& actor : field(obs, "mechs")) {
+        const auto id = actor_id(actor, "id");
+        if (!id || id == self_id || text(field(actor, "kind")) != "mech") {
+            continue;
+        }
+        auto target = describe_enemy(actor, *id);
+        target.attack_position = target.position;
+        target.attack_velocity = point(actor.at("vel"));
+        const Shot shot = shot_points(me, target, stats);
+        const double distance = distance_3d(shot.origin, shot.intercept);
+        if (distance > range || !clear_target_line(shot, arena)) {
+            continue;
+        }
+        const auto aim = angles(shot.origin, shot.intercept);
+        const bool fire = ready && aim_aligned(aim, actual, distance, target.attack_radius) &&
+                          clear_aim_line(shot, actual, distance, arena);
+        // Prefer a shot that can leave now, then the nearest clear target to aim at.
+        if (!best || (fire && !best->fire) || (fire == best->fire && distance < best_distance)) {
+            best = GunShot{aim, fire};
+            best_distance = distance;
+        }
+    }
+    return best;
+}
 
 bool return_fire(const Json& obs, const std::optional<Threat>& threat, const Vec2& move, const Arena& arena,
                  bool returning_to_cover) {

@@ -91,7 +91,10 @@ public:
         const bool underThreat = threat && (threat->hostile || threat->damaged_recently || threat->laser_charging);
         const bool canJoin = duel && !underThreat && !peek_ && !hop_ && me.value("in_zone", false) &&
             !rotationWindow(start, zone, motion, routeEstimate_).urgent;
-        const auto aim = canJoin ? retreat_aim(obs, duel) :
+        const bool joining = decision.fireAllowed && canJoin && opportunity_fire(obs, duel, arena_);
+        const bool defending = decision.fireAllowed && return_fire(obs, threat, command.move, arena_, decision.returningToCover);
+        const auto shot = decision.fireAllowed && !joining && !defending ? threats_.visible_shot(obs, arena_) : std::nullopt;
+        const auto aim = shot ? std::optional{shot->aim} : canJoin ? retreat_aim(obs, duel) :
             threat && threat->facing_us ? retreat_aim(obs, threat) : std::nullopt;
         if (aim) {
             action["aim"] = *aim;
@@ -100,9 +103,7 @@ public:
         }
         std::array fire{false, false};
         const auto& weapons = me.at("weapons");
-        const bool joining = canJoin && opportunity_fire(obs, duel, arena_);
-        const bool defending = decision.fireAllowed && return_fire(obs, threat, command.move, arena_, decision.returningToCover);
-        if (joining || defending) {
+        if (joining || defending || (shot && shot->fire)) {
             for (std::size_t i = 0; i < std::min(fire.size(), weapons.size()); ++i) {
                 if (weapons[i].is_object() && weapons[i].value("kind", "") == std::string_view("gun")) {
                     fire[i] = true;

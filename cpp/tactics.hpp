@@ -34,12 +34,18 @@ struct Cube {
     Vec3 pos;
 };
 
+struct GunShot {
+    Vec2 aim;
+    bool fire;
+};
+
 class ThreatTracker {
 public:
     explicit ThreatTracker(const Json& config);
 
     std::optional<Threat> update(const Json& obs, const Arena& arena);
     std::optional<Threat> duel_target(const Json& obs, const Arena& arena);
+    std::optional<GunShot> visible_shot(const Json& obs, const Arena& arena) const;
     bool can_collect_cubes(const Json& obs) const;
 
 private:
