@@ -321,8 +321,29 @@ Vec3 mortar_lead_target(const Vec3& origin, const Vec3& raw_target, const Vec3& 
                 raw_target[2]};
 }
 
+std::optional<Vec2> clamp_hit_pitch(const Vec3& origin, const Vec3& intercept,
+                                    const Vec3& target_feet, double target_height,
+                                    double min_pitch, double max_pitch) {
+    Vec2 aim = angles(origin, intercept);
+    if (aim[1] >= min_pitch && aim[1] <= max_pitch) {
+        return aim;
+    }
+    const double horiz = distanceXY(origin, intercept);
+    if (horiz < 0.2) {
+        return std::nullopt;
+    }
+    const double clamped = std::clamp(aim[1], min_pitch, max_pitch);
+    const double hit_z = origin[2] + horiz * std::tan(clamped);
+    if (hit_z >= target_feet[2] + 0.25 && hit_z <= target_feet[2] + target_height - 0.2) {
+        aim[1] = clamped;
+        return aim;
+    }
+    return std::nullopt;
+}
+
 std::optional<Vec2> mortar_solution(const Vec3& origin, const Vec3& target,
-                                    double speed, double gravity, const Arena& arena) {
+                                    double speed, double gravity, const Arena& arena,
+                                    double min_pitch, double max_pitch) {
     const double horiz = distanceXY(origin, target);
     if (horiz < 14.0 || speed <= 1.0 || gravity <= 0.1) {
         return std::nullopt;
@@ -338,7 +359,7 @@ std::optional<Vec2> mortar_solution(const Vec3& origin, const Vec3& target,
     const double ux = std::cos(yaw), uy = std::sin(yaw);
     for (const double sign : {-1.0, 1.0}) {
         const double pitch = std::atan((v2 + sign * root) / (gravity * horiz));
-        if (pitch < -1.2 || pitch > 1.50) {
+        if (pitch < min_pitch || pitch > max_pitch) {
             continue;
         }
         const double cos_p = std::cos(pitch);
@@ -428,6 +449,8 @@ ThreatTracker::ThreatTracker(const Json& config)
       muzzle_height_(number(field(config, "mech"), "muzzle_height", 7.0)),
       turn_rate_(number(field(config, "mech"), "turn_rate", 4.0)),
       pitch_rate_(number(field(config, "mech"), "pitch_rate", 3.0)),
+      min_pitch_(number(field(config, "mech"), "min_pitch", -0.7)),
+      max_pitch_(number(field(config, "mech"), "max_pitch", 1.3)),
       size_per_cube_(number(field(config, "cubes"), "size_per_cube", 0.05)),
       damage_per_cube_(number(field(config, "cubes"), "damage_per_cube", 0.04)),
       cube_stat_cap_(number(field(config, "cubes"), "stat_cap", 10.0)),
@@ -627,6 +650,28 @@ std::optional<SoundAlert> ThreatTracker::sound_alert(double now) const {
     return std::nullopt;
 }
 
+std::vector<SoundContact> ThreatTracker::unseen_sound_contacts(const Json& obs,
+                                                               const std::vector<EnemyInfo>& visible) const {
+    const double now = match_time(obs);
+    const Vec3 self_pos = point_or(field(obs, "self"), "pos");
+    std::vector<SoundContact> unseen;
+    for (const auto& sc : sound_contacts_) {
+        if (now > sc.expires) continue;
+        bool matched_visible = false;
+        for (const auto& e : visible) {
+            const double eyaw = std::atan2(e.pos[1] - self_pos[1], e.pos[0] - self_pos[0]);
+            if (std::abs(std::remainder(eyaw - sc.bearing, Tau)) <= radians(22.0)) {
+                matched_visible = true;
+                break;
+            }
+        }
+        if (!matched_visible) {
+            unseen.push_back(sc);
+        }
+    }
+    return unseen;
+}
+
 std::vector<EnemyInfo> ThreatTracker::visible_enemies(const Json& obs, const Arena& arena) const {
     std::vector<EnemyInfo> list;
     const auto& me = field(obs, "self");
@@ -789,6 +834,9 @@ std::optional<Threat> ThreatTracker::update(const Json& obs, const Arena& arena,
         }
     }
 
+    sound_contacts_.erase(std::remove_if(sound_contacts_.begin(), sound_contacts_.end(),
+                                         [now](const SoundContact& sc) { return now > sc.expires; }),
+                          sound_contacts_.end());
     const auto& sounds = field(obs, "sounds");
     if (sounds.is_array() && !sounds.empty()) {
         int best_priority = -1;
@@ -796,7 +844,7 @@ std::optional<Threat> ThreatTracker::update(const Json& obs, const Arena& arena,
         int best_alert_prio = -1;
         for (const auto& sound : sounds) {
             const auto skind = text(field(sound, "kind"));
-            if (skind == "death" || skind == "drop") continue;
+            if (skind == "death" || skind == "drop" || skind == "crate" || skind == "npc_gun") continue;
             std::optional<double> bearing;
             if (const auto p = try_point(field(sound, "pos"))) {
                 if (distanceXY(position, *p) > 3.0) {
@@ -810,6 +858,45 @@ std::optional<Threat> ThreatTracker::update(const Json& obs, const Arena& arena,
             const auto dist_str = text(field(sound, "dist"));
             const bool is_near = dist_str == "near";
             const bool is_mid = dist_str == "mid";
+            if (is_near || is_mid) {
+                std::string inferred_weapon;
+                if (skind == "lightning") inferred_weapon = "lightning";
+                else if (skind == "laser" || skind == "laser_charge") inferred_weapon = "laser";
+                else if (skind == "mortar") inferred_weapon = "mortar";
+                else if (skind == "gun" || skind == "reload") inferred_weapon = "gun";
+                const bool is_lc = (skind == "laser_charge");
+                const bool is_jet = (skind == "jet" && is_near);
+                const double ttl = is_lc ? 0.65 : (is_near ? 1.0 : 0.75);
+                if (is_near || is_lc || inferred_weapon == "mortar" || inferred_weapon == "lightning") {
+                    SoundContact* existing = nullptr;
+                    for (auto& sc : sound_contacts_) {
+                        if (std::abs(std::remainder(sc.bearing - *bearing, Tau)) <= radians(22.0)) {
+                            existing = &sc;
+                            break;
+                        }
+                    }
+                    if (existing) {
+                        existing->bearing = std::remainder(
+                            existing->bearing + 0.55 * std::remainder(*bearing - existing->bearing, Tau), Tau);
+                        existing->near = existing->near || is_near;
+                        existing->est_dist = existing->near ? 32.0 : 95.0;
+                        if (!inferred_weapon.empty()) existing->weapon = inferred_weapon;
+                        if (is_lc) existing->laser_charging = true;
+                        if (is_jet) existing->jet = true;
+                        existing->expires = std::max(existing->expires, now + ttl);
+                    } else if (sound_contacts_.size() < 6) {
+                        SoundContact sc;
+                        sc.bearing = *bearing;
+                        sc.near = is_near;
+                        sc.est_dist = is_near ? 32.0 : 95.0;
+                        sc.weapon = inferred_weapon;
+                        sc.laser_charging = is_lc;
+                        sc.jet = is_jet;
+                        sc.expires = now + ttl;
+                        sound_contacts_.push_back(std::move(sc));
+                    }
+                }
+            }
             int prio = (is_near ? 3 : is_mid ? 1 : 0);
             if (skind == "laser_charge" || skind == "lightning") prio += 4;
             else if (skind == "jet" || skind == "boost" || skind == "step") prio += 3;
@@ -1234,7 +1321,8 @@ std::optional<GunShot> ThreatTracker::visible_shot(const Json& obs, const Arena&
                                                    bool allow_crates,
                                                    bool allow_npcs,
                                                    bool allow_laser_charge,
-                                                   std::optional<int> sticky_target_id) const {
+                                                   std::optional<int> sticky_target_id,
+                                                   bool precharge_laser) const {
     const auto& me = field(obs, "self");
     const auto& weapons = field(me, "weapons");
     if (!weapons.is_array() || weapons.empty()) {
@@ -1252,6 +1340,8 @@ std::optional<GunShot> ThreatTracker::visible_shot(const Json& obs, const Arena&
     };
     std::array<SlotInfo, 2> slots{};
     std::size_t slot_count = 0;
+    bool has_gun_slot = false;
+    double own_light_range = 45.0;
     for (std::size_t i = 0; i < std::min<std::size_t>(2, weapons.size()); ++i) {
         if (!weapons[i].is_object()) {
             continue;
@@ -1262,9 +1352,12 @@ std::optional<GunShot> ThreatTracker::visible_shot(const Json& obs, const Arena&
         if (kind == "mortar") default_range = mortar_range(wstats);
         else if (kind == "laser") default_range = weapon_ranges_[LaserIndex];
         else if (kind == "lightning") default_range = weapon_ranges_[LightningIndex];
+        const double rng = number(wstats, "range", default_range);
+        if (kind == "gun") has_gun_slot = true;
+        if (kind == "lightning") own_light_range = rng;
         slots[slot_count++] = SlotInfo{
             static_cast<int>(i), kind, &weapons[i], &wstats,
-            number(wstats, "range", default_range),
+            rng,
             weapon_ready(weapons[i]),
             number(weapons[i], "charge", 0.0)
         };
@@ -1379,11 +1472,13 @@ std::optional<GunShot> ThreatTracker::visible_shot(const Json& obs, const Arena&
                     if (!aim_pt) continue;
                     const double dist = distance_3d(shot.origin, *aim_pt);
                     if (dist > slot.range) continue;
-                    const Vec2 aim = angles(shot.lead_origin, *aim_pt);
+                    const auto aim = clamp_hit_pitch(shot.lead_origin, *aim_pt, *target.position,
+                                                     target.attack_height, min_pitch_, max_pitch_);
+                    if (!aim) continue;
                     const double slack = dist > 90.0 ? 0.012 : 0.025;
-                    const bool fire = slot.ready && aim_aligned(aim, actual, dist, target.attack_radius, slack) &&
+                    const bool fire = slot.ready && aim_aligned(*aim, actual, dist, target.attack_radius, slack) &&
                                       clear_aim_line(shot.origin, actual, dist, arena);
-                    gun_aim = aim;
+                    gun_aim = *aim;
                     gun_can_fire = fire;
                     gun_slot = slot.index;
                     gun_dist = dist;
@@ -1397,7 +1492,7 @@ std::optional<GunShot> ThreatTracker::visible_shot(const Json& obs, const Arena&
                     if (dist > slot.range) continue;
                     const Vec2 aim = angles(shot.origin, shot.intercept);
                     const bool in_cone = std::abs(std::remainder(aim[0] - actual[0], Tau)) <= radians(cone_deg * 0.45);
-                    const double energy_floor = (is_npc && !attacking_npc) ? 35.0 : (hp <= 90.0 ? 0.0 : 1.5);
+                    const double energy_floor = (is_npc && !attacking_npc) ? (has_gun_slot ? 35.0 : 18.0) : (hp <= 90.0 ? 0.0 : 1.5);
                     const bool has_energy = my_energy >= e_cost + energy_floor;
                     const bool fire = slot.ready && has_energy && in_cone;
                     light_aim = aim;
@@ -1406,19 +1501,22 @@ std::optional<GunShot> ThreatTracker::visible_shot(const Json& obs, const Arena&
                     light_dist = dist;
                     const int chains = is_npc ? 0 : count_neighbors(*target.position, chain_r);
                     light_bonus = 60.0 + 115.0 * chains +
-                        (target.has_laser ? (field(actor, "charging").is_boolean() && field(actor, "charging").get<bool>() ? 160.0 : 75.0) : 0.0);
+                        (target.has_laser ? (field(actor, "charging").is_boolean() && field(actor, "charging").get<bool>() ? 185.0 : 95.0) : 0.0);
                 } else if (slot.kind == "laser") {
                     const Shot shot = shot_points(me, target, *slot.stats, arena, true);
-                    if (arena.blocksLine(shot.origin, shot.target)) continue;
                     const double dist = distance_3d(shot.origin, shot.target);
                     if (dist > slot.range) continue;
-                    const Vec2 aim = angles(shot.origin, shot.intercept);
+                    const bool blocked = arena.blocksLine(shot.origin, shot.target);
+                    const auto aim = clamp_hit_pitch(shot.origin, shot.intercept, *target.position,
+                                                     target.attack_height, min_pitch_, max_pitch_);
+                    if (!aim) continue;
                     const double full_charge = std::max(0.15, number(*slot.stats, "charge", 0.75));
                     const double min_charge = number(*slot.stats, "min_charge", 0.15);
                     const double base_dmg = number(*slot.stats, "damage", 315.0);
                     const double cookoff = target.has_mortar ? 1.6 : 1.0;
                     // Strict hitscan accuracy (0.80 * radius, 0 extra slack) so 100-280m beams never whiff!
-                    const bool aligned = aim_aligned(aim, actual, dist, target.attack_radius * 0.80, 0.0) &&
+                    const bool aligned = !blocked &&
+                                         aim_aligned(*aim, actual, dist, target.attack_radius * 0.80, 0.0) &&
                                          clear_aim_line(shot.origin, actual, dist, arena);
 
                     if (slot.charge > 0.0) {
@@ -1427,7 +1525,7 @@ std::optional<GunShot> ThreatTracker::visible_shot(const Json& obs, const Arena&
                         const double est_dmg = base_dmg * cube_mult * (0.35 + 0.65 * frac) * cookoff;
                         const bool ready_to_release = (slot.charge >= full_charge - 0.03) ||
                             (slot.charge >= min_charge && est_dmg >= hp * 1.02);
-                        laser_aim = aim;
+                        laser_aim = *aim;
                         laser_slot = slot.index;
                         laser_dist = dist;
                         if (ready_to_release && aligned) {
@@ -1439,17 +1537,22 @@ std::optional<GunShot> ThreatTracker::visible_shot(const Json& obs, const Arena&
                             laser_releasing = true;
                             laser_bonus = 200.0;
                         } else {
-                            // Keep holding charge (up to hold_s = 2.0s after full charge) until aim locks dead-center.
+                            // Keep holding charge (up to hold_s = 2.0s after full charge) until LOS opens & aim locks!
                             laser_trigger = slot.charge < full_charge + 1.5;
-                            laser_bonus = 140.0 + (target.has_mortar ? 140.0 : 0.0);
+                            laser_bonus = (blocked ? 90.0 : 140.0) + (target.has_mortar ? 140.0 : 0.0);
                         }
-                    } else if (slot.ready && allow_laser_charge && !is_npc && !enemy_holds_lightning_close &&
-                               (target.has_mortar || dist > 62.0 || !gun_is_ready || !target.facing_us)) {
-                        laser_aim = aim;
-                        laser_slot = slot.index;
-                        laser_dist = dist;
-                        laser_trigger = true;
-                        laser_bonus = (target.has_mortar ? 170.0 : 45.0);
+                    } else if (slot.ready && allow_laser_charge && !enemy_holds_lightning_close) {
+                        const bool allow_npc_laser = is_npc && !has_gun_slot && !blocked && dist > own_light_range;
+                        const bool can_precharge = !is_npc && blocked && precharge_laser && dist >= 22.0 && dist <= 220.0;
+                        const bool want_direct_laser = !is_npc && !blocked &&
+                            (target.has_mortar || !has_gun_slot || dist > 62.0 || !gun_is_ready || !target.facing_us);
+                        if (want_direct_laser || can_precharge || allow_npc_laser) {
+                            laser_aim = *aim;
+                            laser_slot = slot.index;
+                            laser_dist = dist;
+                            laser_trigger = true;
+                            laser_bonus = (target.has_mortar ? 185.0 : (can_precharge ? 70.0 : 50.0));
+                        }
                     }
                 } else if (slot.kind == "mortar" && slot.ready && !is_npc) {
                     const double speed = number(*slot.stats, "speed", 72.0);
@@ -1466,7 +1569,7 @@ std::optional<GunShot> ThreatTracker::visible_shot(const Json& obs, const Arena&
                         (target_speed < 4.5 && dist >= 22.0 && dist <= 130.0);
                     if (!high_value_mortar) continue;
                     const Vec3 lead_target = mortar_lead_target(mortar_origin, aim_target, *target.attack_velocity, speed);
-                    if (const auto m_aim = mortar_solution(mortar_origin, lead_target, speed, grav, arena)) {
+                    if (const auto m_aim = mortar_solution(mortar_origin, lead_target, speed, grav, arena, min_pitch_, max_pitch_)) {
                         const double lead_dist = distanceXY(mortar_origin, lead_target);
                         // Compute exact ballistic pitch tolerance from range sensitivity dR/dpitch!
                         const double dR_dpitch = std::abs(2.0 * (speed * speed / std::max(1.0, grav)) * std::cos(2.0 * (*m_aim)[1]));
@@ -1637,6 +1740,10 @@ std::optional<GunShot> ThreatTracker::visible_shot(const Json& obs, const Arena&
     int light_slot = -1;
     double light_range = 42.0;
     bool light_spare_ready = false;
+    int laser_crate_slot = -1;
+    double laser_crate_charge = 0.0;
+    double laser_crate_full = 0.75;
+    bool laser_crate_ready = false;
     for (std::size_t s = 0; s < slot_count; ++s) {
         if (slots[s].kind == "gun") {
             gun_slot = slots[s].index;
@@ -1645,12 +1752,20 @@ std::optional<GunShot> ThreatTracker::visible_shot(const Json& obs, const Arena&
         } else if (slots[s].kind == "lightning") {
             light_slot = slots[s].index;
             light_range = slots[s].range;
-            light_spare_ready = slots[s].ready && my_energy > 45.0;
+            light_spare_ready = slots[s].ready && my_energy > (has_gun_slot ? 45.0 : 22.0);
+        } else if (slots[s].kind == "laser" && !has_gun_slot && allow_laser_charge) {
+            laser_crate_slot = slots[s].index;
+            laser_crate_charge = slots[s].charge;
+            laser_crate_full = std::max(0.15, number(*slots[s].stats, "charge", 0.75));
+            laser_crate_ready = slots[s].ready || slots[s].charge > 0.0;
         }
     }
     const auto& crates = field(obs, "crates");
-    if ((gun_spare_ready || light_spare_ready) && crates.is_array()) {
+    if ((gun_spare_ready || light_spare_ready || laser_crate_ready) && crates.is_array()) {
         const Vec3 origin = muzzle(me);
+        const double max_crate_range = std::max({gun_spare_ready ? gun_range : 0.0,
+                                                 light_spare_ready ? light_range : 0.0,
+                                                 laser_crate_ready ? 70.0 : 0.0});
         double nearest_crate = std::numeric_limits<double>::infinity();
         for (const auto& crate : crates) {
             if (Clock::now() >= deadline) {
@@ -1658,21 +1773,28 @@ std::optional<GunShot> ThreatTracker::visible_shot(const Json& obs, const Arena&
             }
             const auto pos = try_point(field(crate, "pos"));
             if (!pos) continue;
-            const Vec3 center = above(*pos, 1.5);
+            const Vec3 center = above(*pos, 1.4);
             const double dist = distance_3d(origin, center);
-            if (dist > gun_range || dist >= nearest_crate || arena.blocksLine(origin, center)) {
+            if (dist > max_crate_range || dist >= nearest_crate || arena.blocksLine(origin, center)) {
                 continue;
             }
-            const Vec2 aim = angles(origin, center);
+            const auto aim = clamp_hit_pitch(origin, center, *pos, 2.4, min_pitch_, max_pitch_);
+            if (!aim) continue;
             GunShot gs;
-            gs.aim = aim;
-            if (gun_slot >= 0 && gun_spare_ready) {
+            gs.aim = *aim;
+            if (gun_slot >= 0 && gun_spare_ready && dist <= gun_range) {
                 gs.fire[static_cast<std::size_t>(gun_slot)] =
-                    aim_aligned(aim, actual, dist, 1.8) && clear_aim_line(origin, actual, dist, arena);
+                    aim_aligned(*aim, actual, dist, 1.8) && clear_aim_line(origin, actual, dist, arena);
             }
             if (light_slot >= 0 && light_spare_ready && dist <= light_range &&
-                std::abs(std::remainder(aim[0] - actual[0], Tau)) <= radians(13.0)) {
+                std::abs(std::remainder((*aim)[0] - actual[0], Tau)) <= radians(13.0)) {
                 gs.fire[static_cast<std::size_t>(light_slot)] = true;
+            } else if (laser_crate_slot >= 0 && laser_crate_ready && dist > light_range && dist <= 70.0) {
+                const bool aligned = aim_aligned(*aim, actual, dist, 1.3, 0.0) &&
+                    clear_aim_line(origin, actual, dist, arena);
+                // Charge laser to one-shot 300 HP crate (315 dmg at full charge) and release when aligned!
+                const bool release = laser_crate_charge >= laser_crate_full - 0.03 && aligned;
+                gs.fire[static_cast<std::size_t>(laser_crate_slot)] = !release;
             }
             gs.crate = true;
             best = gs;
