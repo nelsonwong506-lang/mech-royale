@@ -12,7 +12,7 @@
 namespace mr {
 namespace {
 
-constexpr double rotationReserve = 9.5;
+constexpr double rotationReserve = 7.0;
 constexpr double infinity = std::numeric_limits<double>::infinity();
 constexpr double tau = 6.283185307179586;
 
@@ -181,7 +181,7 @@ std::optional<double> frontArmorYaw(const Vec3& from, const std::vector<EnemyInf
     double sumX = 0.0, sumY = 0.0;
     for (const auto& e : enemies) {
         const double dist = distanceXY(from, e.pos);
-        if (dist > 240.0 || wallCover(from, e.pos, ownHeight, arena) == 3) {
+        if (dist > 180.0 || wallCover(from, e.pos, ownHeight, arena) == 3) {
             continue;
         }
         const double weight = (e.facing_us ? 2.5 : 1.0) * (e.charging ? 2.0 : 1.0) / std::max(10.0, dist);
@@ -298,62 +298,40 @@ std::optional<CombatMove> planCombatPosition(const Vec3& from, const Threat& pri
     const bool enemyFinishable = primary.hp <= 420.0 && hpFrac >= 0.25;
     const bool defensive = ctx.wantRegen || ctx.reloading || (hpFrac < 0.38 && !enemyFinishable);
 
-    // Pick our focus target FIRST so weapon-triangle counterplay adapts to the exact target we're engaging!
+    // Choose optimal combat distance based on OUR equipped weapons and enemy loadout.
+    double optimalRange = 42.0;
+    if (ctx.hasLightning && ctx.energy >= 18.0 && !primary.has_mortar) {
+        optimalRange = enemyFinishable ? 24.0 : 31.0;
+    } else if (ctx.hasLaser && !ctx.hasLightning) {
+        optimalRange = 75.0;
+    } else if (ctx.hasMortar && !ctx.hasLightning) {
+        optimalRange = 55.0;
+    } else if (enemyFinishable) {
+        optimalRange = 28.0;
+    }
+    if (primary.has_lightning && !(ctx.hasLightning && enemyFinishable)) {
+        optimalRange = std::max(optimalRange, 52.0);
+    }
+
+    // Pick our focus target (weakest close enemy to isolate in 1vMany cover-splitting).
     Vec3 focusPos = *origin;
     double focusHeight = primary.attack_height;
     int focusId = primary.actor_id.value_or(-1);
-    bool focusHasLightning = primary.has_lightning;
-    bool focusHasLaser = primary.has_laser;
-    bool focusHasMortar = primary.has_mortar;
-    double focusHp = primary.hp;
     if (multiEnemy && !defensive) {
         double bestFocus = -infinity;
         for (const auto* e : nearby) {
             const double d = distanceXY(from, e->pos);
             if (d > 110.0) continue;
-            const double s = (1400.0 - std::min(1400.0, e->hp)) * 0.25 - d +
-                (e->charging ? 120.0 : 0.0) + (ctx.hasLaser && e->has_mortar ? 110.0 : 0.0);
+            const double s = (1400.0 - std::min(1400.0, e->hp)) * 0.25 - d + (e->charging ? 120.0 : 0.0);
             if (s > bestFocus) {
                 bestFocus = s;
                 focusPos = e->pos;
                 focusHeight = e->height;
                 focusId = e->id;
-                focusHasLightning = e->has_lightning;
-                focusHasLaser = e->has_laser;
-                focusHasMortar = e->has_mortar;
-                focusHp = e->hp;
             }
         }
     }
     const Vec3 focusTorso{focusPos[0], focusPos[1], focusPos[2] + focusHeight * 0.5};
-    const double startFocusDist = distanceXY(from, focusPos);
-    const bool focusFinishable = focusHp <= 420.0 && hpFrac >= 0.25;
-
-    // Weapon-Triangle optimal distance counterplay:
-    // - Laser vs Mortar: hold 85m for +60% Cook-off (504+ dmg) outside easy mortar range!
-    // - Lightning vs Laser: close in to lightningRange - 9m ONLY when already near range (<= lightningRange + 6m) or finishable!
-    // - Mortar vs Lightning: hold 48m to knockback + drain 45 energy outside arc range!
-    double optimalRange = 42.0;
-    const double safeLightIn = std::max(20.0, ctx.lightningRange - 9.0);
-    if (ctx.hasLaser && focusHasMortar && !ctx.hasLightning) {
-        optimalRange = 85.0;
-    } else if (ctx.hasLightning && focusHasLaser && !multiEnemy && hpFrac >= 0.50 && ctx.energy >= 22.0 &&
-               (startFocusDist <= ctx.lightningRange + 6.0 || focusFinishable)) {
-        optimalRange = safeLightIn;
-    } else if (focusHasLightning && ctx.hasMortar && !ctx.hasLightning) {
-        optimalRange = 48.0;
-    } else if (ctx.hasLightning && ctx.energy >= 18.0 && !focusHasMortar) {
-        optimalRange = focusFinishable ? std::max(18.0, safeLightIn - 6.0) : std::min(31.0, safeLightIn);
-    } else if (ctx.hasLaser && !ctx.hasLightning) {
-        optimalRange = 75.0;
-    } else if (ctx.hasMortar && !ctx.hasLightning) {
-        optimalRange = 55.0;
-    } else if (focusFinishable) {
-        optimalRange = 28.0;
-    }
-    if (focusHasLightning && !(ctx.hasLightning && focusFinishable)) {
-        optimalRange = std::max(optimalRange, 54.0);
-    }
 
     // Compute pinch escape vector (away from enemy centroid) so we break out of flanks.
     double enemySumX = 0.0, enemySumY = 0.0, enemyWeightSum = 0.0;
@@ -509,15 +487,10 @@ std::optional<CombatMove> planCombatPosition(const Vec3& from, const Threat& pri
             ? 3.8 * (moveDir[0] * ctx.velocity[0] + moveDir[1] * ctx.velocity[1]) / velSpeed
             : 0.0;
 
-        // Incoming bullet sidestep bias + visible enemy laser aim-ray dodge.
-        double dodgeBonus = ctx.bulletDodge
+        // Incoming bullet sidestep bias.
+        const double dodgeBonus = ctx.bulletDodge
             ? 14.0 * (moveDir[0] * (*ctx.bulletDodge)[0] + moveDir[1] * (*ctx.bulletDodge)[1])
             : 0.0;
-        for (const auto* e : nearby) {
-            if (e->charging && e->aim && wallCover(*point, e->pos, motion.height, arena) < 3) {
-                dodgeBonus += 15.0 * std::abs(std::sin(moveYaw - (*e->aim)[0]));
-            }
-        }
 
         // Rooftop high-ground retention: don't accidentally step off a roof while fighting ground bots!
         const bool staysElevated = ctx.onRoof && (*point)[2] >= from[2] - 1.5;
@@ -545,12 +518,11 @@ std::optional<CombatMove> planCombatPosition(const Vec3& from, const Threat& pri
             }
         }
 
-        const double progressWeight = zone.inNext(from, motion.radius + 8.0) ? 0.04 : 0.32;
         const double score = exposureScore + pinchBonus + repositionBonus + momentumBonus + dodgeBonus +
             roofBonus + pullBonus +
             (defensive ? 3.5 : 8.0) * lateral + (preferredSide ? 2.5 : 0.0) -
             (defensive ? 0.15 : 0.45) * rangeError - weaponDangerPenalty - rearRiskPenalty -
-            0.55 * otherApproachPenalty + progressWeight * progress + 0.025 * std::min(40.0, clearance);
+            0.55 * otherApproachPenalty + 0.32 * progress + 0.025 * std::min(40.0, clearance);
 
         if (score > bestScore) {
             bestScore = score;
@@ -563,7 +535,7 @@ std::optional<CombatMove> planCombatPosition(const Vec3& from, const Threat& pri
     };
 
     const std::array<double, 4> roofLengths{2.8, 5.5, 9.0, 14.0};
-    const std::array<double, 4> groundLengths{3.2, 6.5, 11.5, 18.0};
+    const std::array<double, 4> groundLengths{9.0, 15.0, 21.0, 5.5};
     const auto& stepLengths = ctx.onRoof ? roofLengths : groundLengths;
     for (const double length : stepLengths) {
         for (const int offset : baseOffsets) {

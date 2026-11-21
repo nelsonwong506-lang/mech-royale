@@ -80,16 +80,6 @@ struct SoundAlert {
     bool near_reload = false;
 };
 
-struct SoundContact {
-    double bearing = 0.0;
-    double est_dist = 45.0;
-    std::string weapon;
-    bool near = false;
-    bool laser_charging = false;
-    bool jet = false;
-    double expires = -std::numeric_limits<double>::infinity();
-};
-
 class ThreatTracker {
 public:
     explicit ThreatTracker(const Json& config);
@@ -108,13 +98,9 @@ public:
     std::vector<EnemyInfo> visible_enemies(const Json& obs, const Arena& arena) const;
     std::optional<ProjectileDodge> projectile_dodge(const Json& obs, const Arena& arena) const;
     std::optional<SoundAlert> sound_alert(double now) const;
-    std::vector<SoundContact> unseen_sound_contacts(const Json& obs,
-                                                    const std::vector<EnemyInfo>& visible) const;
     bool can_collect_cubes(const Json& obs) const;
     double last_combat_time() const;
     double last_damage_time() const;
-    bool laser_shorted(double now) const;
-    std::optional<double> rear_hit_bearing(double now) const;
     std::optional<double> sound_heading(double now) const;
 
 private:
@@ -141,21 +127,15 @@ private:
     double sound_until_ = -std::numeric_limits<double>::infinity();
     std::optional<SoundAlert> sound_alert_;
     double sound_alert_until_ = -std::numeric_limits<double>::infinity();
-    std::vector<SoundContact> sound_contacts_{};
     double last_damage_at_ = -std::numeric_limits<double>::infinity();
     double last_hit_dealt_at_ = -std::numeric_limits<double>::infinity();
     double last_hostile_damage_at_ = -std::numeric_limits<double>::infinity();
     double last_duel_at_ = -std::numeric_limits<double>::infinity();
-    double laser_shorted_until_ = -std::numeric_limits<double>::infinity();
-    std::optional<double> rear_hit_bearing_;
-    double rear_hit_until_ = -std::numeric_limits<double>::infinity();
     double mech_radius_;
     double mech_height_;
     double muzzle_height_;
     double turn_rate_;
     double pitch_rate_;
-    double min_pitch_;
-    double max_pitch_;
     double size_per_cube_;
     double damage_per_cube_;
     double cube_stat_cap_;

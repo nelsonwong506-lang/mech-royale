@@ -31,11 +31,9 @@ struct CombatContext {
     double maxEnergy = 100.0;
     double muzzleHeight = 7.0;
     double strafeSign = 1.0;
-    bool hasGun = true;
     bool hasLightning = false;
     bool hasLaser = false;
     bool hasMortar = false;
-    double lightningRange = 45.0;
     bool laserCharging = false;
     bool reloading = false;
     bool wantRegen = false;
