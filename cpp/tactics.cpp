@@ -858,7 +858,7 @@ std::optional<Threat> ThreatTracker::update(const Json& obs, const Arena& arena,
                     sound_alert_->bearing + 0.55 * std::remainder(fresh_alert->bearing - sound_alert_->bearing, Tau), Tau);
             }
             sound_alert_ = fresh_alert;
-            sound_alert_until_ = now + (fresh_alert->laser_charge ? 1.1 : fresh_alert->near_reload ? 1.8 : 1.0);
+            sound_alert_until_ = now + (fresh_alert->laser_charge ? 0.60 : 0.75);
         }
     }
 
