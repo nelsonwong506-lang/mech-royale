@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.hpp"
+#include "tactics.hpp"
 
 #include <optional>
 #include <vector>
@@ -10,7 +11,6 @@ namespace mr {
 class Arena;
 class Navigator;
 struct Motion;
-struct Threat;
 struct Zone;
 
 struct RotationWindow {
@@ -22,6 +22,31 @@ struct RotationWindow {
 struct RetreatPlan {
     Vec3 target;
     bool hardCover;
+};
+
+struct CombatContext {
+    double hp = 1400.0;
+    double maxHp = 1400.0;
+    double energy = 100.0;
+    double maxEnergy = 100.0;
+    double muzzleHeight = 7.0;
+    double strafeSign = 1.0;
+    bool hasLightning = false;
+    bool hasLaser = false;
+    bool hasMortar = false;
+    bool laserCharging = false;
+    bool reloading = false;
+    bool wantRegen = false;
+    bool needReposition = false;
+    Vec3 anchor{};
+};
+
+struct CombatMove {
+    Vec3 target;
+    bool boost = false;
+    bool hardCover = false;
+    int exposedCount = 0;
+    const char* label = "engage";
 };
 
 struct DefensiveHop {
@@ -36,13 +61,16 @@ RotationWindow rotationWindow(const Vec3& from, const Zone& zone, const Motion& 
 bool avoidsApproach(const Vec3& from, const Vec2& toward, const std::vector<Vec3>& enemies);
 double approachPenalty(const Vec3& from, const Vec2& toward, const std::vector<Vec3>& enemies);
 int wallCover(const Vec3& feet, const Vec3& threat, double ownHeight, const Arena& arena);
+std::optional<double> frontArmorYaw(const Vec3& from, const std::vector<EnemyInfo>& enemies,
+                                    double ownHeight, const Arena& arena);
 std::optional<RetreatPlan> planRetreat(const Vec3& from, const Threat& threat, const std::vector<Vec3>& enemies,
                                        const Zone& zone, const Motion& motion, const Arena& arena,
                                        Navigator& navigator, Clock::time_point deadline);
-std::optional<Vec3> planEngageStep(const Vec3& from, const Threat& threat, const std::vector<Vec3>& enemies,
-                                   const Zone& zone, const Motion& motion, const Arena& arena,
-                                   Navigator& navigator, double desiredRange, double strafeSign,
-                                   double muzzleHeight, Clock::time_point deadline);
+std::optional<CombatMove> planCombatPosition(const Vec3& from, const Threat& primary,
+                                             const std::vector<EnemyInfo>& enemies,
+                                             const CombatContext& ctx, const Zone& zone,
+                                             const Motion& motion, const Arena& arena,
+                                             Navigator& navigator, Clock::time_point deadline);
 std::optional<DefensiveHop> planDefensiveHop(const Json& me, const Threat& threat,
                                              const std::vector<Vec3>& enemies, const Zone& zone,
                                              const Motion& motion, const Arena& arena, Navigator& navigator,

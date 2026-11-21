@@ -90,6 +90,54 @@ std::string toLowerText(const Json& item) {
     return raw;
 }
 
+int weaponPriority(std::string_view kind) {
+    if (kind == "lightning") return 100;
+    if (kind == "laser") return 75;
+    if (kind == "mortar") return 55;
+    if (kind == "gun") return 10;
+    return 0;
+}
+
+int upgradePriority(const Json& choice) {
+    if (choice.is_object()) {
+        const auto idIt = choice.find("id");
+        if (idIt != choice.end() && idIt->is_string()) {
+            const std::string_view id = idIt->get_ref<const std::string&>();
+            if (id == "nanites") return 100;
+            if (id == "armor") return 96;
+            if (id == "plating") return 92;
+            if (id == "lightning_efficiency") return 90;
+            if (id == "lightning_chain") return 88;
+            if (id == "lightning_range") return 86;
+            if (id == "gun_damage") return 84;
+            if (id == "gun_rate") return 82;
+            if (id == "laser_charge") return 80;
+            if (id == "laser_damage") return 79;
+            if (id == "gun_mag") return 78;
+            if (id == "servos") return 76;
+            if (id == "laser_pierce") return 72;
+            if (id == "reactor") return 70;
+            if (id == "jets") return 65;
+            if (id == "mortar_reload") return 64;
+            if (id == "capacitor") return 62;
+            if (id == "mortar_splash") return 62;
+            if (id == "mortar_velocity") return 58;
+            if (id == "gun_velocity") return 56;
+            if (id == "gyros") return 52;
+            if (id == "sensors") return 48;
+        }
+    }
+    const std::string desc = toLowerText(choice);
+    int score = 0;
+    if (desc.find("nanite") != std::string::npos || desc.find("regen") != std::string::npos) score += 50;
+    if (desc.find("hp") != std::string::npos || desc.find("health") != std::string::npos ||
+        desc.find("armor") != std::string::npos || desc.find("plating") != std::string::npos) score += 40;
+    if (desc.find("lightning") != std::string::npos || desc.find("damage") != std::string::npos ||
+        desc.find("fire rate") != std::string::npos || desc.find("gun") != std::string::npos) score += 35;
+    if (desc.find("speed") != std::string::npos || desc.find("reload") != std::string::npos) score += 20;
+    return score;
+}
+
 int chooseOfferPick(const Json& offer) {
     const Json* choices = nullptr;
     if (offer.is_array() && !offer.empty()) {
@@ -109,26 +157,7 @@ int chooseOfferPick(const Json& offer) {
     int bestIndex = 0;
     int bestScore = std::numeric_limits<int>::min();
     for (std::size_t i = 0; i < choices->size(); ++i) {
-        const std::string desc = toLowerText((*choices)[i]);
-        int score = 0;
-        if (desc.find("hp") != std::string::npos || desc.find("health") != std::string::npos ||
-            desc.find("heal") != std::string::npos || desc.find("armor") != std::string::npos ||
-            desc.find("shield") != std::string::npos) {
-            score += 40;
-        }
-        if (desc.find("damage") != std::string::npos || desc.find("dps") != std::string::npos ||
-            desc.find("gun") != std::string::npos || desc.find("fire") != std::string::npos ||
-            desc.find("rate") != std::string::npos) {
-            score += 35;
-        }
-        if (desc.find("speed") != std::string::npos || desc.find("move") != std::string::npos ||
-            desc.find("boost") != std::string::npos || desc.find("reload") != std::string::npos) {
-            score += 20;
-        }
-        if (desc.find("energy") != std::string::npos || desc.find("range") != std::string::npos ||
-            desc.find("ammo") != std::string::npos) {
-            score += 12;
-        }
+        const int score = upgradePriority((*choices)[i]);
         if (score > bestScore) {
             bestScore = score;
             bestIndex = static_cast<int>(i);
@@ -144,7 +173,9 @@ public:
           arena_(hello.at("map").at("dir").get<std::string>(),
                  hello.at("map").value("files", std::vector<std::string>{})),
           navigator_(arena_), threats_(config_),
-          pickupRadius_(config_.value("cubes", Json::object()).value("pickup_radius", 3.5)) {}
+          pickupRadius_(config_.value("cubes", Json::object()).value("pickup_radius", 3.5)),
+          lootPickupRadius_(config_.value("loot", Json::object()).value("pickup_radius", 4.0)),
+          cubeStatCap_(config_.value("cubes", Json::object()).value("stat_cap", 10.0)) {}
 
     Json act(const Json& obs, Clock::time_point tickStarted) {
         const auto hardDeadline = tickStarted + 30ms;
@@ -159,16 +190,46 @@ public:
         const Motion motion(stats);
         const double muzzleHeight = stats.value("muzzle_height", 7.0);
 
-        const auto threat = threats_.update(obs, arena_, std::min(hardDeadline, Clock::now() + 8ms));
+        const auto threat = threats_.update(obs, arena_, std::min(hardDeadline, Clock::now() + 7ms));
         const bool underThreat = threat && (threat->hostile || threat->damaged_recently || threat->laser_charging);
-        // Skip O(N^2) duel detection while under direct threat (canJoin is always false then).
         const auto duel = !underThreat
-            ? threats_.duel_target(obs, arena_, std::min(hardDeadline, Clock::now() + 4ms))
+            ? threats_.duel_target(obs, arena_, std::min(hardDeadline, Clock::now() + 3ms))
             : std::nullopt;
+        const auto enemyInfos = threats_.visible_enemies(obs, arena_);
         const auto enemies = localEnemies(obs, start, threat, motion.height);
-        const auto allNearby = allVisibleEnemies(obs, start);
-        const auto decision = choose(obs, start, zone, motion, muzzleHeight, threat, enemies, allNearby,
-                                     tickStarted, hardDeadline);
+
+        const bool inZone = me.value("in_zone", false);
+        const double hp = me.value("hp", 1400.0);
+        const double maxHp = std::max(1.0, me.value("max_hp", 1400.0));
+        const double hpFrac = hp / maxHp;
+        const auto window = rotationWindow(start, zone, motion, routeEstimate_);
+
+        // Hysteresis for out-of-combat health regeneration (45-115 HP/s after 2-5s without dealing/taking dmg).
+        const bool finishableClose = threat && threat->position && threat->hp <= 360.0 &&
+            distanceXY(start, *threat->position) <= 65.0 && hpFrac >= 0.28;
+        if (!inZone || window.urgent || hpFrac >= 0.85 || finishableClose) {
+            regenMode_ = false;
+        } else if (hpFrac < 0.58) {
+            regenMode_ = true;
+        }
+
+        int exposedNow = 0;
+        for (const auto& e : enemyInfos) {
+            if (distanceXY(start, e.pos) <= 185.0 && wallCover(start, e.pos, motion.height, arena_) < 3) {
+                ++exposedNow;
+            }
+        }
+
+        // Track anchor staleness to encourage frequent tactical repositioning during multi-enemy kiting.
+        if (!combatAnchor_ || distanceXY(start, *combatAnchor_) > 10.0) {
+            combatAnchor_ = start;
+            anchorSetAt_ = now;
+        }
+        const bool needReposition = (now - anchorSetAt_ >= 1.65) ||
+            (now - threats_.last_damage_time() <= 0.35);
+
+        const auto decision = choose(obs, start, zone, motion, muzzleHeight, threat, enemies, enemyInfos,
+                                     exposedNow, needReposition, tickStarted, hardDeadline);
         const auto& command = decision.command;
 
         Json action = {
@@ -176,22 +237,45 @@ public:
             {"boost", command.boost},
             {"jump", command.jump},
         };
-        const bool inZone = me.value("in_zone", false);
-        const bool canJoin = duel && !underThreat && !peek_ && !hop_ && inZone &&
-            !rotationWindow(start, zone, motion, routeEstimate_).urgent;
-        const bool joining = decision.fireAllowed && canJoin && opportunity_fire(obs, duel, arena_);
-        const bool defending = decision.fireAllowed && return_fire(obs, threat, command.move, arena_, decision.returningToCover);
-        const bool allowCrates = !underThreat && inZone && !peek_ && !hop_;
-        const auto shotDeadline = std::min(tickStarted + 34ms, Clock::now() + 5ms);
-        const auto shot = decision.fireAllowed && !joining && !defending
-            ? threats_.visible_shot(obs, arena_, threat, shotDeadline, allowCrates)
-            : std::nullopt;
 
-        // Always pre-aim known threats (even behind cover / before peeking) instead of spinning scanAim.
-        const auto aim = shot ? std::optional{shot->aim}
-            : canJoin ? retreat_aim(obs, duel)
-            : (threat && threat->position) ? retreat_aim(obs, threat)
+        const auto& weapons = me.contains("weapons") && me["weapons"].is_array() ? me["weapons"] : Json::array();
+        const bool laserCharging = isLaserCharging(weapons);
+        const bool holdFireForRegen = regenMode_ && exposedNow == 0 && !laserCharging;
+        const bool effectiveFireAllowed = decision.fireAllowed && !holdFireForRegen;
+
+        const bool canJoin = duel && !underThreat && !regenMode_ && !peek_ && !hop_ && inZone && !window.urgent;
+        const bool joining = effectiveFireAllowed && canJoin && opportunity_fire(obs, duel, arena_);
+
+        const double myCubes = me.value("cubes", 0.0);
+        const bool needsSecondary = countHeldWeapons(weapons) < 2;
+        const bool allowCrates = !underThreat && !regenMode_ && inZone && !peek_ && !hop_ &&
+            (myCubes < cubeStatCap_ || needsSecondary);
+        const bool allowNpcs = !underThreat && !regenMode_ && inZone && !peek_ && !hop_ &&
+            !window.urgent && myCubes < cubeStatCap_;
+        const int closeCount = static_cast<int>(std::count_if(enemyInfos.begin(), enemyInfos.end(), [&](const EnemyInfo& e) {
+            return distanceXY(start, e.pos) <= 35.0;
+        }));
+        const bool allowLaserCharge = !window.urgent && inZone && !(threat && threat->laser_charging) &&
+            closeCount < 2 && !regenMode_;
+
+        const auto shotDeadline = std::min(tickStarted + 34ms, Clock::now() + 5ms);
+        const auto shot = (effectiveFireAllowed || laserCharging) && !joining
+            ? threats_.visible_shot(obs, arena_, threat, shotDeadline, allowCrates, allowNpcs, allowLaserCharge)
             : std::nullopt;
+        const bool defending = effectiveFireAllowed && !joining && !(shot && shot->firing()) && !laserCharging &&
+            return_fire(obs, threat, command.move, arena_, decision.returningToCover);
+
+        // Aim priority: active shot > duel > front-armor facing (prevents 1.5x rear dmg) > threat pre-aim > scan.
+        std::optional<Vec2> aim;
+        if (shot) {
+            aim = shot->aim;
+        } else if (canJoin) {
+            aim = retreat_aim(obs, duel);
+        } else if (const auto armorYaw = frontArmorYaw(start, enemyInfos, motion.height, arena_)) {
+            aim = Vec2{*armorYaw, 0.0};
+        } else if (threat && threat->position) {
+            aim = retreat_aim(obs, threat);
+        }
         if (aim) {
             action["aim"] = sanitizeAim(*aim);
         } else {
@@ -199,7 +283,6 @@ public:
         }
 
         std::array fire{false, false};
-        const auto& weapons = me.contains("weapons") && me["weapons"].is_array() ? me["weapons"] : Json::array();
         if (joining || defending) {
             for (std::size_t i = 0; i < std::min(fire.size(), weapons.size()); ++i) {
                 if (weapons[i].is_object() && weapons[i].value("kind", "") == std::string_view("gun")) {
@@ -208,29 +291,32 @@ public:
                     break;
                 }
             }
-        } else if (shot && shot->firing()) {
+        } else if (shot) {
             fire = shot->fire;
-            if (peek_ && !shot->crate) peek_->fired = true;
+            if (peek_ && !shot->crate && !shot->npc && shot->firing()) {
+                peek_->fired = true;
+            }
         }
         action["fire"] = fire;
 
-        const bool anyFire = fire[0] || fire[1];
-        const bool canReloadEarly = !canJoin && (!underThreat || shelteredAt_.has_value());
+        const bool anyFire = fire[0] || fire[1] || laserCharging;
+        const bool canReloadEarly = !canJoin && (!underThreat || shelteredAt_.has_value() || exposedNow == 0);
         bool shouldReload = false;
         if (!anyFire) {
             shouldReload = std::any_of(weapons.begin(), weapons.end(), [canReloadEarly](const Json& weapon) {
                 if (!weapon.is_object() || weapon.value("reload", 0.0) > 0.0) {
                     return false;
                 }
-                const auto kind = weapon.value("kind", std::string{});
-                const double ammo = weapon.value("ammo", 0.0);
-                if (kind == "gun") {
-                    return ammo <= (canReloadEarly ? 3.0 : 0.0);
+                if (weapon.value("kind", "") == std::string_view("gun")) {
+                    return weapon.value("ammo", 0.0) <= (canReloadEarly ? 4.0 : 0.0);
                 }
-                return canReloadEarly && ammo <= 0.0;
+                return false;
             });
         }
         action["reload"] = shouldReload;
+
+        // Explicit weapon pickup / upgrade swap (protocol.md §7: must send "take": id within 4 m).
+        attachWeaponTake(obs, me, weapons, start, laserCharging, action);
 
         if (const auto offerIt = obs.find("offer"); offerIt != obs.end() && !offerIt->is_null()) {
             action["pick"] = chooseOfferPick(*offerIt);
@@ -254,6 +340,111 @@ private:
         return std::nullopt;
     }
 
+    static bool hasWeaponKind(const Json& weapons, std::string_view kind) {
+        if (!weapons.is_array()) return false;
+        return std::any_of(weapons.begin(), weapons.end(), [kind](const Json& w) {
+            return w.is_object() && w.value("kind", "") == kind;
+        });
+    }
+
+    static int countHeldWeapons(const Json& weapons) {
+        if (!weapons.is_array()) return 0;
+        int count = 0;
+        for (const auto& w : weapons) {
+            if (w.is_object()) ++count;
+        }
+        return count;
+    }
+
+    static bool isLaserCharging(const Json& weapons) {
+        if (!weapons.is_array()) return false;
+        return std::any_of(weapons.begin(), weapons.end(), [](const Json& w) {
+            return w.is_object() && w.value("kind", "") == std::string_view("laser") &&
+                w.value("charge", 0.0) > 0.0;
+        });
+    }
+
+    static bool isGunReloading(const Json& weapons) {
+        if (!weapons.is_array()) return false;
+        return std::any_of(weapons.begin(), weapons.end(), [](const Json& w) {
+            return w.is_object() && w.value("kind", "") == std::string_view("gun") &&
+                (w.value("reload", 0.0) > 0.15 || w.value("ammo", 1.0) <= 0.0);
+        });
+    }
+
+    static bool hasReadySecondary(const Json& weapons, double energy) {
+        if (!weapons.is_array()) return false;
+        for (const auto& w : weapons) {
+            if (!w.is_object()) continue;
+            const auto kind = w.value("kind", std::string{});
+            if (kind == "gun") continue;
+            if (w.value("cooldown", 0.0) <= 0.15) {
+                if (kind != "lightning" || energy >= 6.0) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    void attachWeaponTake(const Json& obs, const Json& me, const Json& weapons,
+                          const Vec3& start, bool laserCharging, Json& action) const {
+        (void)me;
+        const auto it = obs.find("pickups");
+        if (it == obs.end() || !it->is_array() || it->empty()) {
+            return;
+        }
+        int emptySlot = -1;
+        if (weapons.is_array()) {
+            for (std::size_t i = 0; i < 2; ++i) {
+                if (i >= weapons.size() || weapons[i].is_null()) {
+                    emptySlot = static_cast<int>(i);
+                    break;
+                }
+            }
+        }
+        int slot1Prio = 0;
+        if (weapons.is_array() && weapons.size() >= 2 && weapons[1].is_object()) {
+            slot1Prio = weaponPriority(weapons[1].value("kind", std::string{}));
+        }
+
+        int bestId = -1;
+        int bestPrio = 0;
+        bool needDrop1 = false;
+        for (const auto& p : *it) {
+            if (!p.is_object()) continue;
+            const auto pos = safeVec3(p, "pos", {infinity, infinity, 0.0});
+            if (!std::isfinite(pos[0])) continue;
+            if (distanceXY(start, pos) > lootPickupRadius_ - 0.05 || std::abs(start[2] - pos[2]) > 3.9) {
+                continue;
+            }
+            const auto kind = p.value("kind", std::string{});
+            if (kind.empty() || kind == "gun" || hasWeaponKind(weapons, kind)) {
+                continue;
+            }
+            const int prio = weaponPriority(kind);
+            if (prio <= bestPrio) continue;
+            const auto idIt = p.find("id");
+            if (idIt == p.end() || !idIt->is_number()) continue;
+            const int pid = static_cast<int>(idIt->get<double>());
+            if (emptySlot >= 0) {
+                bestId = pid;
+                bestPrio = prio;
+                needDrop1 = false;
+            } else if (!laserCharging && prio > slot1Prio) {
+                bestId = pid;
+                bestPrio = prio;
+                needDrop1 = true;
+            }
+        }
+        if (bestId >= 0) {
+            action["take"] = bestId;
+            if (needDrop1) {
+                action["drop"] = 1;
+            }
+        }
+    }
+
     std::vector<Vec3> localEnemies(const Json& obs, const Vec3& start,
                                    const std::optional<Threat>& threat, double ownHeight) const {
         std::vector<Vec3> enemies;
@@ -269,7 +460,6 @@ private:
                 const auto point = safeVec3(actor, "pos", {infinity, infinity, 0.0});
                 if (!std::isfinite(point[0])) continue;
                 const double dist = distanceXY(start, point);
-                // Ignore distant enemies fully occluded behind solid buildings so they don't block movement.
                 if (dist <= 35.0 || (dist <= 95.0 && wallCover(start, point, ownHeight, arena_) < 3)) {
                     enemies.push_back(point);
                 }
@@ -282,34 +472,6 @@ private:
             enemies.push_back(*threat->position);
         }
         return enemies;
-    }
-
-    static std::vector<Vec3> allVisibleEnemies(const Json& obs, const Vec3& start) {
-        std::vector<Vec3> enemies;
-        const auto selfId = selfIdOf(obs);
-        const auto mechsIt = obs.find("mechs");
-        if (mechsIt != obs.end() && mechsIt->is_array()) {
-            for (const auto& actor : *mechsIt) {
-                if (!actor.is_object() || actor.value("kind", "") != std::string_view("mech")) continue;
-                if (selfId && actor.contains("id") && actor["id"].is_number() &&
-                    static_cast<int>(actor["id"].get<double>()) == *selfId) {
-                    continue;
-                }
-                const auto point = safeVec3(actor, "pos", {infinity, infinity, 0.0});
-                if (std::isfinite(point[0]) && distanceXY(start, point) <= 235.0) {
-                    enemies.push_back(point);
-                }
-            }
-        }
-        return enemies;
-    }
-
-    static bool hasWeaponKind(const Json& me, std::string_view kind) {
-        const auto it = me.find("weapons");
-        if (it == me.end() || !it->is_array()) return false;
-        return std::any_of(it->begin(), it->end(), [kind](const Json& w) {
-            return w.is_object() && w.value("kind", "") == kind;
-        });
     }
 
     Vec2 scanAim(const Json& me, const Vec2& move, double now) {
@@ -380,8 +542,10 @@ private:
 
     Decision choose(const Json& obs, const Vec3& start, const Zone& zone, const Motion& motion,
                     double muzzleHeight, const std::optional<Threat>& threat,
-                    const std::vector<Vec3>& enemies, const std::vector<Vec3>& allNearby,
+                    const std::vector<Vec3>& enemies, const std::vector<EnemyInfo>& enemyInfos,
+                    int exposedNow, bool needReposition,
                     Clock::time_point tickStarted, Clock::time_point hardDeadline) {
+        (void)exposedNow;
         const auto& me = obs.contains("self") && obs["self"].is_object() ? obs["self"] : Json::object();
         const auto phase = std::pair{zone.start, zone.end};
         if (rotationPhase_ != phase) {
@@ -408,60 +572,104 @@ private:
         }
 
         const bool inZone = me.value("in_zone", false);
+        const auto& weapons = me.contains("weapons") && me["weapons"].is_array() ? me["weapons"] : Json::array();
+
+        // Capture a landed supply drop if we are already inside its ring and not overwhelmed!
+        if (inZone && !window.urgent && !(threat && threat->laser_charging)) {
+            if (const auto cap = supplyDropCapture(obs, start, zone, motion, enemyInfos)) {
+                return *cap;
+            }
+        }
+
         if (threat && threat->position && !window.urgent && inZone) {
             const double threatDist = distanceXY(start, *threat->position);
-            const double hp = me.value("hp", 1400.0);
-            const double maxHp = std::max(1.0, me.value("max_hp", 1400.0));
-            const int closeCount = static_cast<int>(std::count_if(allNearby.begin(), allNearby.end(), [&](const Vec3& e) {
-                return distanceXY(start, e) <= 80.0;
-            }));
-            const bool enemyFinishable = threat->hp <= 420.0 && hp >= 0.25 * maxHp;
-            const bool strong1v1 = closeCount <= 1 && !threat->laser_charging &&
-                threat->actor_id.has_value() && threatDist <= 105.0 &&
-                (hp >= 0.45 * maxHp || enemyFinishable || threat->hp < hp * 0.6) &&
-                (threat->hostile || threatDist <= 65.0);
+            const bool activeCombat = threat->hostile || threat->damaged_recently ||
+                threat->laser_charging || threatDist <= 70.0 || regenMode_;
 
-            // Active 1v1 combat: kite/strafe with clear LOS to eliminate the hunter instead of hiding.
-            if (strong1v1 && !peek_) {
-                if (zone.now >= nextStrafeFlipAt_) {
+            if (activeCombat) {
+                if (zone.now >= nextStrafeFlipAt_ || (zone.now - threats_.last_damage_time() <= 0.15 && zone.now >= nextStrafeFlipAt_ - 0.8)) {
                     strafeSign_ = -strafeSign_;
-                    nextStrafeFlipAt_ = zone.now + 1.8;
+                    nextStrafeFlipAt_ = zone.now + 1.6;
                 }
-                const double desiredRange = hasWeaponKind(me, "lightning") ? 26.0
-                    : enemyFinishable ? 28.0 : 38.0;
-                const auto step = planEngageStep(start, *threat, enemies, zone, motion, arena_, navigator_,
-                                                 desiredRange, strafeSign_, muzzleHeight,
-                                                 std::min(hardDeadline, Clock::now() + 6ms));
-                if (step) {
+                const double energy = me.value("energy", 0.0);
+                const bool reloadingNoBackup = isGunReloading(weapons) && !hasReadySecondary(weapons, energy);
+
+                // If sheltered and healthy (not regenerating), try a clean pre-aimed corner peek.
+                if (!regenMode_ && !reloadingNoBackup) {
+                    std::vector<Vec3> allPos;
+                    allPos.reserve(enemyInfos.size());
+                    for (const auto& e : enemyInfos) allPos.push_back(e.pos);
+                    if (const auto peeking = peekCommand(obs, start, zone, motion, muzzleHeight, *threat, allPos, window)) {
+                        return *peeking;
+                    }
+                }
+
+                CombatContext ctx;
+                ctx.hp = me.value("hp", 1400.0);
+                ctx.maxHp = std::max(1.0, me.value("max_hp", 1400.0));
+                ctx.energy = energy;
+                ctx.maxEnergy = std::max(1.0, me.value("max_energy", 100.0));
+                ctx.muzzleHeight = muzzleHeight;
+                ctx.strafeSign = strafeSign_;
+                ctx.hasLightning = hasWeaponKind(weapons, "lightning");
+                ctx.hasLaser = hasWeaponKind(weapons, "laser");
+                ctx.hasMortar = hasWeaponKind(weapons, "mortar");
+                ctx.laserCharging = isLaserCharging(weapons);
+                ctx.reloading = reloadingNoBackup;
+                ctx.wantRegen = regenMode_;
+                ctx.needReposition = needReposition;
+                ctx.anchor = combatAnchor_.value_or(start);
+
+                // Include the primary threat in enemyInfos if it's an attacking NPC or bearing-only threat.
+                auto tacticalEnemies = enemyInfos;
+                if (threat->is_npc || std::none_of(tacticalEnemies.begin(), tacticalEnemies.end(), [&](const EnemyInfo& e) {
+                        return distanceXY(e.pos, *threat->position) < 1.0;
+                    })) {
+                    EnemyInfo extra;
+                    extra.id = threat->actor_id.value_or(-2);
+                    extra.pos = *threat->position;
+                    extra.hp = threat->hp;
+                    extra.radius = threat->attack_radius;
+                    extra.height = threat->attack_height;
+                    extra.is_npc = threat->is_npc;
+                    extra.has_lightning = threat->has_lightning;
+                    extra.has_laser = threat->has_laser;
+                    extra.has_mortar = threat->has_mortar;
+                    extra.charging = threat->laser_charging;
+                    extra.facing_us = threat->facing_us;
+                    tacticalEnemies.push_back(extra);
+                }
+
+                const auto combatMove = planCombatPosition(start, *threat, tacticalEnemies, ctx, zone, motion, arena_,
+                                                           navigator_, std::min(hardDeadline, Clock::now() + 7ms));
+                if (combatMove) {
+                    if (combatMove->hardCover && distanceXY(start, combatMove->target) < 0.9) {
+                        if (!shelteredAt_) shelteredAt_ = zone.now;
+                        return {groundCommand(start, std::nullopt, me, zone, motion, false, enemies), combatMove->label, true};
+                    }
                     shelteredAt_.reset();
-                    retreat_.reset();
-                    const bool sprint = me.value("grounded", true) && threat->facing_us && threatDist < 55.0 &&
-                        me.value("energy", 0.0) > 0.42 * me.value("max_energy", 100.0);
-                    const auto cmd = groundCommand(start, *step, me, zone, motion, sprint, {});
+                    const bool sprint = me.value("grounded", true) && combatMove->boost;
+                    const auto cmd = groundCommand(start, combatMove->target, me, zone, motion, sprint, {});
                     if (std::hypot(cmd.move[0], cmd.move[1]) > 0.12) {
-                        return {cmd, "engage", true};
+                        return {cmd, combatMove->label, true};
                     }
                     strafeSign_ = -strafeSign_;
                 }
-            }
 
-            const bool shouldDefend = threat->hostile || threat->damaged_recently ||
-                threat->laser_charging || threatDist <= 55.0;
-            if (shouldDefend) {
-                if (const auto peeking = peekCommand(obs, start, zone, motion, muzzleHeight, *threat, allNearby, window)) {
-                    return *peeking;
-                }
-                auto retreat = retreatTarget(start, *threat, allNearby, zone, motion,
-                                             std::min(hardDeadline, Clock::now() + 6ms));
+                // Fallback to classic retreat if combat planner found no step.
+                std::vector<Vec3> allPos;
+                allPos.reserve(enemyInfos.size());
+                for (const auto& e : enemyInfos) allPos.push_back(e.pos);
+                auto retreat = retreatTarget(start, *threat, allPos, zone, motion,
+                                             std::min(hardDeadline, Clock::now() + 4ms));
                 if (retreat) {
                     if (retreat->hardCover && distanceXY(start, retreat->target) < 0.9) {
                         if (!shelteredAt_) shelteredAt_ = zone.now;
-                        // Keep fireAllowed = true so clear shots at OTHER exposed enemies are still taken.
                         return {groundCommand(start, std::nullopt, me, zone, motion, false, enemies), "hold-wall", true};
                     }
                     shelteredAt_.reset();
                     const bool boost = me.value("grounded", true) && threat->hostile && threatDist < 55.0 &&
-                        me.value("energy", 0.0) > 0.38 * me.value("max_energy", 100.0);
+                        energy > 0.35 * ctx.maxEnergy;
                     const auto command = groundCommand(start, retreat->target, me, zone, motion, boost, enemies);
                     if (std::hypot(command.move[0], command.move[1]) > 0.12) {
                         return {command, "withdraw", true};
@@ -478,6 +686,54 @@ private:
         }
         shelteredAt_.reset();
         return rotate(obs, start, zone, motion, threat, enemies, window, tickStarted, hardDeadline);
+    }
+
+    std::optional<Decision> supplyDropCapture(const Json& obs, const Vec3& start, const Zone& zone,
+                                              const Motion& motion, const std::vector<EnemyInfo>& enemyInfos) {
+        const auto it = obs.find("drops");
+        if (it == obs.end() || !it->is_array() || it->empty()) {
+            return std::nullopt;
+        }
+        const auto selfId = selfIdOf(obs);
+        const int closeEnemies = static_cast<int>(std::count_if(enemyInfos.begin(), enemyInfos.end(), [&](const EnemyInfo& e) {
+            return distanceXY(start, e.pos) <= 55.0;
+        }));
+        if (closeEnemies >= 2) {
+            return std::nullopt;
+        }
+        const auto& me = obs.contains("self") && obs["self"].is_object() ? obs["self"] : Json::object();
+        const double hpFrac = me.value("hp", 1400.0) / std::max(1.0, me.value("max_hp", 1400.0));
+        for (const auto& drop : *it) {
+            if (!drop.is_object()) continue;
+            const auto pos = safeVec3(drop, "pos", {infinity, infinity, 0.0});
+            if (!std::isfinite(pos[0])) continue;
+            const double landsIn = drop.value("lands_in", 99.0);
+            const double radius = drop.value("radius", 8.0);
+            const double dist = distanceXY(start, pos);
+            if (landsIn > 12.0 || dist > (hpFrac < 0.75 ? 95.0 : 65.0)) {
+                continue;
+            }
+            if (zone.clearance(horizontal(pos), zone.now + landsIn + 4.5) < motion.radius + 1.0) {
+                continue;
+            }
+            if (drop.contains("holder") && drop["holder"].is_number() && selfId &&
+                static_cast<int>(drop["holder"].get<double>()) != *selfId) {
+                continue;
+            }
+            if (dist <= radius - 1.5 && landsIn <= 0.15) {
+                // Hold inside the supply drop ring until captured (full HP + full energy + 3 cubes!).
+                return Decision{groundCommand(start, std::nullopt, me, zone, motion, false), "cap-drop", true};
+            }
+            if (dist <= 35.0) {
+                const auto target = navigator_.support(horizontal(pos), motion, pos[2] + 3.0);
+                if (target && navigator_.direct(start, *target, zone, motion)) {
+                    const bool sprint = me.value("grounded", true) &&
+                        me.value("energy", 0.0) > 0.45 * me.value("max_energy", 100.0);
+                    return Decision{groundCommand(start, *target, me, zone, motion, sprint), "seek-drop", true};
+                }
+            }
+        }
+        return std::nullopt;
     }
 
     bool wallBehind(const Vec3& start, const Vec2& away, const Motion& motion) const {
@@ -531,7 +787,6 @@ private:
         }
         if (!laser) return {};
 
-        // Break laser beam sideways on foot; never let distant secondary enemies veto a laser dodge.
         const auto velocity = safeVec3(me, "vel");
         std::optional<Decision> best;
         double bestScore = -infinity;
@@ -609,7 +864,6 @@ private:
                 const auto edge = navigator_.support(xy, motion, start[2] + motion.step);
                 if (!edge) continue;
                 const Vec3 edgeMuzzle{(*edge)[0], (*edge)[1], (*edge)[2] + muzzleHeight};
-                // Pick an edge where WE have a clear shot (not requiring the enemy to already aim at it).
                 if (zone.clearance(*edge, zone.now + 2) > motion.radius + 1 &&
                     navigator_.direct(start, *edge, zone, motion) &&
                     navigator_.direct(*edge, start, zone, motion) &&
@@ -635,7 +889,6 @@ private:
             peek_.reset();
             return {};
         }
-        // Allow firing as soon as we clear the corner (on both peek-edge and peek-return) until one shot lands.
         return Decision{{move}, peek.returning ? "peek-return" : "peek-edge", !peek.fired, peek.returning};
     }
 
@@ -713,16 +966,22 @@ private:
                                const Zone& zone, const Motion& motion, const Goals& route, bool complete) {
         const auto& me = obs.contains("self") && obs["self"].is_object() ? obs["self"] : Json::object();
         const bool hostileThreat = threat && (threat->hostile || threat->damaged_recently || threat->laser_charging);
-        if (hostileThreat || !threats_.can_collect_cubes(obs) || !me.value("in_zone", false) ||
+        if (hostileThreat || !me.value("in_zone", false) ||
             (!complete && !zone.inNext(start, motion.radius + 4))) {
             return {};
         }
         const double base = navigator_.pathTime(start, route, motion.walk);
         auto evaluateItem = [&](const Vec3& pos, double maxDetourSec) -> std::optional<Vec3> {
             const auto point = navigator_.support(horizontal(pos), motion, pos[2] + 4.0);
-            if (!point || std::abs((*point)[2] - pos[2]) > 4.0 || !navigator_.direct(start, *point, zone, motion) ||
-                (!route.empty() && !navigator_.walkable(*point, route.front(), motion))) {
+            if (!point || std::abs((*point)[2] - pos[2]) > 4.0 || !navigator_.direct(start, *point, zone, motion)) {
                 return std::nullopt;
+            }
+            if (!route.empty() && !navigator_.walkable(*point, route.front(), motion)) {
+                // Allow direct detour if we are already safely inside next zone.
+                if (!zone.inNext(*point, motion.radius)) {
+                    return std::nullopt;
+                }
+                return point;
             }
             Goals path{*point};
             path.insert(path.end(), route.begin(), route.end());
@@ -735,37 +994,58 @@ private:
             return std::nullopt;
         };
 
-        // 1. Opportunistically collect weapon/health pickups and supply drops when safe.
+        // 1. Prioritize weapon pickups (especially lightning!) when slot 1 is empty or upgradable.
         const auto& weapons = me.contains("weapons") && me["weapons"].is_array() ? me["weapons"] : Json::array();
-        const bool needsSecondary = weapons.size() < 2;
-        for (const char* fieldName : {"pickups", "drops"}) {
-            const auto it = obs.find(fieldName);
-            if (it == obs.end() || !it->is_array()) continue;
-            const double maxRange = needsSecondary ? 32.0 : 22.0;
+        const bool needsSecondary = countHeldWeapons(weapons) < 2;
+        int slot1Prio = 0;
+        if (weapons.size() >= 2 && weapons[1].is_object()) {
+            slot1Prio = weaponPriority(weapons[1].value("kind", std::string{}));
+        }
+        if (const auto it = obs.find("pickups"); it != obs.end() && it->is_array()) {
+            double bestScore = -infinity;
+            std::optional<Vec3> bestPickup;
             for (const auto& item : *it) {
+                if (!item.is_object()) continue;
+                const auto kind = item.value("kind", std::string{});
+                if (kind.empty() || kind == "gun" || hasWeaponKind(weapons, kind)) continue;
+                const int prio = weaponPriority(kind);
+                if (!needsSecondary && prio <= slot1Prio) continue;
                 const auto pos = safeVec3(item, "pos", {infinity, infinity, 0.0});
                 if (!std::isfinite(pos[0])) continue;
                 const double dist = distanceXY(start, pos);
-                if (dist <= 2.0 || dist > maxRange || zone.clearance(horizontal(pos), zone.now) <= motion.radius) {
-                    continue;
+                const double maxRange = needsSecondary ? 65.0 : 35.0;
+                if (dist > maxRange || zone.clearance(horizontal(pos), zone.now) <= motion.radius) continue;
+                const double score = prio - dist * 1.4;
+                if (score > bestScore) {
+                    if (const auto target = evaluateItem(pos, needsSecondary ? 6.5 : 3.5)) {
+                        bestScore = score;
+                        bestPickup = target;
+                    }
                 }
-                if (const auto target = evaluateItem(pos, needsSecondary ? 4.0 : 2.5)) {
-                    return target;
-                }
+            }
+            if (bestPickup) {
+                return bestPickup;
             }
         }
 
-        // 2. Collect safe power cubes.
-        const auto cubes = safe_cubes(obs, threat, pickupRadius_, [&](const Vec2& xy) {
-            return zone.clearance(xy, zone.now) > motion.radius;
-        });
-        for (std::size_t i = 0; i < std::min<std::size_t>(4, cubes.size()); ++i) {
-            const auto& cube = cubes[i].pos;
-            if (distanceXY(start, cube) <= pickupRadius_ && std::abs(start[2] - cube[2]) <= 4) {
-                continue;
-            }
-            if (const auto target = evaluateItem(cube, 3.0)) {
-                return target;
+        // 2. Collect safe power cubes up to stat_cap (10) so we gain +40% HP & damage without bloating hitbox.
+        const double myCubes = me.value("cubes", 0.0);
+        const bool wantCubes = myCubes < cubeStatCap_ || (myCubes == 14.0);
+        if (wantCubes && threats_.can_collect_cubes(obs)) {
+            const auto cubes = safe_cubes(obs, threat, pickupRadius_, [&](const Vec2& xy) {
+                return zone.clearance(xy, zone.now) > motion.radius;
+            });
+            for (std::size_t i = 0; i < std::min<std::size_t>(4, cubes.size()); ++i) {
+                const auto& cube = cubes[i].pos;
+                if (distanceXY(start, cube) <= pickupRadius_ && std::abs(start[2] - cube[2]) <= 4) {
+                    continue;
+                }
+                if (myCubes >= cubeStatCap_ && distanceXY(start, cube) > 10.0) {
+                    continue;
+                }
+                if (const auto target = evaluateItem(cube, 3.5)) {
+                    return target;
+                }
             }
         }
         return {};
@@ -822,7 +1102,6 @@ private:
             progress_ = Progress{*target, start, now};
             return;
         }
-        // Never wipe an active A* search while it is still expanding around a large building.
         if (searching) {
             return;
         }
@@ -853,7 +1132,6 @@ private:
             return {move};
         }
 
-        // Soft directional scoring: never freeze at {0, 0} when flanked or blocked by enemies.
         if (target && distanceXY(start, *target) >= 1.0) {
             const double yaw = std::atan2(move[1], move[0]);
             const double startDist = distanceXY(start, *target);
@@ -871,7 +1149,6 @@ private:
                     const Vec2 ahead{start[0] + adjusted[0] * 4.0, start[1] + adjusted[1] * 4.0};
                     const double progress = startDist - distanceXY(ahead, *target);
                     const double penalty = approachPenalty(start, ahead, enemies);
-                    // Only accept directions that either make progress toward target or escape pressure.
                     if (progress < -1.5 && penalty > 0.0) {
                         continue;
                     }
@@ -958,6 +1235,8 @@ private:
     Navigator navigator_;
     ThreatTracker threats_;
     double pickupRadius_;
+    double lootPickupRadius_;
+    double cubeStatCap_;
     std::optional<Flight> flight_;
     double considerFlightAt_ = -infinity;
     Goals goals_;
@@ -969,6 +1248,9 @@ private:
     std::optional<ActiveHop> hop_;
     std::optional<double> shelteredAt_;
     std::optional<double> scanHeading_;
+    std::optional<Vec3> combatAnchor_;
+    double anchorSetAt_ = -infinity;
+    bool regenMode_ = false;
     double strafeSign_ = 1.0;
     double nextStrafeFlipAt_ = -infinity;
     double nextPeekAt_ = -infinity;

@@ -1,8 +1,8 @@
 # Mech Royale
 
-Placement-focused C++20 bot for the Builders Buildathon. It rotates early into the next safe zone when clear, actively kites and finishes favorable 1v1 engagements (prioritizing low-HP targets and using equipped secondary weapons such as lightning, laser, and mortar), and switches to soft-scored evasion, cover, or lateral dodging when outnumbered or targeted by a charging laser.
+Placement-focused C++20 bot for the Builders Buildathon. It rotates early into the next safe zone, explicitly picks up and upgrades secondary weapons (`take`/`drop`, prioritizing lightning > laser > mortar), uses each weapon's real mechanics (30° auto-hit lightning cones with chain clustering, charge-and-release laser with mortar cook-off, and low/high-arc mortar over cover), and snowballs up to 10 power cubes via crates, NPC drones, and supply drops.
 
-It pre-aims known threats even behind cover, breaks crates and collects safe pickups/cubes opportunistically, handles rooftop drop-offs and wide-building A* routing without thrashing, and uses 2D grid-DDA raycasting with strict per-tick time budgets to stay well under the 50 ms response limit.
+In multi-enemy engagements, it dynamically repositions and cover-splits to isolate 1v1 angles, keeps exposed threats inside its 180° front armor arc to prevent 1.5× rear-armor hits, and holds fire behind cover when low HP to trigger out-of-combat regeneration. It handles rooftop drop-offs, wide-building A* routing without thrashing, and 2D grid-DDA raycasting with strict per-tick time budgets well under the 50 ms limit.
 
 Build the competition image from the repository root:
 
