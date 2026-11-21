@@ -67,13 +67,17 @@ bool Zone::inNext(const Vec3& point, double margin) const {
 
 bool Zone::segment(const Vec2& from, const Vec2& to, double at, double duration) const {
     // A mech already outside may recover; once this path enters, keep it inside.
+    // Exception: if standing still at `from` would already be overtaken by the shrinking zone
+    // at `at + duration`, never block a step that moves strictly closer to `nextCenter`!
+    const bool overtaking = clearance(from, at + duration) < -zoneTolerance;
+    const bool movesInward = distanceXY(to, nextCenter) < distanceXY(from, nextCenter) - 0.05;
     bool entered = clearance(from, at) >= -zoneTolerance;
     for (int i = 1; i <= 4; ++i) {
         const double fraction = i / 4.0;
         const Vec2 point{from[0] + (to[0] - from[0]) * fraction,
                          from[1] + (to[1] - from[1]) * fraction};
         const bool inside = clearance(point, at + duration * fraction) >= -zoneTolerance;
-        if (entered && !inside) {
+        if (entered && !inside && !(overtaking && movesInward)) {
             return false;
         }
         entered |= inside;
@@ -302,9 +306,17 @@ RouteResult Navigator::plan(const Vec3& from, const std::vector<Vec3>& goals, co
         reset();
         role_ = role;
     }
+    const bool outsideNow = zone.clearance(from, zone.now) < -zoneTolerance;
+    Zone planZone = zone;
+    if (outsideNow) {
+        // When already outside the storm, don't reject valid A* building-bypass paths that briefly
+        // skirt outside before entering nextZone!
+        planZone.radius += 120.0;
+        planZone.nextRadius += 120.0;
+    }
     if (!route_.empty()) {
-        route_ = usable(from, route_, zone, motion);
-        if (!route_.empty() && pathSafe(from, route_, zone, motion.walk)) {
+        route_ = usable(from, route_, planZone, motion);
+        if (!route_.empty() && (outsideNow || pathSafe(from, route_, zone, motion.walk))) {
             return {route_, true};
         }
         route_.clear();
@@ -312,7 +324,7 @@ RouteResult Navigator::plan(const Vec3& from, const std::vector<Vec3>& goals, co
     }
     for (std::size_t i = 0; i < std::min<std::size_t>(5, goals.size()) && Clock::now() < deadline; ++i) {
         const auto& goal = goals[i];
-        if (distanceXY(from, goal) <= 19.0 && direct(from, goal, zone, motion)) {
+        if (distanceXY(from, goal) <= 19.0 && direct(from, goal, planZone, motion)) {
             route_ = {goal};
             return {route_, true};
         }
@@ -324,15 +336,20 @@ RouteResult Navigator::plan(const Vec3& from, const std::vector<Vec3>& goals, co
     auto& search = *search_;
     advance(search, zone, motion, deadline);
     if (!search.complete.empty()) {
-        route_ = usable(from, search.complete, zone, motion);
-        if (!route_.empty() && pathSafe(from, route_, zone, motion.walk)) {
+        route_ = usable(from, search.complete, planZone, motion);
+        if (!route_.empty() && (outsideNow || pathSafe(from, route_, zone, motion.walk))) {
+            return {route_, true};
+        }
+        // If A* found a complete path around a building that briefly dips outside the shrinking edge,
+        // still follow it rather than throwing away the route and freezing against the wall!
+        if (!route_.empty()) {
             return {route_, true};
         }
         route_.clear();
     }
     std::vector<Vec3> partial;
     if (search.best != search.from) {
-        partial = usable(from, search.path(search.best), zone, motion);
+        partial = usable(from, search.path(search.best), planZone, motion);
     }
     if (!search.complete.empty()) {
         search_.reset();

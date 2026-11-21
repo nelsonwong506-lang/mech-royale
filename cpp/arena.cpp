@@ -673,7 +673,16 @@ bool Arena::walkSegment(const Vec3& start, const Vec3& end, double radius, doubl
     const double maxRise = std::tan(radians(maxSlopeDeg)) * distance / count;
     double previousGround = ground(start[0], start[1]);
     double z = surfaceAboveTerrain(start[0], start[1], start[2] + supportEpsilon, previousGround);
-    if (std::abs(z - start[2]) > supportEpsilon || !prismClear(start[0], start[1], z, radius, height, stepUp)) {
+    if (std::abs(z - start[2]) > supportEpsilon) {
+        // Mech perched overhanging a rooftop/ledge edge (protocol.md §7): allow stepping off or back onto roof.
+        if (start[2] > z && start[2] - z <= 24.0) {
+            z = start[2];
+        } else {
+            return false;
+        }
+    }
+    const bool startGrazing = !prismClear(start[0], start[1], z, radius, height, stepUp);
+    if (startGrazing && !prismClear(start[0], start[1], z, std::max(0.5, radius - 0.45), height, stepUp)) {
         return false;
     }
 
@@ -686,19 +695,22 @@ bool Arena::walkSegment(const Vec3& start, const Vec3& end, double radius, doubl
         const bool bothOnTerrain = z == previousGround && support == terrainZ;
         const double maxClimb = (bothOnTerrain ? maxRise : stepUp) + supportEpsilon;
         const bool steepDrop = rise < -(bothOnTerrain ? maxRise : stepUp) - supportEpsilon;
+        const double checkR = (startGrazing && i < count && distance * fraction <= 1.6)
+            ? std::max(0.5, radius - 0.35)
+            : radius;
         if (steepDrop && !bothOnTerrain && rise >= -24.0 &&
-            !prismClear(x, y, support, radius, height, stepUp) &&
-            prismClear(x, y, z, radius, height, 0.0)) {
+            !prismClear(x, y, support, checkR, height, stepUp) &&
+            prismClear(x, y, z, checkR, height, 0.0)) {
             // Still overhanging the rooftop edge we are stepping off of: remain at ledge height z
             // until our cylinder radius clears the building face, then drop to ground support!
             continue;
         }
-        if (rise > maxClimb || !prismClear(x, y, support, radius, height, stepUp)) {
+        if (rise > maxClimb || !prismClear(x, y, support, checkR, height, stepUp)) {
             return false;
         }
         if (steepDrop) {
             // Allow stepping down off a rooftop or ledge when the drop path is unobstructed.
-            if (bothOnTerrain || rise < -24.0 || !prismClear(x, y, z, radius, height, 0.0)) {
+            if (bothOnTerrain || rise < -24.0 || !prismClear(x, y, z, checkR, height, 0.0)) {
                 return false;
             }
         }
@@ -713,8 +725,9 @@ bool Arena::flightSegment(const Vec3& start, const Vec3& end, double radius, dou
     const int count = std::max(1, static_cast<int>(std::ceil(std::hypot(dx, dy, dz) / sampleSpacing)));
     for (int i = 0; i <= count; ++i) {
         const double fraction = static_cast<double>(i) / count;
+        const double checkR = (i == 0 && count >= 1) ? std::max(0.5, radius - 0.45) : radius;
         if (!bodyClear(start[0] + dx * fraction, start[1] + dy * fraction,
-                       start[2] + dz * fraction, radius, height)) {
+                       start[2] + dz * fraction, checkR, height)) {
             return false;
         }
     }

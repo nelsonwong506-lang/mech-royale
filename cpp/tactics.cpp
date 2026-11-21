@@ -1405,6 +1405,8 @@ std::optional<GunShot> ThreatTracker::visible_shot(const Json& obs, const Arena&
     };
 
     double best_score = -std::numeric_limits<double>::infinity();
+    double best_target_dist = std::numeric_limits<double>::infinity();
+    double best_target_hp = 1400.0;
     std::optional<GunShot> best;
 
     if (mechs.is_array()) {
@@ -1684,6 +1686,8 @@ std::optional<GunShot> ThreatTracker::visible_shot(const Json& obs, const Arena&
             if (score > best_score) {
                 best_score = score;
                 best = candidate;
+                best_target_dist = candidate_dist;
+                best_target_hp = hp;
             }
         }
     }
@@ -1735,12 +1739,14 @@ std::optional<GunShot> ThreatTracker::visible_shot(const Json& obs, const Arena&
         }
     }
 
-    if (best || !allow_crates || Clock::now() >= deadline) {
+    const bool only_distant_passive_mech = best && !best->npc && best_target_dist > 95.0 &&
+        best_target_hp > 650.0 && (!primary_threat || !primary_threat->hostile);
+    if ((best && !only_distant_passive_mech) || !allow_crates || Clock::now() >= deadline) {
         return best;
     }
 
     int gun_slot = -1;
-    double gun_range = 65.0;
+    double gun_range = only_distant_passive_mech ? 42.0 : 65.0;
     bool gun_spare_ready = false;
     int light_slot = -1;
     double light_range = 42.0;
@@ -1748,8 +1754,8 @@ std::optional<GunShot> ThreatTracker::visible_shot(const Json& obs, const Arena&
     for (std::size_t s = 0; s < slot_count; ++s) {
         if (slots[s].kind == "gun") {
             gun_slot = slots[s].index;
-            gun_range = std::min(65.0, slots[s].range);
-            gun_spare_ready = slots[s].ready && number(*slots[s].weapon, "ammo", 0.0) > 3.0;
+            gun_range = std::min(gun_range, slots[s].range);
+            gun_spare_ready = slots[s].ready && number(*slots[s].weapon, "ammo", 0.0) > 1.0;
         } else if (slots[s].kind == "lightning") {
             light_slot = slots[s].index;
             light_range = slots[s].range;

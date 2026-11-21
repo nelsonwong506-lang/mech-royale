@@ -11,7 +11,7 @@
 namespace mr {
 namespace {
 
-constexpr double rotationReserve = 7.0;
+constexpr double rotationReserve = 10.0;
 constexpr double infinity = std::numeric_limits<double>::infinity();
 constexpr double tau = 6.283185307179586;
 
@@ -333,7 +333,7 @@ RotationWindow rotationWindow(const Vec3& from, const Zone& zone, const Motion& 
     const double directDistance = std::max(0.0, distanceXY(from, zone.nextCenter) - (zone.nextRadius - inset));
     const double directTravel = directDistance / std::max(1.0, motion.walk);
     const double travel = routeSeconds && std::isfinite(*routeSeconds) && *routeSeconds >= 0.0
-        ? std::max(directTravel, *routeSeconds) : 1.45 * directTravel;
+        ? std::max(directTravel, *routeSeconds) : 1.65 * directTravel;
     return {untilRisk <= travel + rotationReserve, untilRisk, travel};
 }
 
@@ -714,7 +714,7 @@ std::optional<CombatMove> planCombatPosition(const Vec3& from, const Threat& pri
         double pullBonus = 0.0;
         if (ctx.coverPull && !ctx.onRoof && (exposedCount >= 1 || defensive)) {
             const double pullProgress = distanceXY(from, *ctx.coverPull) - distanceXY(xy, *ctx.coverPull);
-            const double pullWeight = (multiEnemy || defensive) ? 1.25 : 0.60;
+            const double pullWeight = defensive ? 2.0 : (multiEnemy ? 1.35 : 0.60);
             pullBonus = pullWeight * pullProgress;
             if (pullProgress > 4.0 && multiEnemy && exposedCount >= 2) {
                 label = "pull-cover";
@@ -746,10 +746,16 @@ std::optional<CombatMove> planCombatPosition(const Vec3& from, const Threat& pri
             }
         }
 
-        const double score = exposureScore + pinchBonus +
+        // In defensive mode (reloading/low-HP) without immediate wall cover, gently open distance without
+        // overpowering hard wall cover (+48/+58) or walking into other enemies!
+        const double defensiveEscapeBonus = (defensive && exposedCount > 0)
+            ? 0.55 * std::clamp(focusDist - distanceXY(from, focusPos), -10.0, 14.0)
+            : 0.0;
+
+        const double score = exposureScore + pinchBonus + defensiveEscapeBonus +
             repositionBonus + momentumBonus + dodgeBonus + roofBonus + pullBonus + cubeGrabBonus +
-            (defensive ? 3.5 : 8.5) * lateral + weaveBonus -
-            (defensive ? 0.15 : 0.45) * rangeError - weaponDangerPenalty - rearRiskPenalty -
+            (defensive ? 3.0 : 8.5) * lateral + weaveBonus -
+            (defensive ? 0.0 : 0.45) * rangeError - weaponDangerPenalty - rearRiskPenalty -
             0.55 * otherApproachPenalty + 0.32 * progress + 0.025 * std::min(40.0, clearance);
 
         if (score > bestScore) {
