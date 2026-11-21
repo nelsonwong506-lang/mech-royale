@@ -167,7 +167,9 @@ public:
     explicit Bot(const Json& hello)
         : config_(hello.is_object() ? hello.value("config", Json::object()) : Json::object()),
           arena_(hello.at("map").at("dir").get<std::string>(),
-                 hello.at("map").value("files", std::vector<std::string>{})),
+                 hello.at("map").value("files", std::vector<std::string>{}),
+                 config_.value("mech", Json::object()).value("radius", 2.5),
+                 config_.value("mech", Json::object()).value("height", 9.0)),
           navigator_(arena_), threats_(config_),
           lootPickupRadius_(config_.value("loot", Json::object()).value("pickup_radius", 4.0)),
           cubeStatCap_(config_.value("cubes", Json::object()).value("stat_cap", 10.0)) {}
@@ -192,13 +194,11 @@ public:
         const double hp = me.value("hp", 1400.0);
         const double maxHp = std::max(1.0, me.value("max_hp", 1400.0));
         const bool grounded = me.value("grounded", true);
-        const bool onRoof = grounded && pos[2] > arena_.ground(pos[0], pos[1]) + 2.0 &&
-                            std::abs(arena_.surface(pos[0], pos[1], pos[2] + 0.25) - pos[2]) < 0.3;
-        int exposed = 0;
+        const bool onRoof = grounded && arena_.roofAt(pos);
+        const int exposed = exposureAt(pos, enemies, motion.height);
         int close = 0;
         for (const auto& enemy : enemies) {
             if (distanceXY(pos, enemy.pos) < 35.0) ++close;
-            if (distanceXY(pos, enemy.pos) <= 280.0 && wallCover(pos, enemy.pos, motion.height, arena_) < 3) ++exposed;
         }
         const Frame frame{obs, me, stats, weapons, zone, motion, pos, threat, enemies,
                           rotationWindow(pos, zone, motion, routeEstimate_), deadline,
@@ -458,6 +458,16 @@ private:
         }
         const Vec3 goal = rotationGoal_.value_or(Vec3{f.zone.nextCenter[0], f.zone.nextCenter[1],
             arena_.ground(f.zone.nextCenter[0], f.zone.nextCenter[1])});
+        if (distanceXY(f.pos, goal) > 18) {
+            const auto stop = arena_.rotationWaypoint(f.pos, horizontal(goal), 52, f.motion.radius, f.motion.height);
+            if (stop && (!failedGoal_ || f.zone.now >= retryAt_ || distanceXY(*stop, *failedGoal_) > 3)) {
+                const double extra = distanceXY(f.pos, *stop) + distanceXY(*stop, goal) - distanceXY(f.pos, goal);
+                const double travel = distanceXY(f.pos, *stop) / std::max(1.0, f.motion.walk);
+                if (extra < f.motion.walk * (f.window.urgent ? 0.5 : 2.0) &&
+                    f.zone.segment(f.pos, *stop, f.zone.now, travel))
+                    return {Mode::Rotate, *stop, f.inZone ? "cover-rotate" : "recover-zone", f.window.urgent};
+            }
+        }
         return {Mode::Rotate, goal, f.inZone ? "rotate" : "recover-zone", f.window.urgent};
     }
 
@@ -473,7 +483,8 @@ private:
             if (value <= bestValue || distance > 100 || f.zone.clearance(pos, f.zone.now + eta + 2) < f.motion.radius ||
                 (failedGoal_ && f.zone.now < retryAt_ && distanceXY(pos, *failedGoal_) < 3)) return;
             const auto supported = navigator_.support(horizontal(pos), f.motion, pos[2] + 3.5);
-            if (!supported || std::abs((*supported)[2] - pos[2]) > 4.0) return;
+            if (!supported || std::abs((*supported)[2] - pos[2]) > 4.0 ||
+                (arena_.roofAt(*supported) && !arena_.roofFits(*supported, f.motion.radius, f.motion.height))) return;
             for (const auto& e : f.enemies) {
                 if (distanceXY(pos, e.pos) < 120 && wallCover(*supported, e.pos, f.motion.height, arena_) < 3) return;
             }
@@ -506,14 +517,59 @@ private:
         if (best || (!needGear && !needCubes)) return best;
         const auto roofs = arena_.nearbyRooftops(f.pos, 85, -4.0, 36.0, f.motion.radius, f.motion.height);
         for (const auto& roof : roofs) {
-            if (distanceXY(f.pos, roof) < 5 && std::abs(f.pos[2]-roof[2]) < 1) {
-                searched_[roof] = f.zone.now;
+            const auto* site = arena_.roofAt(roof);
+            if (!site) continue;
+            if (f.onRoof && site == arena_.roofAt(f.pos)) {
+                searched_[site->interior] = f.zone.now;
                 continue;
             }
-            const auto seen = searched_.find(roof);
+            const auto seen = searched_.find(site->interior);
             if (seen != searched_.end() && f.zone.now - seen->second < 45.0) continue;
             consider(roof, 25, "search-roof");
         }
+        return best;
+    }
+
+    int exposureAt(const Vec3& point, const std::vector<EnemyInfo>& enemies, double height) const {
+        int count = 0;
+        for (const auto& enemy : enemies) {
+            const double range = enemy.has_laser ? 280 : 235;
+            if (distanceXY(point, enemy.pos) > range) continue;
+            Vec3 source = enemy.pos;
+            source[2] += enemy.height * (7.0 / 9.0);
+            for (double fraction : {0.25, 0.55, 0.98}) {
+                if (!arena_.blocksLine(source, {point[0], point[1], point[2] + height * fraction})) {
+                    ++count;
+                    break;
+                }
+            }
+        }
+        return count;
+    }
+
+    std::optional<Intent> roofCombat(const Frame& f, bool withdraw) {
+        const auto* roof = f.onRoof ? arena_.roofAt(f.pos) : nullptr;
+        if (!roof || !f.threat || !f.threat->position) return {};
+        const bool coveredMortar = hasWeaponKind(f.weapons, "mortar") && !f.exposed;
+        const bool shelter = withdraw || coveredMortar || f.exposed >= 2 || isGunReloading(f.weapons);
+        std::optional<Intent> best;
+        double bestScore = -infinity;
+        auto consider = [&](const Vec3& p) {
+            if (!arena_.roofFits(p, f.motion.radius, f.motion.height) ||
+                !navigator_.direct(f.pos, p, f.zone, f.motion)) return;
+            const int count = exposureAt(p, f.enemies, f.motion.height);
+            const auto& target = *f.threat->position;
+            const bool clear = !arena_.blocksLine({p[0], p[1], p[2] + f.stats.value("muzzle_height", 7.0)},
+                                                  {target[0], target[1], target[2] + f.threat->attack_height * 0.5});
+            if ((!shelter && (count != 1 || !clear)) || (shelter && count >= std::max(1, f.exposed))) return;
+            const double score = -100 * count - distanceXY(p, f.pos);
+            if (score <= bestScore) return;
+            bestScore = score;
+            best = Intent{withdraw ? Mode::Regen : Mode::Combat, p, shelter ? "roof-cover" : "roof-peek"};
+        };
+        consider(f.pos);
+        consider(roof->interior);
+        for (const auto& p : roof->edges) consider(p);
         return best;
     }
 
@@ -524,6 +580,7 @@ private:
         const bool needsRest = f.hpFraction < (mode_ == Mode::Regen ? 0.98 : (f.exposed ? 0.42 : 0.80));
         if (!f.inZone || f.window.urgent) return rotation(f);
         if (needsRest && !advantage) {
+            if (auto shelter = roofCombat(f, true)) return *shelter;
             if (opponent && f.exposed) {
                 std::vector<Vec3> positions;
                 for (const auto& enemy : f.enemies) positions.push_back(enemy.pos);
@@ -533,7 +590,8 @@ private:
             }
             return {Mode::Regen, f.pos, "regen-cover"};
         }
-        if (opponent && (f.exposed || f.threat->hostile)) {
+        if (opponent && (f.exposed || f.threat->hostile || f.onRoof)) {
+            if (auto roof = roofCombat(f, false)) return *roof;
             CombatContext ctx;
             ctx.hp = f.hp;
             ctx.maxHp = f.me.value("max_hp", 1400.0);
@@ -615,12 +673,12 @@ private:
             (intent.goal[2] > f.pos[2] + f.motion.step || intent.mode == Mode::Rotate)) {
             considerFlightAt_ = f.zone.now + 0.45;
             if (intent.goal[2] > f.pos[2] + f.motion.step)
-                flight_ = navigator_.flightToRoof(f.pos, intent.goal, f.zone, f.motion, f.energy, f.me.value("max_energy",100.0), f.deadline);
+                flight_ = navigator_.flightToRoof(f.pos, intent.goal, f.zone, f.motion, f.energy, f.me.value("max_energy",100.0), f.deadline, horizontal(safeVec3(f.me,"vel")));
             else
-                flight_ = navigator_.flightPlan(f.pos, {intent.goal}, f.zone, f.motion, f.energy, f.me.value("max_energy",100.0), f.deadline);
+                flight_ = navigator_.flightPlan(f.pos, {intent.goal}, f.zone, f.motion, f.energy, f.me.value("max_energy",100.0), f.deadline, horizontal(safeVec3(f.me,"vel")));
             if (flight_ && flight_->seconds + distanceXY(f.pos, flight_->takeoff) / std::max(1.0, f.motion.walk) < walkTime) {
                 flightOwner_ = intent;
-                flightOwner_.goal = flight_->landing;
+                plannedFlightAt_ = f.zone.now;
                 if (auto cmd = fly(f.me, f.pos, f.zone, f.motion)) {
                     intent.reason = "launch";
                     return *cmd;
@@ -719,18 +777,25 @@ private:
                 flight_.reset();
                 return {};
             }
-            if (distanceXY(start, flight.takeoff) > 1.0 || std::hypot(velocity[0], velocity[1]) > 2) {
+            if (distanceXY(start, flight.takeoff) > 1.0) {
                 return groundCommand(start, flight.takeoff, me, zone, motion, false);
             }
-            const Vec3 vertical{start[0], start[1], flight.apex};
-            if (!arena_.flightSegment(start, vertical, motion.radius, motion.height) ||
-                !zone.segment(start, start, zone.now, flight.climb) ||
-                !zone.segment(start, flight.landing, zone.now + flight.climb, flight.seconds - flight.climb)) {
+            // Recheck the actual launch velocity after moving to a planned takeoff point.
+            if (distanceXY(start, flight.takeoff) > 0.1 || zone.now > plannedFlightAt_ + 0.15) {
+                const auto revised = navigator_.flightToRoof(start, flight.landing, zone, motion, energy, maximum,
+                                                            Clock::now() + 2ms, horizontal(velocity));
+                if (!revised || distanceXY(start, revised->takeoff) > 1.0) {
+                    flight_.reset();
+                    return {};
+                }
+                flight = *revised;
+            }
+            if (!zone.segment(start, flight.climbToward, zone.now, flight.climb)) {
                 flight_.reset();
                 return {};
             }
             flight.airborne = true;
-            return Command{{}, false, true};
+            return Command{direction(start, flight.climbToward), false, true};
         }
         if (!zone.segment(start, flight.landing, zone.now, distanceXY(start, flight.landing) / motion.walk + 0.3)) {
             for (const auto& xy : {zone.circle(zone.now + 0.6).first, horizontal(start)}) {
@@ -743,7 +808,10 @@ private:
         }
         const double offset = distanceXY(start, flight.landing);
         const double speed = std::min(1.0, std::sqrt(2 * motion.airAcceleration * std::max(0.0, offset - 0.35)) / motion.walk);
-        const auto move = start[2] >= flight.apex - 0.4 ? direction(start, flight.landing, speed) : Vec2{};
+        const double climbDistance = distanceXY(start, flight.climbToward);
+        const double climbSpeed = std::min(1.0, std::sqrt(2 * motion.airAcceleration * climbDistance) / motion.walk);
+        const auto move = start[2] >= flight.apex - 0.4 ? direction(start, flight.landing, speed)
+                                                         : direction(start, flight.climbToward, climbSpeed);
         const bool jet = offset > 1.1 && energy > 0.2 * maximum + 0.2 * motion.jetDrain &&
             start[2] + velocity[2] * 0.16 < flight.apex + 0.4;
         if (navigator_.guard(move, jet, me, zone, motion, true)) {
@@ -764,6 +832,7 @@ private:
     bool trace_ = std::getenv("MECH_TRACE") && std::string_view(std::getenv("MECH_TRACE")) == "1";
     Mode mode_ = Mode::Rotate;
     std::optional<Flight> flight_;
+    double plannedFlightAt_ = 0;
     Intent flightOwner_{Mode::Rotate, {}, "flight"};
     std::optional<DefensiveHop> hop_;
     double hopEnds_ = 0, steerAt_ = 0, nextHopAt_ = 0, considerFlightAt_ = 0;
