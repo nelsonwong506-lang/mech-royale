@@ -2,6 +2,8 @@
 
 Survival-first bot for the Builders Buildathon. It starts rotating early when the route is clear. While threatened, it chooses an escape in the current safe zone until the shrinking boundary makes rotation urgent. It scans while travelling and returns fire while withdrawing when an enemy aims at it with a clear shot. It uses solid structures for cover and reserves short single-shot peeks for safe situations.
 
+An exposed enemy laser charge triggers lateral evasion. Short defensive jumps are checked against the ceiling, terrain, landing space, and moving zone. The bot can also fire on a participant in a confirmed fight between other mechs while keeping its current survival movement.
+
 Build the competition image from the repository root:
 
 ```sh

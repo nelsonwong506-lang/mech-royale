@@ -24,6 +24,13 @@ struct RetreatPlan {
     bool hardCover;
 };
 
+struct DefensiveHop {
+    Vec3 landing;
+    Vec2 launch;
+    double duration;
+    double steerAfter;
+};
+
 RotationWindow rotationWindow(const Vec3& from, const Zone& zone, const Motion& motion,
                               std::optional<double> routeSeconds = std::nullopt);
 bool avoidsApproach(const Vec3& from, const Vec2& toward, const std::vector<Vec3>& enemies);
@@ -31,5 +38,9 @@ int wallCover(const Vec3& feet, const Vec3& threat, double ownHeight, const Aren
 std::optional<RetreatPlan> planRetreat(const Vec3& from, const Threat& threat, const std::vector<Vec3>& enemies,
                                        const Zone& zone, const Motion& motion, const Arena& arena,
                                        Navigator& navigator, Clock::time_point deadline);
+std::optional<DefensiveHop> planDefensiveHop(const Json& me, const Threat& threat,
+                                             const std::vector<Vec3>& enemies, const Zone& zone,
+                                             const Motion& motion, const Arena& arena, Navigator& navigator,
+                                             bool preferLateral, bool liftFirst, Clock::time_point deadline);
 
 }  // namespace mr

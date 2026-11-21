@@ -12,11 +12,15 @@ namespace {
 
 constexpr double RetaliationSeconds = 3.0;
 constexpr double CubeDamageQuietSeconds = 5.0;
+constexpr double FreshHostileDamageSeconds = 0.3;
 constexpr double ProjectileLookahead = 0.4;
 constexpr double CubeDetourMeters = 20.0;
+constexpr double DuelEvidenceSeconds = 0.25;
+constexpr double DuelMemorySeconds = 1.2;
 constexpr double Tau = 6.283185307179586;
 constexpr std::array<std::string_view, 4> WeaponKinds{"gun", "mortar", "laser", "lightning"};
 constexpr std::size_t MortarIndex = 1;
+constexpr std::size_t LaserIndex = 2;
 
 const Json& field(const Json& value, const char* key) {
     static const Json missing;
@@ -185,6 +189,36 @@ Shot shot_points(const Json& me, const Threat& threat, const Json& weapon_stats)
     return {origin, target, intercept};
 }
 
+bool segment_hits_mech(const Vec3& start, const Vec3& end, const Threat& mech) {
+    constexpr double contact_slack = 0.15;
+    const Vec3& feet = *mech.position;
+    const double bottom = feet[2] - contact_slack;
+    const double top = feet[2] + mech.attack_height + contact_slack;
+    const double delta_z = end[2] - start[2];
+    double begin = 0;
+    double finish = 1;
+    if (std::abs(delta_z) > 1e-8) {
+        const auto [first, last] = std::minmax({(bottom - start[2]) / delta_z, (top - start[2]) / delta_z});
+        begin = std::max(begin, first);
+        finish = std::min(finish, last);
+    } else if (start[2] < bottom || start[2] > top) {
+        return false;
+    }
+    if (begin > finish) {
+        return false;
+    }
+    const double dx = end[0] - start[0];
+    const double dy = end[1] - start[1];
+    const double length_squared = dx * dx + dy * dy;
+    const double projection = length_squared > 1e-8
+        ? ((feet[0] - start[0]) * dx + (feet[1] - start[1]) * dy) / length_squared : begin;
+    const double nearest = std::clamp(projection, begin, finish);
+    const double gap_x = start[0] + dx * nearest - feet[0];
+    const double gap_y = start[1] + dy * nearest - feet[1];
+    const double radius = mech.attack_radius + contact_slack;
+    return gap_x * gap_x + gap_y * gap_y <= radius * radius;
+}
+
 double mortar_range(const Json& mortar) {
     const double speed = number(mortar, "speed", 72.0);
     const double gravity = std::max(1.0, number(mortar, "gravity", 22.0));
@@ -306,6 +340,7 @@ std::optional<Threat> ThreatTracker::update(const Json& obs, const Arena& arena)
         if (!id || id == self_id || weapon == "zone" || weapon == "npc") {
             continue;
         }
+        last_hostile_damage_at_ = now;
         attacks_[*id].time = now;
         const auto& bearing = field(event, "bearing");
         if (!enemies[*id] && bearing.is_number()) {
@@ -382,6 +417,7 @@ std::optional<Threat> ThreatTracker::update(const Json& obs, const Arena& arena)
     std::optional<Threat> facing;
     double nearest_distance = std::numeric_limits<double>::infinity();
     double facing_distance = std::numeric_limits<double>::infinity();
+    const bool damaged_recently = now <= last_hostile_damage_at_ + FreshHostileDamageSeconds;
     const double radius = number(self_stats, "radius", mech_radius_);
     const double height = number(self_stats, "height", mech_height_);
     for (int id = 0; id < static_cast<int>(enemies.size()); ++id) {
@@ -394,9 +430,23 @@ std::optional<Threat> ThreatTracker::update(const Json& obs, const Arena& arena)
             nearest = observed;
             nearest_distance = distance;
         }
-        if (distance < facing_distance && enemy_aims_at(observed, position, radius, height, arena)) {
+        const auto& charging = field(*enemies[id], "charging");
+        if (charging.is_boolean() && charging.get<bool>() &&
+            (!facing || !facing->laser_charging || distance < facing_distance)) {
+            auto laser = observed;
+            laser.enemy_range = weapon_ranges_[LaserIndex];
+            laser.enemy_muzzle_height = muzzle_height_ * (1 + size_per_cube_ * number(*enemies[id], "cubes", 0.0));
+            if (enemy_aims_at(laser, position, radius, height, arena)) {
+                observed = laser;
+                observed.laser_charging = true;
+            }
+        }
+        const bool preferred = !facing || (observed.laser_charging && !facing->laser_charging) ||
+                               (observed.laser_charging == facing->laser_charging && distance < facing_distance);
+        if (preferred && (observed.laser_charging || enemy_aims_at(observed, position, radius, height, arena))) {
             observed.facing_us = true;
             observed.hostile = true;
+            observed.damaged_recently = damaged_recently;
             observed.attack_id = id;
             observed.attack_position = observed.position;
             observed.attack_velocity = point(enemies[id]->at("vel"));
@@ -413,6 +463,7 @@ std::optional<Threat> ThreatTracker::update(const Json& obs, const Arena& arena)
         threat.position = attacks_[attacker].position;
         threat.actor_id = attacker;
         threat.hostile = true;
+        threat.damaged_recently = damaged_recently;
         threat.attack_id = attacker;
         if (enemy) {
             threat.attack_position = threat.position;
@@ -424,9 +475,163 @@ std::optional<Threat> ThreatTracker::update(const Json& obs, const Arena& arena)
         Threat threat;
         threat.position = unknown_position_;
         threat.hostile = true;
+        threat.damaged_recently = damaged_recently;
         return threat;
     }
     return nearest;
+}
+
+std::optional<Threat> ThreatTracker::duel_target(const Json& obs, const Arena& arena) {
+    const auto& me = obs.at("self");
+    const auto own_id = actor_id(me, "id");
+    const auto& actors = field(obs, "mechs");
+    const auto& beams = field(obs, "beams");
+    const double now = match_time(obs);
+    const auto& zone = field(obs, "zone");
+    const auto& center = field(zone, "center");
+    const Vec2 circle_center = center.is_array() && center.size() >= 2 ? pair(center) : Vec2{};
+    const double circle_radius = number(zone, "radius", -1.0);
+    std::array<const Json*, 16> opponents{};
+    std::array<bool, 16> hurt_by_us{};
+    std::array<bool, 16> lost_health{};
+    for (const auto& event : field(obs, "events")) {
+        if (text(field(event, "type")) == "hit") {
+            if (const auto victim = actor_id(event, "target")) {
+                hurt_by_us[*victim] = true;
+            }
+        }
+    }
+    std::size_t opponent_count = 0;
+    for (const auto& actor : actors) {
+        const auto id = actor_id(actor, "id");
+        if (!id || id == own_id || text(field(actor, "kind")) != "mech" || opponents[*id]) {
+            continue;
+        }
+        opponents[*id] = &actor;
+        ++opponent_count;
+        const double hp = number(actor, "hp", -1.0);
+        const Vec3 position = point(actor.at("pos"));
+        const bool in_zone = distanceXY(position, circle_center) <= circle_radius;
+        const auto previous = health_samples_[*id];
+        if (!hurt_by_us[*id] && in_zone && previous.in_zone && now > previous.time &&
+            now <= previous.time + DuelEvidenceSeconds && hp >= 0 && previous.hp - hp > 0.5) {
+            lost_health[*id] = true;
+        }
+        health_samples_[*id] = {now, hp, in_zone};
+    }
+    if (opponent_count < 2) {
+        if (now <= last_duel_at_ + DuelMemorySeconds) {
+            duel_times_ = {};
+            last_duel_at_ = -std::numeric_limits<double>::infinity();
+        }
+        return std::nullopt;
+    }
+    if (now > last_duel_at_ + DuelMemorySeconds && beams.empty() &&
+        std::none_of(lost_health.begin(), lost_health.end(), [](bool lost) {
+            return lost;
+        })) {
+        return std::nullopt;
+    }
+
+    const auto& stats = field(me, "stats");
+    const Vec3 own_position = point(me.at("pos"));
+    const Vec3 eye = above(own_position, number(stats, "eye_height", 8.0));
+    std::array<std::optional<Threat>, 16> seen;
+    for (int id = 0; id < static_cast<int>(opponents.size()); ++id) {
+        if (!opponents[id]) {
+            continue;
+        }
+        auto actor = describe_enemy(*opponents[id], id);
+        const auto body = above(*actor.position, actor.attack_height / 2);
+        // The server continues reporting actors recently seen behind solid walls.
+        if (!arena.blocksLine(eye, body)) {
+            seen[id] = std::move(actor);
+        }
+    }
+
+    const auto remember_duel = [&](int first, int second) {
+        duel_times_[std::min(first, second)][std::max(first, second)] = now;
+        last_duel_at_ = now;
+    };
+    for (const auto& beam : beams) {
+        const auto kind = text(field(beam, "kind"));
+        const auto shooter = actor_id(beam, "by");
+        const auto& path = field(beam, "path");
+        if ((kind != "laser" && kind != "lightning") || !shooter || !seen[*shooter] ||
+            number(beam, "age", DuelEvidenceSeconds + 1) > DuelEvidenceSeconds || !path.is_array() || path.size() < 2) {
+            continue;
+        }
+        const auto& source = *seen[*shooter];
+        for (int id = 0; id < static_cast<int>(seen.size()); ++id) {
+            if (id == *shooter || !seen[id]) {
+                continue;
+            }
+            const auto& target = *seen[id];
+            for (std::size_t index = 1; index < path.size(); ++index) {
+                if (segment_hits_mech(point(path[index - 1]), point(path[index]), target) &&
+                    enemy_aims_at(target, *source.position, source.attack_radius, source.attack_height, arena)) {
+                    remember_duel(id, *shooter);
+                    break;
+                }
+            }
+        }
+    }
+    for (int id = 0; id < static_cast<int>(seen.size()); ++id) {
+        if (!seen[id] || !lost_health[id]) {
+            continue;
+        }
+        const auto& victim = *seen[id];
+        for (int other = 0; other < static_cast<int>(seen.size()); ++other) {
+            if (other == id || !seen[other]) {
+                continue;
+            }
+            const auto& rival = *seen[other];
+            if (enemy_aims_at(rival, *victim.position, victim.attack_radius, victim.attack_height, arena) &&
+                enemy_aims_at(victim, *rival.position, rival.attack_radius, rival.attack_height, arena)) {
+                remember_duel(id, other);
+            }
+        }
+    }
+
+    std::array<bool, 16> fighting{};
+    for (std::size_t first = 0; first < seen.size(); ++first) {
+        for (std::size_t second = first + 1; second < seen.size(); ++second) {
+            auto& last_evidence = duel_times_[first][second];
+            if (last_evidence && seen[first] && seen[second] && now <= *last_evidence + DuelMemorySeconds) {
+                fighting[first] = fighting[second] = true;
+            } else {
+                last_evidence.reset();
+            }
+        }
+    }
+
+    const auto& weapon = gun(me);
+    const auto& weapon_stats = field(weapon, "stats");
+    const double range = number(weapon_stats, "range", 230.0);
+    const double radius = number(stats, "radius", mech_radius_);
+    const double height = number(stats, "height", mech_height_);
+    std::optional<Threat> preferred;
+    double nearest = std::numeric_limits<double>::infinity();
+    for (int id = 0; id < static_cast<int>(seen.size()); ++id) {
+        if (weapon.is_null() || !fighting[id] || !seen[id]->enemy_aim) {
+            continue;
+        }
+        auto target = *seen[id];
+        if (enemy_aims_at(target, own_position, radius, height, arena)) {
+            continue;
+        }
+        target.attack_position = target.position;
+        target.attack_id = id;
+        target.attack_velocity = point(opponents[id]->at("vel"));
+        const auto shot = shot_points(me, target, weapon_stats);
+        const double distance = distance_3d(shot.origin, shot.intercept);
+        if (distance < nearest && distance <= range && !arena.blocksLine(shot.origin, shot.target) &&
+            !arena.blocksLine(shot.origin, shot.intercept)) {
+            preferred = std::move(target);
+            nearest = distance;
+        }
+    }
+    return preferred;
 }
 
 std::optional<Vec2> retreat_aim(const Json& obs, const std::optional<Threat>& threat) {
@@ -441,27 +646,16 @@ std::optional<Vec2> retreat_aim(const Json& obs, const std::optional<Threat>& th
     return angles(muzzle(me), above(*threat->position, 4.5));
 }
 
-bool return_fire(const Json& obs, const std::optional<Threat>& threat, const Vec2& move, const Arena& arena,
-                 bool returning_to_cover) {
-    if (!threat || !threat->facing_us || !threat->attack_id || !threat->attack_position) {
-        return false;
-    }
-    const auto& me = obs.at("self");
+namespace {
+
+bool ready_aligned_shot(const Json& me, const Threat& target, const Arena& arena) {
     const auto& weapon = gun(me);
     if (weapon.is_null() || number(weapon, "cooldown", 0.0) > 0.1 ||
         number(weapon, "reload", 0.0) > 0 || number(weapon, "ammo", 1.0) <= 0) {
         return false;
     }
-    const auto position = point(me.at("pos"));
-    const double dx = (*threat->attack_position)[0] - position[0];
-    const double dy = (*threat->attack_position)[1] - position[1];
-    // The caller may validate a short return route to cover that points towards the attacker.
-    if (std::hypot(move[0], move[1]) < 0.15 ||
-        (!returning_to_cover && dx * move[0] + dy * move[1] > 0.05 * std::hypot(dx, dy))) {
-        return false;
-    }
     const auto& weapon_stats = field(weapon, "stats");
-    const Shot shot = shot_points(me, *threat, weapon_stats);
+    const Shot shot = shot_points(me, target, weapon_stats);
     const double distance = distance_3d(shot.origin, shot.intercept);
     if (distance > number(weapon_stats, "range", 230.0)) {
         return false;
@@ -470,7 +664,7 @@ bool return_fire(const Json& obs, const std::optional<Threat>& threat, const Vec
     const auto [actual_yaw, actual_pitch] = pair(me.at("aim"));
     const double yaw_error = std::remainder(yaw - actual_yaw, Tau) * std::cos(pitch);
     const double pitch_error = pitch - actual_pitch;
-    const double tolerance = std::min(0.18, std::atan2(0.75 * threat->attack_radius, std::max(distance, 1.0)));
+    const double tolerance = std::min(0.18, std::atan2(0.75 * target.attack_radius, std::max(distance, 1.0)));
     if (yaw_error * yaw_error + pitch_error * pitch_error > tolerance * tolerance) {
         return false;
     }
@@ -480,6 +674,30 @@ bool return_fire(const Json& obs, const std::optional<Threat>& threat, const Vec
                           shot.origin[2] + distance * std::sin(actual_pitch)};
     return !arena.blocksLine(shot.origin, shot.target) && !arena.blocksLine(shot.origin, shot.intercept) &&
            !arena.blocksLine(shot.origin, actual_end);
+}
+
+}  // namespace
+
+bool return_fire(const Json& obs, const std::optional<Threat>& threat, const Vec2& move, const Arena& arena,
+                 bool returning_to_cover) {
+    if (!threat || !threat->facing_us || !threat->attack_id || !threat->attack_position) {
+        return false;
+    }
+    const auto& me = obs.at("self");
+    const auto position = point(me.at("pos"));
+    const double dx = (*threat->attack_position)[0] - position[0];
+    const double dy = (*threat->attack_position)[1] - position[1];
+    // The caller may validate a short return route to cover that points towards the attacker.
+    if (std::hypot(move[0], move[1]) < 0.15 ||
+        (!returning_to_cover && dx * move[0] + dy * move[1] > 0.05 * std::hypot(dx, dy))) {
+        return false;
+    }
+    return ready_aligned_shot(me, *threat, arena);
+}
+
+bool opportunity_fire(const Json& obs, const std::optional<Threat>& target, const Arena& arena) {
+    return target && !target->hostile && !target->facing_us && target->attack_id && target->attack_position &&
+           ready_aligned_shot(obs.at("self"), *target, arena);
 }
 
 std::vector<Cube> safe_cubes(const Json& obs, const std::optional<Threat>& threat,
