@@ -120,6 +120,60 @@ private:
         double climbEnergy = 0.0;
     };
 
+    using Weapons = std::array<std::optional<WeaponInfo>, 2>;
+
+    struct FireState {
+        Vec3 pos{};
+        Vec3 vel{};
+        Vec2 aim{};
+        double turnRate = 4.0;
+        double pitchRate = 3.0;
+        double minPitch = -0.7;
+        double maxPitch = 1.3;
+        double muzzleHeight = 7.0;
+        double height = 9.0;
+        double energy = 100.0;
+        int cubes = 0;
+    };
+
+    struct FirePlan {
+        Vec2 aim{};
+        Vec2 gunAim{};
+        Vec2 hitscanAim{};
+        std::array<bool, 2> fire{};
+        double yawTolerance = 0.0;
+        double pitchTolerance = 0.0;
+    };
+
+    struct ActionChoice {
+        Vec2 move{};
+        bool boost = false;
+        bool waitForCover = false;
+        bool stayToFight = false;
+        bool finishesWhileMoving = false;
+        bool baselineFight = false;
+    };
+
+    struct ProjectionContext;
+    struct ProjectedAction;
+    struct Projection;
+
+    FirePlan planDirectFire(const FireState& state, const Weapons& weapons, const MechTrack* target,
+                            const Vec3& point, const Vec3& velocity, double radius, double height,
+                            bool movingToCover) const;
+    ProjectionContext projectionContext(const Json& obs, const Json& me, const FireState& fire,
+                                        const Weapons& weapons, const MechTrack* target,
+                                        const std::vector<MechTrack*>& seen, bool enteringZone = false) const;
+    void projectAction(const ProjectionContext& context, const ProjectedAction& action,
+                       Projection& state, bool pursuit, int decision) const;
+    ActionChoice compareActions(const ProjectionContext& context, const std::vector<ProjectedAction>& actions,
+                                bool enteringZone) const;
+    ActionChoice chooseFinishAction(const ProjectionContext& context, ActionChoice fallback,
+                                    std::optional<Vec2> cover, std::optional<ActionChoice> baselineFight);
+    ActionChoice chooseZoneAction(const ProjectionContext& context, ActionChoice fallback, Vec2 goal);
+    bool projectMove(const ProjectionContext& context, const Vec3& from, Vec3& to) const;
+    bool canFinishWithinProjection(const FireState& state, const Weapons& weapons, const MechTrack& target) const;
+
     double scaleOf(int cubes) const;
     Vec3 centerOf(const MechTrack& t) const;
     Vec3 eyeOf(const MechTrack& t) const;
@@ -269,6 +323,7 @@ private:
     double lastThreatAt_ = -100.0;
     double lastLaserSoundAt_ = -100.0;
     double laserSoundBearing_ = 0.0;
+    double laserShortUntil_ = -100.0;
     int lootID_ = -1;
     double lootSince_ = -100.0;
     bool roofFlying_ = false;

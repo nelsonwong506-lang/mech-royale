@@ -11,6 +11,10 @@ namespace {
 constexpr double kTau = 2.0 * std::numbers::pi;
 constexpr double kLat = 0.075;
 constexpr double kInf = std::numeric_limits<double>::infinity();
+constexpr double kTick = 0.05;
+constexpr double kDecision = 2.0 * kTick;
+constexpr int kProjectionDecisions = 32;
+constexpr int kProjectionTicks = 2 * kProjectionDecisions;
 
 double angDiff(double a, double b) {
     return std::remainder(a - b, kTau);
@@ -114,6 +118,25 @@ std::array<std::optional<WeaponInfo>, 2> parseWeapons(const Json& me) {
 double gunHitProb(double dist) {
     const double u = dist / 155.0;
     return std::clamp(1.0 / (1.0 + u * u), 0.18, 0.96);
+}
+
+Vec2 limitLength(Vec2 v, double limit) {
+    const double length = std::hypot(v[0], v[1]);
+    if (length > limit) {
+        v[0] *= limit / length;
+        v[1] *= limit / length;
+    }
+    return v;
+}
+
+Vec2 toward(const Vec3& from, Vec2 to) {
+    const Vec2 delta{to[0] - from[0], to[1] - from[1]};
+    const double length = std::hypot(delta[0], delta[1]);
+    return length > 1e-6 ? Vec2{delta[0] / length, delta[1] / length} : Vec2{};
+}
+
+double distanceTo(const Vec3& from, Vec2 to) {
+    return std::hypot(to[0] - from[0], to[1] - from[1]);
 }
 
 }  // namespace
@@ -964,6 +987,10 @@ void Brain::observe(const Json& obs, const Json& me, const std::array<std::optio
                         ni->second.hitMe = now_;
                     }
                 }
+            } else if (type == "effect" && strOr(e, "effect") == "short") {
+                const auto& kinds = config_.contains("weapons") ? config_["weapons"] : Json::object();
+                const auto& arc = kinds.contains("lightning") ? kinds["lightning"] : Json::object();
+                laserShortUntil_ = now_ + numOr(arc, "short_s", 2.0);
             } else if (type == "hit") {
                 // Dealing damage to ANY target resets the 5s regen clock (protocol.md §7)
                 lastCombatAt_ = now_;
@@ -1970,6 +1997,795 @@ std::optional<Vec2> Brain::mortarAim(const Vec3& tube, const Vec3& foot, const V
     return std::nullopt;
 }
 
+Brain::FirePlan Brain::planDirectFire(const FireState& state, const Weapons& ws,
+                                      const MechTrack* target, const Vec3& tp, const Vec3& tv,
+                                      double tr, double th, bool movingToCover) const {
+    const auto& [x, y, zf] = state.pos;
+    const Vec3 muzzle{x + state.vel[0] * kLat, y + state.vel[1] * kLat, zf + state.muzzleHeight};
+    const auto& curAim = state.aim;
+    const double turnRate = state.turnRate, pitchRate = state.pitchRate;
+    const double minPitch = state.minPitch, maxPitch = state.maxPitch;
+    const double ownHeight = state.height, energy = state.energy;
+    const int myCubes = state.cubes;
+    const WeaponInfo* gun = getWeapon(ws, "gun");
+    FirePlan result;
+    Vec2& aim = result.aim;
+    auto& fire = result.fire;
+    const double dist = std::hypot(tp[0] - x, tp[1] - y);
+    const bool targetGrounded = std::abs(tv[2]) < 0.5;
+    Vec2 gAim{0.0, 0.0};
+    bool gunOK = false;
+    if (gun) {
+        gAim = leadAim(muzzle, tp, tv, gun->speed, targetGrounded);
+        gunOK = dist <= gun->range * 0.96;
+    }
+    const Vec3 dp{tp[0] + tv[0] * (kLat + 0.05), tp[1] + tv[1] * (kLat + 0.05), tp[2]};
+    const double hy = std::atan2(dp[1] - muzzle[1], dp[0] - muzzle[0]);
+    const double hpPitch = std::atan2(dp[2] - muzzle[2], std::hypot(dp[0] - muzzle[0], dp[1] - muzzle[1]));
+
+    aim = gun ? gAim : Vec2{hy, hpPitch};
+
+    const double tolY = std::atan2(tr * 0.75, std::max(dist, 1.0));
+    const double tolP = std::atan2(th * 0.40, std::max(dist, 1.0));
+    result.gunAim = gAim;
+    result.hitscanAim = {hy, hpPitch};
+    result.yawTolerance = tolY;
+    result.pitchTolerance = tolP;
+    auto slewAligned = [&](double wantY, double wantP) -> bool {
+        const double ey = std::max(0.0, std::abs(angDiff(wantY, curAim[0])) - turnRate * 0.05);
+        const double ep = std::max(0.0, std::abs(wantP - curAim[1]) - pitchRate * 0.05);
+        return ey < tolY && ep < tolP;
+    };
+
+    for (int i = 0; i < 2; ++i) {
+        const auto& ow = ws[static_cast<std::size_t>(i)];
+        if (!ow) continue;
+        const auto& w = *ow;
+        if (w.kind == "gun") {
+            if (gunOK && w.ammo > 0.0 && w.reload <= 0.0 && slewAligned(gAim[0], gAim[1])) {
+                fire[static_cast<std::size_t>(i)] = true;
+            }
+        } else if (w.kind == "lightning") {
+            const double cone = radians(w.coneDeg);
+            if (dist < w.range - 1.5 &&
+                std::abs(angDiff(hy, curAim[0])) < cone * 0.5 - 0.05 &&
+                energy >= w.energyCost) {
+                fire[static_cast<std::size_t>(i)] = true;
+            }
+        } else if (w.kind == "laser") {
+            if (!target || dist > w.range * 0.97) continue;
+            // Don't start a fresh laser charge (0.5x move speed!) while actively running to cover
+            if (movingToCover && w.charge <= 0.0) continue;
+            const double full = w.fullCharge;
+            // Always-on exact physics lethal early release (with cube + cook-off + rear-armor multipliers!)
+            if (w.charge >= w.minCharge && w.charge < full - 0.051) {
+                double dmg = w.damage * (w.minFrac + (1.0 - w.minFrac) * (w.charge / full)) *
+                    (1.0 + cfgDmgPerCube_ * static_cast<double>(std::min(myCubes, cfgCubeStatCap_)));
+                if (holdsKind(target->weapons, "mortar")) dmg *= (1.0 + w.cookoff);
+                if (showsBack(*target, x, y)) dmg *= cfgRearMult_;
+                if (dmg * 0.80 >= target->hp &&
+                    std::abs(angDiff(hy, curAim[0])) < tolY * 0.9 &&
+                    std::abs(hpPitch - curAim[1]) < tolP) {
+                    aim = {hy, hpPitch};
+                    fire[static_cast<std::size_t>(i)] = false;
+                    continue;
+                }
+            }
+            if (w.charge < full - 0.051) {
+                fire[static_cast<std::size_t>(i)] = true;
+                if (w.charge > full * 0.45) {
+                    aim = {hy, hpPitch};
+                }
+            } else {
+                aim = {hy, hpPitch};
+                const double ey = std::abs(angDiff(hy, curAim[0]));
+                const double ep = std::abs(hpPitch - curAim[1]);
+                fire[static_cast<std::size_t>(i)] = !(ey < tolY * 0.9 && ep < tolP);
+            }
+        } else if (w.kind == "mortar") {
+            if (!target || w.cooldown > 0.25 || dist < 16.0 || dist > 200.0) continue;
+            const Vec3 tube{muzzle[0], muzzle[1], zf + ownHeight + 0.5};
+            const Vec3 foot{tp[0], tp[1], tp[2] - th * 0.5};
+            if (const auto ma = mortarAim(tube, foot, tv, w.speed, w.gravity, minPitch, maxPitch, false)) {
+                if (!gun || gun->reload > 0.0 || gun->ammo <= 0.0 || !gunOK) {
+                    aim = *ma;
+                }
+                const double ey = std::max(0.0, std::abs(angDiff((*ma)[0], curAim[0])) - turnRate * 0.05);
+                const double ep = std::max(0.0, std::abs((*ma)[1] - curAim[1]) - pitchRate * 0.05);
+                if (ey < 0.04 && ep < 0.03) {
+                    fire[static_cast<std::size_t>(i)] = true;
+                }
+            }
+        }
+    }
+    return result;
+}
+
+struct Brain::ProjectionContext {
+    struct Threat {
+        const MechTrack* mech;
+        double damageRate;
+        bool chasing;
+    };
+    struct Projectile {
+        Vec3 pos;
+        Vec3 vel;
+        double damage;
+    };
+
+    FireState fire;
+    Weapons weapons;
+    const MechTrack* target = nullptr;
+    std::vector<Threat> threats;
+    std::vector<Projectile> projectiles;
+    std::vector<Vec3> lightningInterceptors;
+    std::array<ZoneCircle, kProjectionTicks + 1> circles{};
+    double hp = 1400.0;
+    double maxHp = 1400.0;
+    double armor = 0.0;
+    double maxEnergy = 100.0;
+    double walk = 11.7;
+    double boost = 19.5;
+    double accel = 58.5;
+    double radius = 2.5;
+    double stepUp = 1.2;
+    double maxSlope = 50.0;
+    double boostDrain = 17.0;
+    double energyRegen = 18.0;
+    double energyDelay = 0.6;
+    double chargeMove = 0.5;
+    double regenPerS = 45.0;
+    double zoneDPS = 20.0;
+    double backgroundDPS = 0.0;
+    bool inZone = true;
+    bool enteringZone = false;
+    Vec2 dodge{};
+    bool dodgeLaser = false;
+};
+
+struct Brain::ProjectedAction {
+    ActionChoice first;
+    std::optional<Vec2> waypoint;
+    std::optional<Vec2> goal;
+};
+
+struct Brain::Projection {
+    FireState fire;
+    Weapons weapons;
+    std::array<Vec3, 4> enemies{};
+    std::array<double, 4> pursuitSide{};
+    std::array<bool, 8> incomingHit{};
+    std::array<double, kProjectionTicks + 1> pendingDamage{};
+    MechTrack target;
+    double hp = 0.0;
+    double deathTime = kInf;
+    double outsideTime = 0.0;
+    double exposedTime = 0.0;
+    double lastCombat = 0.0;
+    double lastEnergyUse = 0.0;
+    double stoppedOnWall = 0.0;
+    bool reachedCover = false;
+    bool settled = false;
+};
+
+Brain::ProjectionContext Brain::projectionContext(const Json& obs, const Json& me, const FireState& fire,
+                                                  const Weapons& weapons, const MechTrack* target,
+                                                  const std::vector<MechTrack*>& seen, bool enteringZone) const {
+    ProjectionContext c;
+    c.fire = fire;
+    c.weapons = weapons;
+    c.target = target;
+    c.enteringZone = enteringZone;
+    c.hp = numOr(me, "hp", 1400.0);
+    c.maxHp = numOr(me, "max_hp", 1400.0);
+    c.maxEnergy = numOr(me, "max_energy", 100.0);
+    c.inZone = boolOr(me, "in_zone", true);
+    const auto& st = me.contains("stats") && me["stats"].is_object() ? me["stats"] : Json::object();
+    c.armor = numOr(st, "armor", 0.0);
+    c.walk = std::max(1.0, numOr(st, "walk_speed", 11.7));
+    c.boost = std::max(c.walk, numOr(st, "boost_speed", 19.5));
+    c.accel = std::max(1.0, numOr(st, "ground_accel", 58.5));
+    c.radius = numOr(st, "radius", cfgMechRadius_);
+    c.stepUp = numOr(st, "step_up", 1.2);
+    c.maxSlope = numOr(st, "max_slope_deg", 50.0);
+    c.boostDrain = numOr(st, "boost_drain", 17.0);
+    c.energyRegen = numOr(st, "energy_regen", cfgEnergyRegen_);
+    c.energyDelay = numOr(st, "energy_regen_delay", 0.6);
+    c.chargeMove = std::clamp(numOr(st, "charge_move_mult", 0.5), 0.1, 1.0);
+    c.regenPerS = numOr(st, "regen_per_s", cfgRegenPerS_);
+
+    const auto& zone = obs.contains("zone") && obs["zone"].is_object() ? obs["zone"] : Json::object();
+    c.zoneDPS = numOr(zone, "dps", 20.0);
+    c.circles[0] = curZone(zone);
+    const double shrinkStart = numOr(zone, "shrink_start", 0.0);
+    const double shrinkEnd = numOr(zone, "shrink_end", 0.0);
+    const auto next = safeVec2(zone, "next_center", {c.circles[0].x, c.circles[0].y});
+    const double nextRadius = numOr(zone, "next_radius", c.circles[0].r);
+    for (int tick = 1; tick <= kProjectionTicks; ++tick) {
+        if (now_ >= shrinkStart && now_ < shrinkEnd) {
+            const auto& current = c.circles[0];
+            const double fraction = std::min(1.0, tick * kTick / (shrinkEnd - now_));
+            c.circles[tick] = {std::lerp(current.x, next[0], fraction), std::lerp(current.y, next[1], fraction),
+                               std::lerp(current.r, nextRadius, fraction)};
+        } else {
+            c.circles[tick] = zoneAt(zone, now_ + tick * kTick);
+        }
+    }
+    dodgeBullets(obs, me, c.dodge[0], c.dodge[1], c.dodgeLaser);
+
+    for (const MechTrack* enemy : seen) {
+        const double dist = distanceTo(fire.pos, {enemy->pos[0], enemy->pos[1]});
+        const double attention = attentionWeight(*enemy, fire.pos[0], fire.pos[1]);
+        const bool aiming = attention > 0.7;
+        const double rate = enemyExpectedDPS(*enemy, weapons, c.armor, fire.energy, dist, aiming, false);
+        const double towardMe = std::atan2(fire.pos[1] - enemy->pos[1], fire.pos[0] - enemy->pos[0]);
+        const bool facingMe = std::abs(angDiff(enemy->aim[0], towardMe)) < 0.35;
+        const bool chasing = now_ - enemy->hitMe < 4.5 ||
+            (enemy->seen == now_ && facingMe && (dist < 65.0 || enemy->closing > 0.0));
+        c.threats.push_back({enemy, rate * attention, chasing});
+    }
+    std::stable_sort(c.threats.begin(), c.threats.end(), [&](const auto& a, const auto& b) {
+        if ((a.mech == target) != (b.mech == target)) return a.mech == target;
+        return a.damageRate > b.damageRate;
+    });
+    for (std::size_t i = 4; i < c.threats.size(); ++i) {
+        if (c.threats[i].mech->los) c.backgroundDPS += c.threats[i].damageRate;
+    }
+    if (c.threats.size() > 4) c.threats.resize(4);
+
+    if (const auto it = obs.find("projectiles"); it != obs.end() && it->is_array()) {
+        for (const auto& item : *it) {
+            const std::string kind = strOr(item, "kind");
+            if (kind != "gun" && kind != "npc") continue;
+            const Vec3 pos = safeVec3(item, "pos"), vel = safeVec3(item, "vel");
+            const double speed2 = vel[0] * vel[0] + vel[1] * vel[1];
+            if (speed2 <= 1.0) continue;
+            const double dx = fire.pos[0] - pos[0], dy = fire.pos[1] - pos[1];
+            const double t = (dx * vel[0] + dy * vel[1]) / speed2;
+            // A projectile can only intersect the portion of the map we can reach before it passes.
+            if (t < 0.0 || t > 0.8 ||
+                std::hypot(dx - t * vel[0], dy - t * vel[1]) > c.radius + t * c.boost) continue;
+            c.projectiles.push_back({pos, vel, kind == "npc" ? 25.0 : 45.0});
+            if (c.projectiles.size() == 8) break;
+        }
+    }
+    if (getWeapon(weapons, "lightning") && target) {
+        for (const char* field : {"mechs", "crates"}) {
+            if (const auto it = obs.find(field); it != obs.end() && it->is_array()) {
+                for (const auto& item : *it) {
+                    if (intOr(item, "id", -1) == target->id) continue;
+                    const Vec3 pos = safeVec3(item, "pos");
+                    if (distanceTo(fire.pos, {pos[0], pos[1]}) <= 2.0 * getWeapon(weapons, "lightning")->range) {
+                        c.lightningInterceptors.push_back(pos);
+                    }
+                }
+            }
+        }
+    }
+    return c;
+}
+
+bool Brain::projectMove(const ProjectionContext& c, const Vec3& from, Vec3& to) const {
+    if (!nav_.inBounds(to[0], to[1])) return false;
+    to[2] = arena_.surface(to[0], to[1], from[2] + c.stepUp + 1e-6);
+    return arena_.walkSegment(from, to, c.radius, c.fire.height, c.stepUp, c.maxSlope);
+}
+
+bool Brain::canFinishWithinProjection(const FireState& fs, const Weapons& weapons,
+                                       const MechTrack& target) const {
+    // An optimistic bound limits this decision to genuine finish opportunities. Ordinary
+    // retreats keep their existing route when even every available shot would fall short.
+    constexpr double horizon = kProjectionDecisions * kDecision;
+    double damage = 0.0;
+    for (const auto& slot : weapons) {
+        if (!slot) continue;
+        const auto& w = *slot;
+        double ready = w.cooldown;
+        double shotDamage = w.damage;
+        if (w.kind == "gun") {
+            const double reload = w.ammo <= 0.0 && w.reload <= 0.0 ? w.reloadS : w.reload;
+            ready = std::max(ready, reload) + target.dist / std::max(1.0, w.speed);
+        } else if (w.kind == "laser") {
+            ready = std::max(ready, laserShortUntil_ - now_) + std::max(0.0, w.minCharge - w.charge);
+            if (holdsKind(target.weapons, "mortar")) shotDamage *= 1.0 + w.cookoff;
+        } else if (w.kind != "lightning") {
+            continue;
+        }
+        if (ready > horizon) continue;
+        double shots = 1.0 + std::floor((horizon - ready) / w.fireInterval);
+        if (w.kind == "lightning" && w.energyCost > 0.0) {
+            shots = std::min(shots, std::floor((fs.energy + cfgEnergyRegen_ * horizon) / w.energyCost));
+        }
+        damage += shots * shotDamage;
+    }
+    const double cubeMult = 1.0 + cfgDmgPerCube_ * std::min(fs.cubes, cfgCubeStatCap_);
+    return damage * cubeMult * cfgRearMult_ >= target.hp;
+}
+
+void Brain::projectAction(const ProjectionContext& c, const ProjectedAction& action,
+                          Projection& s, bool pursuit, int decision) const {
+    if (s.hp <= 0.0) return;
+    const double elapsed = decision * kDecision;
+    auto& fs = s.fire;
+    const WeaponInfo* laser = getWeapon(s.weapons, "laser");
+    const double chargeFactor = laser && laser->charge > 0.0 ? c.chargeMove : 1.0;
+    Vec2 move = action.first.move;
+    if (decision > 0 && action.waypoint) {
+        Vec2 waypoint = *action.waypoint;
+        if (action.goal && distanceTo(fs.pos, waypoint) <= c.walk * kDecision) waypoint = *action.goal;
+        const double distance = distanceTo(fs.pos, waypoint);
+        const double speed = (action.first.boost ? c.boost : c.walk) * chargeFactor;
+        move = toward(fs.pos, waypoint);
+        const double fraction = std::clamp(distance / (speed * kDecision), 0.0, 1.0);
+        move[0] *= fraction;
+        move[1] *= fraction;
+    }
+
+    double inDPS = c.backgroundDPS;
+    double fromTarget = 0.0;
+    bool exposed = c.backgroundDPS > 0.0;
+    bool targetVisible = false;
+    const Vec3 body{fs.pos[0], fs.pos[1], fs.pos[2] + fs.height * 0.6};
+    for (std::size_t i = 0; i < c.threats.size(); ++i) {
+        const auto& track = c.threats[i];
+        const auto& enemy = *track.mech;
+        const bool isTarget = track.mech == c.target;
+        if (isTarget && s.target.hp <= 0.0) continue;
+        Vec3& pos = s.enemies[i];
+        double vx = enemy.vel[0], vy = enemy.vel[1];
+        const double distBefore = distanceTo(fs.pos, {pos[0], pos[1]});
+        if (pursuit && track.chasing) {
+            const Vec2 toMe = toward(pos, {fs.pos[0], fs.pos[1]});
+            const double clearance = std::max(0.0, distBefore - c.radius - cfgMechRadius_ * scaleOf(enemy.cubes));
+            const double speed = std::min(std::max(11.7, std::hypot(vx, vy)), clearance / kDecision);
+            vx = toMe[0] * speed;
+            vy = toMe[1] * speed;
+        }
+        if (decision > 0 && (vx != 0.0 || vy != 0.0)) {
+            auto step = [&](double dx, double dy) {
+                const double nx = pos[0] + dx * kDecision, ny = pos[1] + dy * kDecision;
+                if (!nav_.inBounds(nx, ny) || !nav_.free(nx, ny) || !nav_.lineWalkable(pos[0], pos[1], nx, ny)) {
+                    return false;
+                }
+                pos = {nx, ny, arena_.surface(nx, ny, pos[2] + c.stepUp + 1e-6)};
+                return true;
+            };
+            if (step(vx, vy)) {
+                s.pursuitSide[i] = 0.0;
+            } else if (pursuit && track.chasing) {
+                // Continue around the same side of a corner until a direct approach opens.
+                const double side = s.pursuitSide[i] == 0.0 ? 1.0 : s.pursuitSide[i];
+                const double heading = std::atan2(vy, vx), speed = std::hypot(vx, vy);
+                for (double turn : {side, -side, 2.0 * side, -2.0 * side, 3.0 * side, -3.0 * side}) {
+                    const double a = heading + turn * std::numbers::pi / 4.0;
+                    const double dx = speed * std::cos(a), dy = speed * std::sin(a);
+                    if (step(dx, dy)) {
+                        vx = dx;
+                        vy = dy;
+                        s.pursuitSide[i] = std::copysign(1.0, turn);
+                        break;
+                    }
+                }
+            }
+        }
+        const double dist = distanceTo(fs.pos, {pos[0], pos[1]});
+        const Vec3 eye{pos[0], pos[1], pos[2] + cfgMechEye_ * scaleOf(enemy.cubes)};
+        const bool blocked = arena_.blocksLine(eye, body);
+        if (isTarget) {
+            s.target.pos = pos;
+            s.target.vel = {vx, vy, enemy.vel[2]};
+            if (pursuit && track.chasing && decision > 0) {
+                s.target.aim[0] = std::atan2(fs.pos[1] - pos[1], fs.pos[0] - pos[0]);
+            }
+            targetVisible = !blocked || (decision == 0 && enemy.los);
+        }
+        if (blocked) continue;
+        const double bearing = std::atan2(fs.pos[1] - pos[1], fs.pos[0] - pos[0]);
+        const double off = std::abs(angDiff(enemy.aim[0], bearing));
+        const bool facing = off < 0.35 || (pursuit && track.chasing);
+        const double attention = track.chasing || dist < 42.0 ? 1.0 : (facing ? 0.95 : (off < 0.85 ? 0.55 : 0.25));
+        double rate = enemyExpectedDPS(enemy, s.weapons, c.armor, fs.energy, dist, facing, false) * attention;
+        if (enemy.charging && facing && elapsed < std::max(0.0, 0.75 - kDecision)) rate += 315.0;
+        if (dist > 48.0 && arena_.blocksVisionTree(eye, body)) rate *= 0.15;
+        const double toEnemy = std::atan2(pos[1] - fs.pos[1], pos[0] - fs.pos[0]);
+        if (std::abs(angDiff(fs.aim[0], toEnemy)) > radians(cfgFrontArcDeg_ * 0.5)) rate *= cfgRearMult_;
+        inDPS += rate;
+        if (isTarget) fromTarget = rate;
+        exposed = exposed || rate > 0.0;
+    }
+
+    if (decision > 0 && !exposed) s.reachedCover = true;
+    const bool quiet = action.first.waitForCover && !s.reachedCover;
+    FirePlan shot;
+    shot.aim = fs.aim;
+    double targetDistance = 0.0;
+    if (targetVisible) {
+        const double scale = scaleOf(s.target.cubes);
+        const double height = cfgMechHeight_ * scale;
+        Vec3 point = s.target.pos;
+        point[2] += height * 0.5;
+        const Vec3 muzzle{fs.pos[0] + fs.vel[0] * kLat, fs.pos[1] + fs.vel[1] * kLat, fs.pos[2] + fs.muzzleHeight};
+        if (arena_.blocksLine(muzzle, point)) point[2] = s.target.pos[2] + height * 0.85;
+        targetVisible = !arena_.blocksLine(muzzle, point);
+        targetDistance = distanceTo(fs.pos, {point[0], point[1]});
+        if (targetVisible) {
+            const bool movingToCover = !c.enteringZone && !action.first.stayToFight &&
+                (action.goal || action.first.boost) && (move[0] != 0.0 || move[1] != 0.0);
+            shot = planDirectFire(fs, s.weapons, &s.target, point, s.target.vel, cfgMechRadius_ * scale,
+                                  height, movingToCover);
+        }
+    }
+    if (quiet) shot.fire.fill(false);
+
+    for (int substep = 1; substep <= 2; ++substep) {
+        const int tick = 2 * decision + substep;
+        const double time = tick * kTick;
+        fs.aim[0] += std::clamp(angDiff(shot.aim[0], fs.aim[0]), -fs.turnRate * kTick, fs.turnRate * kTick);
+        fs.aim[1] = std::clamp(fs.aim[1] + std::clamp(shot.aim[1] - fs.aim[1], -fs.pitchRate * kTick, fs.pitchRate * kTick),
+                              fs.minPitch, fs.maxPitch);
+        const bool boosting = action.first.boost && fs.energy > 0.1 && (move[0] != 0.0 || move[1] != 0.0);
+        const double speed = (boosting ? c.boost : c.walk) *
+                             ((laser && laser->charge > 0.0) ? c.chargeMove : 1.0);
+        const Vec2 dv = limitLength({move[0] * speed - fs.vel[0], move[1] * speed - fs.vel[1]}, c.accel * kTick);
+        fs.vel[0] += dv[0];
+        fs.vel[1] += dv[1];
+        const Vec3 before = fs.pos;
+        Vec3 next{fs.pos[0] + fs.vel[0] * kTick, fs.pos[1] + fs.vel[1] * kTick, fs.pos[2]};
+        if (next != before && !projectMove(c, before, next)) {
+            Vec3 slideX{next[0], before[1], before[2]};
+            Vec3 slideY{before[0], next[1], before[2]};
+            const bool canSlideX = slideX[0] != before[0] && projectMove(c, before, slideX);
+            const bool canSlideY = slideY[1] != before[1] && projectMove(c, before, slideY);
+            if (canSlideX && (!canSlideY || std::abs(fs.vel[0]) >= std::abs(fs.vel[1]))) {
+                next = slideX;
+                fs.vel[1] = 0.0;
+            } else if (canSlideY) {
+                next = slideY;
+                fs.vel[0] = 0.0;
+            } else {
+                next = before;
+                fs.vel[0] = fs.vel[1] = 0.0;
+                s.stoppedOnWall += kTick;
+            }
+        }
+        fs.pos = next;
+        if (boosting) {
+            fs.energy = std::max(0.0, fs.energy - c.boostDrain * kTick);
+            s.lastEnergyUse = now_ + time;
+        } else if (now_ + time - s.lastEnergyUse >= c.energyDelay) {
+            fs.energy = std::min(c.maxEnergy, fs.energy + c.energyRegen * kTick);
+        }
+
+        const auto& circle = c.circles[tick];
+        const bool outside = distanceTo(fs.pos, {circle.x, circle.y}) > circle.r;
+        if (outside) s.outsideTime += kTick;
+        if (exposed) s.exposedTime += kTick;
+        double damage = (inDPS + (outside ? c.zoneDPS : 0.0)) * kTick;
+        for (std::size_t i = 0; i < c.projectiles.size(); ++i) {
+            if (s.incomingHit[i]) continue;
+            const auto& p = c.projectiles[i];
+            const double x = p.pos[0] + p.vel[0] * (time - kTick) - before[0];
+            const double y = p.pos[1] + p.vel[1] * (time - kTick) - before[1];
+            const double dx = p.vel[0] * kTick - (next[0] - before[0]);
+            const double dy = p.vel[1] * kTick - (next[1] - before[1]);
+            const double length2 = dx * dx + dy * dy;
+            if (length2 < 1e-6) continue;
+            const double closest = std::clamp(-(x * dx + y * dy) / length2, 0.0, 1.0);
+            if (std::hypot(x + dx * closest, y + dy * closest) > c.radius + 0.3) continue;
+            const double impactTime = time - kTick + kTick * closest;
+            const Vec3 impact{p.pos[0] + p.vel[0] * impactTime, p.pos[1] + p.vel[1] * impactTime,
+                              p.pos[2] + p.vel[2] * impactTime};
+            const double floor = before[2] + (next[2] - before[2]) * closest;
+            if (impact[2] < floor - 0.3 || impact[2] > floor + fs.height + 0.3) continue;
+            if (!arena_.blocksLine(p.pos, impact)) damage += p.damage * std::clamp(1.0 - c.armor, 0.25, 1.0);
+            s.incomingHit[i] = true;
+        }
+        s.hp -= damage;
+        if (damage > 0.0) s.lastCombat = now_ + time;
+        if (s.hp <= 0.0) {
+            s.deathTime = time;
+            s.settled = true;
+            return;
+        }
+
+        const double cubeMult = 1.0 + cfgDmgPerCube_ * std::min(fs.cubes, cfgCubeStatCap_);
+        const double rear = showsBack(s.target, fs.pos[0], fs.pos[1]) ? cfgRearMult_ : 1.0;
+        for (std::size_t slot = 0; slot < s.weapons.size(); ++slot) {
+            if (!s.weapons[slot]) continue;
+            auto& w = *s.weapons[slot];
+            w.cooldown = std::max(0.0, w.cooldown - kTick);
+            const bool holding = shot.fire[slot] && s.target.hp > 0.0;
+            const auto aligned = [&](Vec2 aim, double yawTol) {
+                return std::abs(angDiff(fs.aim[0], aim[0])) < yawTol &&
+                       std::abs(fs.aim[1] - aim[1]) < shot.pitchTolerance;
+            };
+            if (w.kind == "gun") {
+                if (w.reload > 0.0) {
+                    w.reload = std::max(0.0, w.reload - kTick);
+                    if (w.reload <= 0.0) w.ammo = w.mag;
+                }
+                if (!holding || w.cooldown > 0.0 || w.reload > 0.0 || w.ammo <= 0.0) continue;
+                --w.ammo;
+                w.cooldown = w.fireInterval;
+                if (w.ammo <= 0.0) w.reload = w.reloadS;
+                if (targetVisible && aligned(shot.gunAim, shot.yawTolerance)) {
+                    const double flight = targetDistance / std::max(1.0, w.speed);
+                    const int impact = tick + static_cast<int>(std::ceil(flight / kTick));
+                    if (impact <= kProjectionTicks) {
+                        s.pendingDamage[impact] += w.damage * cubeMult * rear * gunHitProb(targetDistance);
+                    }
+                }
+            } else if (w.kind == "laser") {
+                if (now_ + time < laserShortUntil_) {
+                    w.charge = 0.0;
+                } else if (w.charge <= 0.0) {
+                    if (holding && w.cooldown <= 0.0) w.charge = kTick;
+                } else {
+                    w.charge += kTick;
+                    if ((!holding && w.charge >= w.minCharge) || w.charge >= w.fullCharge + w.holdS) {
+                        const double fraction = w.minFrac + (1.0 - w.minFrac) * std::min(1.0, w.charge / w.fullCharge);
+                        if (targetVisible && targetDistance <= w.range && aligned(shot.hitscanAim, shot.yawTolerance * 0.9)) {
+                            const double cookoff = holdsKind(s.target.weapons, "mortar") ? 1.0 + w.cookoff : 1.0;
+                            s.pendingDamage[tick] += w.damage * fraction * cubeMult * cookoff * rear * 0.8;
+                        }
+                        w.charge = 0.0;
+                        w.cooldown = w.fireInterval;
+                    }
+                }
+            } else if (w.kind == "lightning" && holding && w.cooldown <= 0.0 && fs.energy >= w.energyCost) {
+                fs.energy -= w.energyCost;
+                s.lastEnergyUse = now_ + time;
+                w.cooldown = w.fireInterval;
+                const double cone = radians(w.coneDeg) * 0.5;
+                if (!targetVisible || targetDistance >= w.range ||
+                    std::abs(angDiff(shot.hitscanAim[0], fs.aim[0])) >= cone) continue;
+                const bool intercepted = std::any_of(c.lightningInterceptors.begin(), c.lightningInterceptors.end(),
+                    [&](const Vec3& point) {
+                        const double yaw = std::atan2(point[1] - fs.pos[1], point[0] - fs.pos[0]);
+                        return distanceTo(fs.pos, {point[0], point[1]}) < targetDistance &&
+                               std::abs(angDiff(yaw, fs.aim[0])) < cone &&
+                               !arena_.blocksLine({fs.pos[0], fs.pos[1], fs.pos[2] + fs.muzzleHeight},
+                                                  {point[0], point[1], point[2] + 1.0});
+                    });
+                if (!intercepted) s.pendingDamage[tick] += w.damage * cubeMult * rear;
+            } else if (w.kind == "mortar" && holding && w.cooldown <= 0.0) {
+                w.cooldown = w.fireInterval;
+            }
+        }
+        if (s.pendingDamage[tick] > 0.0 && s.target.hp > 0.0) {
+            s.target.hp -= s.pendingDamage[tick];
+            s.lastCombat = now_ + time;
+            if (s.target.hp <= 0.0) {
+                targetVisible = false;
+                inDPS = std::max(0.0, inDPS - fromTarget);
+            }
+        }
+        if (!outside && now_ + time - s.lastCombat >= cfgRegenDelay_) {
+            s.hp = std::min(c.maxHp, s.hp + c.regenPerS * kTick);
+        }
+    }
+    const auto& circle = c.circles[2 * decision + 2];
+    const bool inZone = distanceTo(fs.pos, {circle.x, circle.y}) <= circle.r;
+    const bool arrived = action.goal && distanceTo(fs.pos, *action.goal) < c.walk * kDecision;
+    if (c.enteringZone) {
+        s.settled = inZone && (arrived || (!c.inZone && std::hypot(fs.vel[0], fs.vel[1]) <= c.accel * kDecision));
+    } else {
+        s.settled = (c.target && s.target.hp <= 0.0) || (arrived && !exposed);
+    }
+}
+
+Brain::ActionChoice Brain::compareActions(const ProjectionContext& c, const std::vector<ProjectedAction>& actions,
+                                           bool enteringZone) const {
+    if (actions.size() <= 1) return actions.front().first;
+    Projection initial;
+    initial.fire = c.fire;
+    initial.weapons = c.weapons;
+    initial.hp = c.hp;
+    initial.lastCombat = lastCombatAt_;
+    initial.lastEnergyUse = c.fire.energy >= c.maxEnergy ? -kInf : now_;
+    if (c.target) initial.target = *c.target;
+    for (std::size_t i = 0; i < c.threats.size(); ++i) initial.enemies[i] = c.threats[i].mech->pos;
+
+    std::vector<std::array<Projection, 2>> predictions(actions.size(), {initial, initial});
+    const bool hasPursuit = std::any_of(c.threats.begin(), c.threats.end(), [](const auto& t) { return t.chasing; });
+    // Evaluate every candidate over the same time. A candidate that reaches cover first still
+    // has to survive there while the other candidate finishes its approach.
+    for (int decision = 0; decision < kProjectionDecisions; ++decision) {
+        bool settled = true;
+        for (std::size_t i = 0; i < actions.size(); ++i) {
+            for (std::size_t scenario = 0; scenario < (hasPursuit ? 2U : 1U); ++scenario) {
+                auto& prediction = predictions[i][scenario];
+                projectAction(c, actions[i], prediction, scenario != 0, decision);
+                settled = settled && prediction.settled;
+            }
+        }
+        if (settled && decision > 0) break;
+    }
+
+    struct Score {
+        int deaths;
+        double firstDeath;
+        double hp;
+        double primaryExposure;
+        double progress;
+        double blockedTime;
+        double energy;
+    };
+    auto summarize = [&](std::size_t i) -> Score {
+        const auto& a = predictions[i][0];
+        const auto& b = predictions[i][hasPursuit ? 1 : 0];
+        const auto& goal = actions[i].goal;
+        return {
+            static_cast<int>(a.hp <= 0.0) + static_cast<int>(b.hp <= 0.0),
+            std::min(a.deathTime, b.deathTime),
+            std::min(a.hp, b.hp),
+            enteringZone ? std::max(a.outsideTime, b.outsideTime) : std::max(a.exposedTime, b.exposedTime),
+            goal ? -std::max(distanceTo(a.fire.pos, *goal), distanceTo(b.fire.pos, *goal)) : 0.0,
+            std::max(a.stoppedOnWall, b.stoppedOnWall),
+            std::min(a.fire.energy, b.fire.energy),
+        };
+    };
+    std::vector<Score> scores;
+    scores.reserve(actions.size());
+    int fewestDeaths = 2;
+    for (std::size_t i = 0; i < actions.size(); ++i) {
+        scores.push_back(summarize(i));
+        fewestDeaths = std::min(fewestDeaths, scores.back().deaths);
+    }
+    double latestDeath = 0.0;
+    for (const auto& score : scores) {
+        if (score.deaths == fewestDeaths) latestDeath = std::max(latestDeath, score.firstDeath);
+    }
+    double bestHP = -kInf;
+    for (const auto& score : scores) {
+        if (score.deaths == fewestDeaths && score.firstDeath == latestDeath) bestHP = std::max(bestHP, score.hp);
+    }
+    // Sub-tick health estimates are too close to distinguish. Use the actual exposure and
+    // progress in that case, before spending energy that won't make the route safer.
+    const double hpResolution = std::max(1.0, c.regenPerS * kTick);
+    std::size_t best = 0;
+    bool found = false;
+    for (std::size_t i = 0; i < scores.size(); ++i) {
+        const auto& a = scores[i];
+        if (a.deaths != fewestDeaths || a.firstDeath != latestDeath || a.hp < bestHP - hpResolution) continue;
+        const auto& b = scores[best];
+        if (!found || a.primaryExposure < b.primaryExposure - 1e-6 ||
+            (std::abs(a.primaryExposure - b.primaryExposure) < 1e-6 &&
+             (a.blockedTime < b.blockedTime - 1e-6 ||
+              (std::abs(a.blockedTime - b.blockedTime) < 1e-6 &&
+               (a.progress > b.progress + 0.05 ||
+                (std::abs(a.progress - b.progress) <= 0.05 && a.energy > b.energy + 0.05)))))) {
+            best = i;
+            found = true;
+        }
+    }
+    ActionChoice selected = actions[best].first;
+    if (!enteringZone && !selected.stayToFight && !selected.waitForCover && c.target) {
+        const auto& a = predictions[best][0];
+        const auto& b = predictions[best][hasPursuit ? 1 : 0];
+        selected.finishesWhileMoving = a.target.hp <= 0.0 && b.target.hp <= 0.0;
+    }
+    return selected;
+}
+
+Brain::ActionChoice Brain::chooseFinishAction(const ProjectionContext& c, ActionChoice fallback,
+                                               std::optional<Vec2> cover, std::optional<ActionChoice> baselineFight) {
+    const Vec3& start = c.fire.pos;
+    std::optional<Vec2> waypoint;
+    const Vec2 route = limitLength(fallback.move, 1.0);
+    if (route[0] != 0.0 || route[1] != 0.0) {
+        const double leg = cover ? std::min(5.0, distanceTo(start, *cover)) : 5.0;
+        waypoint = Vec2{start[0] + route[0] * leg, start[1] + route[1] * leg};
+    }
+    std::vector<ProjectedAction> actions;
+    if (baselineFight) actions.push_back({*baselineFight, std::nullopt, cover});
+    actions.push_back({fallback, waypoint, cover});
+    if (waypoint) {
+        if (fallback.boost) actions.push_back({{fallback.move, false}, waypoint, cover});
+        else if (c.fire.energy > 0.1) actions.push_back({{fallback.move, true}, waypoint, cover});
+        if (cover) actions.push_back({{fallback.move, fallback.boost, true}, waypoint, cover});
+    }
+    actions.push_back({{{}, false, false, true}, std::nullopt, cover});
+    if (!cover && !c.threats.empty()) {
+        const auto mostDangerous = std::max_element(c.threats.begin(), c.threats.end(), [](const auto& a, const auto& b) {
+            return a.damageRate < b.damageRate;
+        });
+        const auto& enemy = mostDangerous->mech->pos;
+        const Vec2 away = toward(enemy, {start[0], start[1]});
+        for (double angle : {0.0, -std::numbers::pi / 4.0, std::numbers::pi / 4.0}) {
+            const Vec2 direction{away[0] * std::cos(angle) - away[1] * std::sin(angle),
+                                 away[0] * std::sin(angle) + away[1] * std::cos(angle)};
+            Vec3 next{start[0] + direction[0] * c.walk * kDecision,
+                      start[1] + direction[1] * c.walk * kDecision, start[2]};
+            if (next == start || !projectMove(c, start, next)) continue;
+            actions.push_back({{direction, false}, std::nullopt, std::nullopt});
+            if (c.fire.energy > 0.1) actions.push_back({{direction, true}, std::nullopt, std::nullopt});
+        }
+    }
+    if (c.dodge[0] != 0.0 || c.dodge[1] != 0.0) {
+        const Vec2 mv = limitLength({fallback.move[0] * 0.4 + c.dodge[0] * 0.9,
+                                     fallback.move[1] * 0.4 + c.dodge[1] * 0.9}, 1.0);
+        actions.push_back({{mv, fallback.boost || (c.dodgeLaser && c.fire.energy > 0.1)}, waypoint, cover});
+    }
+    return compareActions(c, actions, false);
+}
+
+Brain::ActionChoice Brain::chooseZoneAction(const ProjectionContext& c, ActionChoice fallback, Vec2 goal) {
+    const Vec3& start = c.fire.pos;
+    const auto& circle = c.circles[2];
+    const Vec2 center{circle.x, circle.y};
+    std::optional<Vec2> entry;
+    if (!c.inZone && distanceTo(start, center) - circle.r <= c.boost * 0.5) {
+        const double bearing = std::atan2(start[1] - circle.y, start[0] - circle.x);
+        const double radius = std::max(0.0, circle.r - std::min(1.0, circle.r * 0.5));
+        double bestDistance = kInf;
+        auto consider = [&](Vec2 point) {
+            const double distance = distanceTo(start, point);
+            if (distance <= 1e-6 || distance >= bestDistance || distance > c.boost * 0.5) return;
+            Vec3 end{point[0], point[1], start[2]};
+            if (projectMove(c, start, end)) {
+                bestDistance = distance;
+                entry = point;
+            }
+        };
+        consider(center);
+        if (radius > 0.0) {
+            for (double ring : {radius, radius * 0.5, circle.r - 1e-3}) {
+                if (ring <= 0.0) continue;
+                for (int k = 0; k < 8; ++k) {
+                    const double angle = bearing + k * kTau / 8.0;
+                    consider({circle.x + std::cos(angle) * ring, circle.y + std::sin(angle) * ring});
+                }
+            }
+        }
+    }
+
+    std::optional<Vec2> waypoint;
+    const Vec2 route = limitLength(fallback.move, 1.0);
+    if (route[0] != 0.0 || route[1] != 0.0) {
+        const double leg = std::min(5.0, distanceTo(start, goal));
+        waypoint = Vec2{start[0] + route[0] * leg, start[1] + route[1] * leg};
+    } else if (!entry && !c.inZone && distanceTo(start, goal) > 1e-6) {
+        // Travel's regular stopping radius can hide a short but blocked path to safety.
+        const auto [path, reached] = nav_.path(start[0], start[1], goal[0], goal[1]);
+        if (reached) {
+            for (int cell : path) {
+                const Vec2 point = nav_.cellPos(cell);
+                if (distanceTo(start, point) < 0.15) continue;
+                Vec3 end{point[0], point[1], start[2]};
+                if (projectMove(c, start, end)) {
+                    waypoint = point;
+                    fallback.move = toward(start, point);
+                }
+                break;
+            }
+        }
+    }
+    const Vec2 destination = entry.value_or(goal);
+    std::vector<ProjectedAction> actions{{fallback, waypoint, destination}};
+    if (waypoint) {
+        if (fallback.boost) actions.push_back({{fallback.move, false}, waypoint, destination});
+        else if (c.fire.energy > 0.1) actions.push_back({{fallback.move, true}, waypoint, destination});
+    }
+    if (entry) {
+        const Vec2 direction = toward(start, *entry);
+        actions.push_back({{direction, false}, entry, destination});
+        if (c.fire.energy > 0.1) actions.push_back({{direction, true}, entry, destination});
+        const WeaponInfo* laser = getWeapon(c.weapons, "laser");
+        const double speed = c.walk * (laser && laser->charge > 0.0 ? c.chargeMove : 1.0);
+        const double fraction = std::clamp(distanceTo(start, *entry) / (kDecision * speed), 0.0, 1.0);
+        actions.push_back({{{direction[0] * fraction, direction[1] * fraction}, false}, entry, destination});
+    }
+    if (entry || c.inZone) actions.push_back({{{}, false}, std::nullopt, destination});
+    if (c.dodge[0] != 0.0 || c.dodge[1] != 0.0) {
+        const Vec2 intended = waypoint ? fallback.move : toward(start, destination);
+        const Vec2 mv = limitLength({0.4 * intended[0] + 0.9 * c.dodge[0], 0.4 * intended[1] + 0.9 * c.dodge[1]}, 1.0);
+        actions.push_back({{mv, fallback.boost || (c.dodgeLaser && c.fire.energy > 0.1)},
+                           waypoint ? waypoint : entry, destination});
+    }
+    return compareActions(c, actions, true);
+}
+
 Json Brain::act(const Json& obs) {
     const auto& me = obs.contains("self") && obs["self"].is_object() ? obs["self"] : Json::object();
     const auto& z = obs.contains("zone") && obs["zone"].is_object() ? obs["zone"] : Json::object();
@@ -2000,6 +2816,8 @@ Json Brain::act(const Json& obs) {
     const double ownMuzzleH = numOr(st, "muzzle_height", cfgMechMuzzle_);
     const double ownHeight = numOr(st, "height", cfgMechHeight_);
     const double myArmor = numOr(st, "armor", 0.0);
+    const FireState fireState{pos, vel, curAim, turnRate, pitchRate, minPitch,
+                              maxPitch, ownMuzzleH, ownHeight, energy, myCubes};
 
     const WeaponInfo* gun = getWeapon(ws, "gun");
     const WeaponInfo* light = getWeapon(ws, "lightning");
@@ -2078,27 +2896,18 @@ Json Brain::act(const Json& obs) {
         lastThreatAt_ = now_;
     }
 
-    // 2. Clean Physics-Driven Retreat Hysteresis (never retreats from fair full-HP 1v1 or fast lethal finish!)
-    double ttkBestKill = 99.0;
-    if (target) {
-        const bool rear = showsBack(*target, x, y);
-        const double bDps = myExpectedDPS(ws, myCubes, energy, *target, target->dist, rear, /*burst=*/true);
-        const double sDps = myExpectedDPS(ws, myCubes, energy, *target, target->dist, rear, /*burst=*/false);
-        const double fastT = (bDps > 15.0) ? (target->hp / bDps) : 99.0;
-        ttkBestKill = (fastT <= 2.2) ? fastT : (target->hp / std::max(10.0, sDps));
-    }
-    const bool finishing = target && target->dist < 120.0 && (ttkBestKill < 1.35 || target->hp < 210.0 || target->hp < hp * 0.45);
+    // 2. Retreat hysteresis sets the default. Finishing competes with that route below.
     const bool outgunned = target && holdsKind(target->weapons, "laser") && !laser && target->dist > 55.0 && hpFrac < 0.78;
     const int crowdLim = pracOn_ ? 4 : 3;
     const double retreatHP = pracOn_ ? 0.25 : 0.38;
     const double reenterHP = pracOn_ ? 0.52 : 0.78;
     const bool swamped = (crowdCount >= crowdLim) || (crowdCount == 2 && hpFrac < (pracOn_ ? 0.45 : 0.65)) || outgunned;
     const bool lowUnderFire = (hpFrac < retreatHP && now_ - lastThreatAt_ < 2.0);
-    if (!retreat_ && !finishing && !late && (lowUnderFire || swamped)) {
+    if (!retreat_ && !late && (lowUnderFire || swamped)) {
         retreat_ = true;
         coverAt_ = -1.0;
     }
-    if (retreat_ && (finishing || late || (!swamped &&
+    if (retreat_ && (late || (!swamped &&
         (hpFrac > reenterHP || (now_ - lastThreatAt_ > std::max(3.5, cfgRegenDelay_ + 1.5) && hpFrac > 0.55))))) {
         retreat_ = false;
     }
@@ -2107,6 +2916,9 @@ Json Brain::act(const Json& obs) {
     double mx = 0.0, my = 0.0;
     bool boost = false;
     bool jump = false;
+    bool projectedMove = false;
+    bool waitForCover = false;
+    bool projectingCoverFire = false;
     std::string mode = "idle";
     MechTrack* farmNpc = nullptr;
     std::optional<Vec3> farmCratePos;
@@ -2130,23 +2942,65 @@ Json Brain::act(const Json& obs) {
         roofFlying_ = false;
         boost = energy > 15.0;
         mode = "dodge-mortar";
-    } else if (zoneMust && zdist > 2.0) {
+    } else if (zoneMust && (!inZone || zdist > 2.0)) {
         roofFlying_ = false;
-        const Vec2 mv = travel(me, zg[0], zg[1]);
+        Vec2 mv = travel(me, zg[0], zg[1]);
+        boost = (!inZone || now_ + tNeed >= deadline) && energy > 5.0;
+        if (grounded) {
+            const auto context = projectionContext(obs, me, fireState, ws, target, seen, true);
+            const auto action = chooseZoneAction(context, {mv, boost}, zg);
+            mv = action.move;
+            boost = action.boost;
+            projectedMove = true;
+        } else if (!inZone && mv == Vec2{}) {
+            mv = toward(pos, zg);
+        }
         mx = mv[0];
         my = mv[1];
-        boost = (!inZone || now_ + tNeed >= deadline) && energy > 5.0;
         mode = "zone";
     } else if (retreat_ && !late) {
         roofFlying_ = false;
+        const bool planFinish = target && target->dist < 120.0 && grounded &&
+                                canFinishWithinProjection(fireState, ws, *target);
+        std::optional<ActionChoice> baselineFight;
+        std::optional<std::mt19937> fightRng;
+        double fightStrafe = strafe_, fightStrafeUntil = strafeUntil_;
+        if (planFinish) {
+            const bool rear = showsBack(*target, x, y);
+            const double burstDPS = myExpectedDPS(ws, myCubes, energy, *target, target->dist, rear, true);
+            const double sustainedDPS = myExpectedDPS(ws, myCubes, energy, *target, target->dist, rear, false);
+            const double fastTime = burstDPS > 15.0 ? target->hp / burstDPS : kInf;
+            const double oldKillTime = fastTime <= 2.2 ? fastTime : target->hp / std::max(10.0, sustainedDPS);
+            // Offer the existing fight movement first, so it breaks ties. The old shortcuts
+            // only supply a candidate, and the projection still has to justify choosing it.
+            if (oldKillTime < 1.35 || target->hp < 210.0 || target->hp < hp * 0.45) {
+                const auto savedRng = rng_;
+                const Vec2 move = fightMove(obs, me, ws, *target, seen);
+                const bool charge = light && target->dist > 48.0 && target->dist < 110.0 &&
+                                    energy > 55.0 && target->engageScore > 40.0;
+                const bool kite = !light && holdsKind(target->weapons, "lightning") && target->dist < 62.0 &&
+                                  energy > 20.0 && move != Vec2{};
+                baselineFight = ActionChoice{move, charge || kite, false, true, false, true};
+                fightRng = rng_;
+                rng_ = savedRng;
+                std::swap(fightStrafe, strafe_);
+                std::swap(fightStrafeUntil, strafeUntil_);
+            }
+        }
+        auto savedPath = baselineFight ? path_ : std::vector<int32_t>{};
+        const Vec2 savedPathGoal = pathGoal_, savedCover = coverGoal_;
+        const double savedPathAt = pathAt_, savedCoverAt = coverAt_;
+        const std::size_t savedPathIndex = pathI_;
+        const bool savedCoverOK = coverOK_;
+        std::optional<Vec2> cover;
         if (coverMove(obs, me, seen, mx, my)) {
+            cover = coverGoal_;
             boost = energy > 10.0 && (mx != 0.0 || my != 0.0);
             mode = "cover";
         } else if (target) {
             const Vec2 mv = fightMove(obs, me, ws, *target, seen);
             mx = mv[0];
             my = mv[1];
-            recordTrap(x, y, 2.5);
             mode = "cornered";
         } else {
             const Vec2 mv = travel(me, zg[0], zg[1]);
@@ -2159,6 +3013,31 @@ Json Brain::act(const Json& obs) {
             }
             mode = "flee";
         }
+        if (planFinish) {
+            const auto context = projectionContext(obs, me, fireState, ws, target, seen);
+            const auto action = chooseFinishAction(context, {{mx, my}, boost}, cover, baselineFight);
+            mx = action.move[0];
+            my = action.move[1];
+            boost = action.boost;
+            waitForCover = action.waitForCover;
+            projectedMove = true;
+            projectingCoverFire = !action.stayToFight && (cover.has_value() || boost);
+            if (action.stayToFight || action.finishesWhileMoving) mode = "fight";
+            if (action.baselineFight) {
+                retreat_ = false;
+                rng_ = *fightRng;
+                strafe_ = fightStrafe;
+                strafeUntil_ = fightStrafeUntil;
+                path_ = std::move(savedPath);
+                pathGoal_ = savedPathGoal;
+                pathAt_ = savedPathAt;
+                pathI_ = savedPathIndex;
+                coverGoal_ = savedCover;
+                coverAt_ = savedCoverAt;
+                coverOK_ = savedCoverOK;
+            }
+        }
+        if (mode == "cornered") recordTrap(x, y, 2.5);
     } else if (!target && now_ - lastHurt_ < 2.5 && !late && hideFromBearing(obs, me, seen, mx, my)) {
         roofFlying_ = false;
         boost = energy > 30.0 && (mx != 0.0 || my != 0.0);
@@ -2316,7 +3195,7 @@ Json Brain::act(const Json& obs) {
     }
 
     // 4. Additive 3D Incoming Bullet & Charging-Laser Dodge Overlay
-    if (mode != "unstuck" && mode != "escape" && mode != "roof:jet" && mode != "roof:launch") {
+    if (!projectedMove && mode != "unstuck" && mode != "escape" && mode != "roof:jet" && mode != "roof:launch") {
         double ddx = 0.0, ddy = 0.0;
         bool lz = false;
         dodgeBullets(obs, me, ddx, ddy, lz);
@@ -2335,7 +3214,8 @@ Json Brain::act(const Json& obs) {
     // 5. Fast Physical Unstuck Detector
     if (mode == "escape" || mode == "roof:charge" || mode == "roof:jet" || mode == "cap-drop") {
         stuckSince_ = -1.0;
-    } else if ((mx != 0.0 || my != 0.0) && std::hypot(vel[0], vel[1]) < 1.2 && grounded) {
+    } else if ((projectedMove ? std::hypot(mx, my) * walkSpeed > 1.2 : (mx != 0.0 || my != 0.0)) &&
+               std::hypot(vel[0], vel[1]) < 1.2 && grounded) {
         if (stuckSince_ < 0.0) {
             stuckSince_ = now_;
         } else if (now_ - stuckSince_ > 0.7) {
@@ -2417,90 +3297,12 @@ Json Brain::act(const Json& obs) {
 
     std::array<bool, 2> fire{false, false};
     if (shootable) {
-        const double dist = std::hypot(tp[0] - x, tp[1] - y);
-        const bool targetGrounded = std::abs(tv[2]) < 0.5;
-        Vec2 gAim{0.0, 0.0};
-        bool gunOK = false;
-        if (gun) {
-            gAim = leadAim(muzzle, tp, tv, gun->speed, targetGrounded);
-            gunOK = dist <= gun->range * 0.96;
-        }
-        const Vec3 dp{tp[0] + tv[0] * (kLat + 0.05), tp[1] + tv[1] * (kLat + 0.05), tp[2]};
-        const double hy = std::atan2(dp[1] - muzzle[1], dp[0] - muzzle[0]);
-        const double hpPitch = std::atan2(dp[2] - muzzle[2], std::hypot(dp[0] - muzzle[0], dp[1] - muzzle[1]));
-
-        aim = gun ? gAim : Vec2{hy, hpPitch};
+        const FirePlan shot = planDirectFire(fireState, ws, target, tp, tv, tr, th,
+                                             (mode == "cover" || projectingCoverFire) && (mx != 0.0 || my != 0.0));
+        aim = shot.aim;
+        fire = shot.fire;
         haveAim = true;
-
-        const double tolY = std::atan2(tr * 0.75, std::max(dist, 1.0));
-        const double tolP = std::atan2(th * 0.40, std::max(dist, 1.0));
-        auto slewAligned = [&](double wantY, double wantP) -> bool {
-            const double ey = std::max(0.0, std::abs(angDiff(wantY, curAim[0])) - turnRate * 0.05);
-            const double ep = std::max(0.0, std::abs(wantP - curAim[1]) - pitchRate * 0.05);
-            return ey < tolY && ep < tolP;
-        };
-
-        for (int i = 0; i < 2; ++i) {
-            const auto& ow = ws[static_cast<std::size_t>(i)];
-            if (!ow) continue;
-            const auto& w = *ow;
-            if (w.kind == "gun") {
-                if (gunOK && w.ammo > 0.0 && w.reload <= 0.0 && slewAligned(gAim[0], gAim[1])) {
-                    fire[static_cast<std::size_t>(i)] = true;
-                }
-            } else if (w.kind == "lightning") {
-                const double cone = radians(w.coneDeg);
-                if (dist < w.range - 1.5 &&
-                    std::abs(angDiff(hy, curAim[0])) < cone * 0.5 - 0.05 &&
-                    energy >= w.energyCost) {
-                    fire[static_cast<std::size_t>(i)] = true;
-                }
-            } else if (w.kind == "laser") {
-                if (!isMech || !target || dist > w.range * 0.97) continue;
-                // Don't start a fresh laser charge (0.5x move speed!) while actively running to cover
-                if (mode == "cover" && (mx != 0.0 || my != 0.0) && w.charge <= 0.0) continue;
-                const double full = w.fullCharge;
-                // Always-on exact physics lethal early release (with cube + cook-off + rear-armor multipliers!)
-                if (w.charge >= w.minCharge && w.charge < full - 0.051) {
-                    double dmg = w.damage * (w.minFrac + (1.0 - w.minFrac) * (w.charge / full)) *
-                        (1.0 + cfgDmgPerCube_ * static_cast<double>(std::min(myCubes, cfgCubeStatCap_)));
-                    if (holdsKind(target->weapons, "mortar")) dmg *= (1.0 + w.cookoff);
-                    if (showsBack(*target, x, y)) dmg *= cfgRearMult_;
-                    if (dmg * 0.80 >= target->hp &&
-                        std::abs(angDiff(hy, curAim[0])) < tolY * 0.9 &&
-                        std::abs(hpPitch - curAim[1]) < tolP) {
-                        aim = {hy, hpPitch};
-                        fire[static_cast<std::size_t>(i)] = false;
-                        continue;
-                    }
-                }
-                if (w.charge < full - 0.051) {
-                    fire[static_cast<std::size_t>(i)] = true;
-                    if (w.charge > full * 0.45) {
-                        aim = {hy, hpPitch};
-                    }
-                } else {
-                    aim = {hy, hpPitch};
-                    const double ey = std::abs(angDiff(hy, curAim[0]));
-                    const double ep = std::abs(hpPitch - curAim[1]);
-                    fire[static_cast<std::size_t>(i)] = !(ey < tolY * 0.9 && ep < tolP);
-                }
-            } else if (w.kind == "mortar") {
-                if (!isMech || w.cooldown > 0.25 || dist < 16.0 || dist > 200.0) continue;
-                const Vec3 tube{muzzle[0], muzzle[1], zf + ownHeight + 0.5};
-                const Vec3 foot{tp[0], tp[1], tp[2] - th * 0.5};
-                if (const auto ma = mortarAim(tube, foot, tv, w.speed, w.gravity, minPitch, maxPitch, false)) {
-                    if (!gun || gun->reload > 0.0 || gun->ammo <= 0.0 || !gunOK) {
-                        aim = *ma;
-                    }
-                    const double ey = std::max(0.0, std::abs(angDiff((*ma)[0], curAim[0])) - turnRate * 0.05);
-                    const double ep = std::max(0.0, std::abs((*ma)[1] - curAim[1]) - pitchRate * 0.05);
-                    if (ey < 0.04 && ep < 0.03) {
-                        fire[static_cast<std::size_t>(i)] = true;
-                    }
-                }
-            }
-        }
+        if (waitForCover) fire.fill(false);
     }
 
     // Indirect mortar blind-fire over buildings using 5s memory_s real-time enemy coordinates!
