@@ -59,6 +59,8 @@ public:
     double walkRaster(double x, double y) const;
     bool standable(double x, double y, double z, double radius,
                    double height = 9.0, double stepUp = 1.2) const;
+    bool ceilingClear(double x, double y, double zLow, double zHigh) const;
+    double canopyConcealment(double x, double y, double z) const;
     bool bodyClear(double x, double y, double z, double radius, double height) const;
     bool prismClear(double x, double y, double z, double radius, double height, double stepUp = 0) const;
     bool walkSegment(const Vec3& start, const Vec3& end, double radius, double height,

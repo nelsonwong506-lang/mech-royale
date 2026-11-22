@@ -903,6 +903,43 @@ bool Arena::standable(double x, double y, double z, double radius, double height
     return true;
 }
 
+bool Arena::ceilingClear(double x, double y, double zLow, double zHigh) const {
+    if (const auto* cell = prismCell(gridX(x), gridY(y))) {
+        for (auto index : *cell) {
+            const auto& prism = prisms_[index];
+            if (prism.base < zHigh && prism.top > zLow && prism.contains(x, y)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+double Arena::canopyConcealment(double x, double y, double z) const {
+    if (trees_.empty()) return 0.0;
+    const int bx0 = bin(x - 16.0), bx1 = bin(x + 16.0);
+    const int by0 = bin(y - 16.0), by1 = bin(y + 16.0);
+    double score = 0.0;
+    for (int bx = bx0; bx <= bx1; ++bx) {
+        for (int by = by0; by <= by1; ++by) {
+            const auto cell = treeBins_.find(binKey(bx, by));
+            if (cell == treeBins_.end()) continue;
+            for (const auto idx : cell->second) {
+                const auto& t = trees_[idx];
+                const double cLo = t.z + t.crownBase;
+                const double cHi = t.z + t.height;
+                if (z + 8.5 < cLo || z + 3.0 > cHi) continue;
+                const double d = std::hypot(t.crownX - x, t.crownY - y);
+                if (d < t.crownR + 8.0) {
+                    const double closeness = std::clamp(1.0 - d / (t.crownR + 8.0), 0.0, 1.0);
+                    score += closeness * std::min(1.0, t.crownR / 4.5);
+                }
+            }
+        }
+    }
+    return std::min(1.0, score);
+}
+
 double Arena::surfaceAboveTerrain(double x, double y, double maxZ, double support) const {
     if (const auto* cell = prismCell(gridX(x), gridY(y))) {
         for (auto index : *cell) {

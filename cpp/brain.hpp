@@ -22,9 +22,11 @@ struct WeaponInfo {
     double charge = 0.0;
     // Dynamic stats
     double damage = 45.0;
+    double fireInterval = 0.24;
     double speed = 252.0;
     double range = 230.0;
     double mag = 12.0;
+    double reloadS = 2.4;
     double splashRadius = 7.0;
     double gravity = 22.0;
     double fullCharge = 0.75;
@@ -53,6 +55,7 @@ struct MechTrack {
     bool los = false;
     double closing = 0.0;
     bool engage = false;
+    double engageScore = -1e9;
 };
 
 struct KnownItem {
@@ -63,43 +66,19 @@ struct KnownItem {
     double seen = -100.0;
 };
 
+struct ThreatPing {
+    Vec2 pos{};
+    double weight = 1.0;
+    double at = -100.0;
+    double radius = 75.0;
+    bool isLaser = false;
+    bool exact = false;
+};
+
 struct ZoneCircle {
     double x = 0.0;
     double y = 0.0;
     double r = 560.0;
-};
-
-struct BrainParams {
-    double retreatHP = 0.38;
-    double recoverHP = 0.80;
-    double gunRange = 85.0;
-    double lightRange = 28.0;
-    double laserRange = 85.0;
-    double engageDist = 60.0;
-    bool farmNPC = true;
-    bool explore = false;
-    bool ghost = true;
-    double homeExpo = 120.0;
-    double lootRadius = 90.0;
-    double crateUntil = 150.0;
-    bool dodge = true;
-    bool noMortar = true;
-    bool peek = true;
-    bool laserFirst = true;
-    bool crowdHide = true;
-    double laserSeek = 0.0;
-    bool lethal = false;
-    double lethalK = 0.72;
-    double stick = 0.0;
-    double hpW = 60.0 / 1400.0;
-    double lowBonus = 0.0;
-    double maxTarget = 215.0;
-    bool loseRule = false;
-    double fightLoot = 0.0;
-    double farmHP = 0.70;
-    bool laserUp = false;
-    double finish = 0.0;
-    double finishHP = 0.38;
 };
 
 class Brain {
@@ -112,18 +91,44 @@ private:
         std::string kind;
         int id = -1;
         Vec3 pos{};
-        double value = 0.0;
+        double utility = 0.0;
+        bool isRoof = false;
+        Vec2 roofLaunch{};
+        double climbEnergy = 0.0;
     };
-
-    static BrainParams defaultParams();
-    static BrainParams squadParams(BrainParams base);
 
     double scaleOf(int cubes) const;
     Vec3 centerOf(const MechTrack& t) const;
     Vec3 eyeOf(const MechTrack& t) const;
     bool showsBack(const MechTrack& t, double x, double y) const;
-    bool wantPickup(const std::array<std::optional<WeaponInfo>, 2>& ws, const std::string& kind) const;
-    int pickUpgrade(const Json& offer) const;
+
+    // Continuous value & risk functions (zero magic thresholds)
+    double soundHeat(double px, double py) const;
+    double regenBreakCost(double hpFrac, bool inZone) const;
+    double cubeValue(int cubes, double hpFrac) const;
+    double weaponPower(std::string_view kind, double nextRadius) const;
+    double weaponGain(const std::array<std::optional<WeaponInfo>, 2>& ws,
+                      std::string_view kind, double nextRadius) const;
+    bool wantPickup(const std::array<std::optional<WeaponInfo>, 2>& ws,
+                    const std::string& kind, double nextRadius) const;
+    int pickUpgrade(const Json& offer, const std::array<std::optional<WeaponInfo>, 2>& ws,
+                    double nextRadius) const;
+
+    // Continuous physics combat functions
+    double myExpectedDPS(const std::array<std::optional<WeaponInfo>, 2>& ws,
+                         int myCubes, double energy, const MechTrack& target,
+                         double dist, bool rearShot, bool burst) const;
+    double enemyExpectedDPS(const MechTrack& enemy,
+                            const std::array<std::optional<WeaponInfo>, 2>& myWs,
+                            double myArmor, double myEnergy, double dist,
+                            bool aimingAtMe, bool burst) const;
+    double attentionWeight(const MechTrack& t, double x, double y) const;
+    double engageValue(const Json& obs, const Json& me,
+                       const std::array<std::optional<WeaponInfo>, 2>& ws,
+                       const MechTrack& t, double inDPS, bool late) const;
+    std::optional<double> bestArmorYaw(const Json& obs, const Json& me,
+                                       const std::array<std::optional<WeaponInfo>, 2>& ws,
+                                       const std::vector<MechTrack*>& seen) const;
 
     void observe(const Json& obs, const Json& me, const std::array<std::optional<WeaponInfo>, 2>& ws);
 
@@ -136,37 +141,40 @@ private:
     bool runEscape(const Json& me, double& mx, double& my, bool& boost, bool& jump);
     bool dodgeShell(const Json& obs, const Json& me, double& mx, double& my) const;
     Vec2 travel(const Json& me, double gx, double gy);
-    double prefRange(const Json& me, const std::array<std::optional<WeaponInfo>, 2>& ws, const MechTrack& t) const;
+    std::optional<Vec2> findRoofLaunch(double ix, double iy, double iz, double ownHeight) const;
+
     Vec2 fightMove(const Json& obs, const Json& me, const std::array<std::optional<WeaponInfo>, 2>& ws,
-                   const MechTrack& tg, const std::vector<MechTrack*>& seen, double wantLos);
+                   const MechTrack& tg, const std::vector<MechTrack*>& seen);
     bool coverMove(const Json& obs, const Json& me, const std::vector<MechTrack*>& seen, double& mx, double& my);
     bool hideFromBearing(const Json& obs, const Json& me, const std::vector<MechTrack*>& seen, double& mx, double& my);
     std::optional<LootChoice> chooseLoot(const Json& obs, const Json& me,
                                          const std::array<std::optional<WeaponInfo>, 2>& ws,
-                                         double hpFrac, bool danger);
-    Vec2 exploreMove(const Json& obs, const Json& me);
+                                         double hpFrac, bool inZone);
     double homeCost(const Json& obs, const Json& me, double px, double py) const;
     std::optional<Vec2> findHome(const Json& obs, const Json& me);
     void dodgeBullets(const Json& obs, const Json& me, double& dx, double& dy, bool& enemyLaser) const;
 
     Vec2 leadAim(const Vec3& muzzle, const Vec3& tp, const Vec3& tv, double speed, bool grounded) const;
     std::optional<Vec2> mortarAim(const Vec3& tube, const Vec3& foot, const Vec3& tv,
-                                  double v, double g, double minPitch, double maxPitch) const;
+                                  double v, double g, double minPitch, double maxPitch,
+                                  bool allowHighArc = false) const;
 
     Json config_;
     Arena arena_;
     NavGrid nav_;
     std::mt19937 rng_;
-    BrainParams baseP_;
-    BrainParams p_;
 
-    // Config cached constants
+    // Config cached physics constants
     double cfgMechRadius_ = 2.5;
     double cfgMechHeight_ = 9.0;
     double cfgMechEye_ = 8.0;
     double cfgMechMuzzle_ = 7.0;
     double cfgFrontArcDeg_ = 180.0;
     double cfgRearMult_ = 1.5;
+    double cfgRegenDelay_ = 5.0;
+    double cfgRegenPerS_ = 45.0;
+    double cfgEnergyRegen_ = 18.0;
+    double cfgMaxRiseSpeed_ = 15.0;
     double cfgNpcRadius_ = 1.8;
     double cfgNpcHeight_ = 3.5;
     double cfgCrateRadius_ = 1.4;
@@ -174,6 +182,7 @@ private:
     double cfgSizePerCube_ = 0.05;
     double cfgDmgPerCube_ = 0.04;
     int cfgCubeStatCap_ = 10;
+    std::vector<int> cfgUpgradeThresholds_{1, 3, 6, 10, 15, 21, 28, 36};
     double cfgLootPickupRadius_ = 4.0;
     double cfgMortarGravity_ = 22.0;
     double cfgMortarSplash_ = 7.0;
@@ -186,8 +195,10 @@ private:
     std::unordered_map<int, KnownItem> cubes_;
     std::unordered_map<int, KnownItem> pickups_;
     std::unordered_map<int, double> badLoot_;
+    std::vector<ThreatPing> pings_;
 
     double now_ = 0.0;
+    double laserPresence_ = 0.25;  // Continuous estimate of laser prevalence in lobby [0, 1]
 
     // Path state
     std::vector<int32_t> path_;
@@ -202,29 +213,30 @@ private:
     double coverAt_ = -100.0;
     Vec2 coverGoal_{};
     bool coverOK_ = false;
-    double loseAt_ = -100.0;
     int stickID_ = -1;
     double stickAt_ = -100.0;
 
-    // Damage / threat / loot tracking
+    // Damage / combat regen / threat / loot tracking
     double lastHurt_ = -100.0;
     double hurtBearing_ = 0.0;
+    double lastCombatAt_ = -100.0;  // max(lastHurt, lastHit) -> exact 5s regen clock!
     double npcHurt_ = -100.0;
     double npcBearing_ = 0.0;
     double lastThreatAt_ = -100.0;
+    double lastLaserSoundAt_ = -100.0;
+    double laserSoundBearing_ = 0.0;
     int lootID_ = -1;
     double lootSince_ = -100.0;
+    bool roofFlying_ = false;
 
     // Zone hold tracking
     ZoneCircle hold_{};
     double holdStart_ = -1.0;
 
-    // Home / explore / unstuck / escape state
+    // Home / unstuck / escape state
     Vec2 homeXY_{};
     double homeAt_ = -100.0;
     bool homeSet_ = false;
-    Vec2 exploreXY_{};
-    double exploreUntil_ = -100.0;
     double stuckSince_ = -1.0;
     double unstuckUntil_ = -100.0;
     Vec2 unstuckDir_{};
@@ -233,14 +245,6 @@ private:
     std::optional<EscapeRoute> escRoute_;
     double escAt_ = -100.0;
     bool escFlying_ = false;
-
-    // Practice vs FFA auto-detection
-    bool initDone_ = false;
-    bool pracOn_ = false;
-    bool notPractice_ = false;
-    int startAlive_ = 16;
-    int kills_ = 0;
-    int otherDeadTicks_ = 0;
 };
 
 }  // namespace mr
