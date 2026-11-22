@@ -10,6 +10,7 @@ namespace {
 
 constexpr double kTau = 2.0 * std::numbers::pi;
 constexpr double kLat = 0.075;
+constexpr double kTickSeconds = 0.05;
 constexpr double kInf = std::numeric_limits<double>::infinity();
 
 double angDiff(double a, double b) {
@@ -116,6 +117,20 @@ double gunHitProb(double dist) {
     return std::clamp(1.0 / (1.0 + u * u), 0.18, 0.96);
 }
 
+double audibleZoneFraction(double zoneRadius, double soundRadius, double offset) {
+    if (zoneRadius <= 0.0 || soundRadius <= 0.0 || offset >= zoneRadius + soundRadius) return 0.0;
+    if (offset <= std::abs(zoneRadius - soundRadius)) {
+        const double ratio = std::min(1.0, soundRadius / zoneRadius);
+        return ratio * ratio;
+    }
+    const double zr2 = zoneRadius * zoneRadius, sr2 = soundRadius * soundRadius, d2 = offset * offset;
+    const double zAngle = std::acos(std::clamp((d2 + zr2 - sr2) / (2.0 * offset * zoneRadius), -1.0, 1.0));
+    const double sAngle = std::acos(std::clamp((d2 + sr2 - zr2) / (2.0 * offset * soundRadius), -1.0, 1.0));
+    const double overlap = zr2 * (zAngle - std::sin(2.0 * zAngle) * 0.5) +
+                           sr2 * (sAngle - std::sin(2.0 * sAngle) * 0.5);
+    return std::clamp(overlap / (std::numbers::pi * zr2), 0.0, 1.0);
+}
+
 }  // namespace
 
 Brain::Brain(const Json& hello)
@@ -142,6 +157,14 @@ Brain::Brain(const Json& hello)
     cfgRegenPerS_ = numOr(mech, "regen_per_s", 45.0);
     cfgEnergyRegen_ = std::max(1.0, numOr(mech, "energy_regen", 18.0));
     cfgMaxRiseSpeed_ = std::max(3.0, numOr(mech, "max_rise_speed", 15.0));
+
+    if (const auto sound = config_.find("sound"); sound != config_.end() && sound->is_object()) {
+        cfgStepSoundSpeed_ = numOr(*sound, "step_speed", 5.0);
+        if (const auto ranges = sound->find("range"); ranges != sound->end()) {
+            cfgGunSoundRange_ = numOr(*ranges, "gun", 320.0);
+            cfgNpcSoundRange_ = numOr(*ranges, "npc_gun", 200.0);
+        }
+    }
 
     const auto& npc = config_.contains("npc") && config_["npc"].is_object() ? config_["npc"] : Json::object();
     cfgNpcRadius_ = numOr(npc, "radius", 1.8);
@@ -1330,11 +1353,15 @@ Vec2 Brain::fightMove(const Json& obs, const Json& me, const std::array<std::opt
     for (const auto& [cid, c] : cubes_) {
         (void)cid;
         const double d = std::hypot(c.pos[0] - x, c.pos[1] - y);
-        if (d < nearCubeD && std::abs(c.pos[2] - pos[2]) < 4.0) {
+        if (d < nearCubeD && std::abs(c.pos[2] - pos[2]) < 4.0 &&
+            zonePenalty(z, c.pos[0], c.pos[1]) < 150.0 &&
+            nav_.lineWalkable(x, y, c.pos[0], c.pos[1])) {
             nearCube = &c;
             nearCubeD = d;
         }
     }
+    const double nextCubeValue = cubeValue(myCubes, hpFrac);
+    const double cubePull = nextCubeValue / (nextCubeValue + 60.0);
 
     double best = -kInf;
     Vec2 bestMove{0.0, 0.0};
@@ -1429,7 +1456,8 @@ Vec2 Brain::fightMove(const Json& obs, const Json& me, const std::array<std::opt
         if (rearShot && d < 140.0) s += 16.0;
         s -= zonePenalty(z, cx, cy) * 1.4;
         if (nearCube) {
-            s += 2.2 * (nearCubeD - std::hypot(nearCube->pos[0] - cx, nearCube->pos[1] - cy));
+            const double progress = nearCubeD - std::hypot(nearCube->pos[0] - cx, nearCube->pos[1] - cy);
+            s += 3.0 * cubePull * progress;
         }
         const double cl = nav_.clearanceAt(cx, cy);
         if (cl < 4.0) {
@@ -1566,6 +1594,7 @@ std::optional<Brain::LootChoice> Brain::chooseLoot(const Json& obs, const Json& 
     const int alive = intOr(obs, "alive", 16);
     const double nextRadius = numOr(z, "next_radius", 380.0);
     const ZoneCircle cur = curZone(z);
+    const double gearedMult = (ws[1].has_value() && myCubes >= 3) ? 2.1 : 1.0;
 
     // Estimate our gun DPS for crate/NPC time calculation
     const WeaponInfo* gun = getWeapon(ws, "gun");
@@ -1633,6 +1662,21 @@ std::optional<Brain::LootChoice> Brain::chooseLoot(const Json& obs, const Json& 
         // Hard zone deadline check
         const double dl = zoneDeadline(z, ipos[0], ipos[1], 6.0);
         if (now_ + totalTime + 4.5 > dl) return;
+
+        if (isNoisy && !pracOn_) {
+            // Estimate how much of the lobby can hear a shot from the firing position.
+            const double fireDistance = (kind == "crate") ? 50.0 : 75.0;
+            const double approach = std::clamp(1.0 - fireDistance / std::max(1.0, d), 0.0, 1.0);
+            const double fireX = x + (ipos[0] - x) * approach;
+            const double fireY = y + (ipos[1] - y) * approach;
+            const double heard = audibleZoneFraction(cur.r, cfgGunSoundRange_, std::hypot(fireX - cur.x, fireY - cur.y));
+            const double npcHeard = (kind == "npc")
+                ? audibleZoneFraction(cur.r, cfgNpcSoundRange_, std::hypot(ipos[0] - cur.x, ipos[1] - cur.y))
+                : 0.0;
+            const double listeners = std::max(0, alive - 1) * (heard + 0.4 * npcHeard);
+            netGain -= 14.0 * listeners * gearedMult;
+            if (netGain <= 1.0) return;
+        }
 
         // Continuous EnemySafety(pos, pathMidpoint) — wider awareness (175m) for noisy crates/NPCs that alert hunters!
         const double midX = 0.5 * (x + ipos[0]), midY = 0.5 * (y + ipos[1]);
@@ -1706,15 +1750,9 @@ std::optional<Brain::LootChoice> Brain::chooseLoot(const Json& obs, const Json& 
 
     // Unified regen-silence & danger gate: never shoot loud crates/NPCs while hurt OR within 6s of recent threat!
     const bool protectRegen = (regenCost > 28.0) || (!pracOn_ && (hpFrac < 0.70 || now_ - lastThreatAt_ < 6.0));
-    // Player-density gunshot reveal cost: shooting crates/NPCs in shrinking circles alerts the entire lobby!
-    const double zoneScale = std::max(0.65, cur.r / 150.0);
-    const double playerDensity = static_cast<double>(alive) / (zoneScale * zoneScale);
-    const double gearedMult = (!pracOn_ && ws[1].has_value() && myCubes >= 3) ? 2.1 : 1.0;
-    const double densityNoiseCost = pracOn_ ? 0.0 : (16.0 * playerDensity * gearedMult);
-
-    // 3. Loot crates (1 cube + 50% weapon chance - noise/density/regen opportunity cost)
+    // 3. Loot crates (1 cube + 50% weapon chance minus local PvE and recovery costs)
     if (!protectRegen) {
-        const double crateNoiseCost = 28.0 + densityNoiseCost + regenCost;
+        const double crateNoiseCost = 28.0 + regenCost;
         for (const auto& [cid, c] : crates_) {
             (void)cid;
             const double chp = c.hp > 1.0 ? c.hp : 300.0;
@@ -1725,7 +1763,7 @@ std::optional<Brain::LootChoice> Brain::chooseLoot(const Json& obs, const Json& 
 
         // 4. NPC drones (2 cubes - counter-damage & loud 200m+320m firefight reveal cost)
         const double twoCubeVal = cubeValue(myCubes, hpFrac) + cubeValue(myCubes + 1, hpFrac);
-        const double npcCounterCost = 62.0 + densityNoiseCost * 1.4 + 120.0 * std::clamp(1.0 - hpFrac, 0.0, 1.0) + regenCost;
+        const double npcCounterCost = 62.0 + 120.0 * std::clamp(1.0 - hpFrac, 0.0, 1.0) + regenCost;
         for (const auto& [nid, n] : npcs_) {
             (void)nid;
             if (now_ - n.seen > 15.0) continue;
@@ -1828,27 +1866,40 @@ double Brain::homeCost(const Json& obs, const Json& me, double px, double py) co
 
 std::optional<Vec2> Brain::findHome(const Json& obs, const Json& me) {
     const auto& z = obs.contains("zone") && obs["zone"].is_object() ? obs["zone"] : Json::object();
+    const auto& st = me.contains("stats") && me["stats"].is_object() ? me["stats"] : Json::object();
+    const Vec3 pos = safeVec3(me, "pos");
     const Vec2 nc = safeVec2(z, "next_center");
     const double nr = numOr(z, "next_radius", 200.0);
-    const bool out = !homeSet_ || std::hypot(homeXY_[0] - nc[0], homeXY_[1] - nc[1]) > nr * 0.8;
-    if (out || now_ - homeAt_ > 15.0) {
+    const double walkSpeed = std::max(1.0, numOr(st, "walk_speed", 11.7));
+    const double quietSpeed = std::max(1.0, std::min(walkSpeed, cfgStepSoundSpeed_ * 0.92));
+    auto hasTime = [&](double px, double py) {
+        const double approachTime = std::hypot(px - pos[0], py - pos[1]) * 1.45 / quietSpeed;
+        const Vec2 next = zoneGoal(z, px, py);
+        const double rotateTime = std::hypot(px - next[0], py - next[1]) * 1.45 / walkSpeed;
+        return now_ + approachTime + rotateTime + 7.0 < zoneDeadline(z, px, py, 8.0);
+    };
+    const bool out = !homeSet_ || !hasTime(homeXY_[0], homeXY_[1]);
+    if ((out && homeSet_) || now_ - homeAt_ > 15.0) {
         homeAt_ = now_;
         Vec2 best{};
         double bestC = kInf;
-        std::uniform_real_distribution<double> u01(0.0, 1.0);
-        for (int k = 0; k < 40; ++k) {
-            const double a = u01(rng_) * kTau;
-            const double r = std::sqrt(u01(rng_)) * nr * 0.72;
-            const double px = nc[0] + std::cos(a) * r, py = nc[1] + std::sin(a) * r;
-            if (!nav_.inBounds(px, py) || !nav_.reachable(px, py)) continue;
+        auto consider = [&](double px, double py) {
+            if (!nav_.inBounds(px, py) || !nav_.reachable(px, py) || !hasTime(px, py)) return;
             const double c = homeCost(obs, me, px, py);
             if (c < bestC) {
                 bestC = c;
                 best = {px, py};
             }
+        };
+        consider(pos[0], pos[1]);
+        std::uniform_real_distribution<double> u01(0.0, 1.0);
+        for (int k = 0; k < 40; ++k) {
+            const double a = u01(rng_) * kTau;
+            const bool local = k < 20;
+            const double r = std::sqrt(u01(rng_)) * (local ? 12.0 * quietSpeed : nr * 0.72);
+            consider((local ? pos[0] : nc[0]) + std::cos(a) * r, (local ? pos[1] : nc[1]) + std::sin(a) * r);
         }
-        // Strong hysteresis (-36) when already holding a valid low-exposure home inside next_center
-        // so transient distant gunshots never kick us out of solid cover into open streets!
+        if (out) homeSet_ = false;
         if (std::isfinite(bestC) && (out || bestC < homeCost(obs, me, homeXY_[0], homeXY_[1]) - 36.0)) {
             homeXY_ = best;
             homeSet_ = true;
@@ -2168,46 +2219,7 @@ Json Brain::act(const Json& obs) {
         const Vec2 mv = fightMove(obs, me, ws, *foe, seen);
         mx = mv[0];
         my = mv[1];
-        if (light && foe->dist > 48.0 && foe->dist < 110.0 && energy > 55.0 && foe->engageScore > 40.0) {
-            boost = true;
-        }
-        // Anti-lightning boost-kite: stay strictly outside enemy's 45m Lightning cone!
-        if (!light && holdsKind(foe->weapons, "lightning") && foe->dist < 62.0 && energy > 20.0 &&
-            (mx != 0.0 || my != 0.0)) {
-            boost = true;
-        }
         mode = "fight";
-        // Safe opportunistic mid-fight cube grab (only when valuable & not facing charging laser / multi-foe!)
-        bool enemyCharging = false;
-        for (const MechTrack* e : seen) {
-            if (e->seen == now_ && e->los && e->charging) {
-                enemyCharging = true;
-                break;
-            }
-        }
-        if (crowdCount <= 1 && !enemyCharging && cubeValue(myCubes, hpFrac) >= 50.0) {
-            const ZoneCircle curZ = curZone(z);
-            double bestCubeD = pracOn_ ? (hpFrac > 0.50 ? 68.0 : 38.0) : (hpFrac > 0.50 ? 40.0 : 20.0);
-            std::optional<Vec3> bc;
-            for (const auto& [cid, c] : cubes_) {
-                (void)cid;
-                const double d = std::hypot(c.pos[0] - x, c.pos[1] - y);
-                if (d < bestCubeD && std::abs(c.pos[2] - zf) < 4.0 &&
-                    std::hypot(c.pos[0] - curZ.x, c.pos[1] - curZ.y) < curZ.r - 4.0) {
-                    const double dFoe = std::hypot(c.pos[0] - foe->pos[0], c.pos[1] - foe->pos[1]);
-                    if (d < 14.0 || d < dFoe * 0.95) {
-                        bestCubeD = d;
-                        bc = c.pos;
-                    }
-                }
-            }
-            if (bc) {
-                const Vec2 cmv = travel(me, (*bc)[0], (*bc)[1]);
-                mx = cmv[0];
-                my = cmv[1];
-                mode = "fight:cube";
-            }
-        }
     } else if (zoneShould && zdist > 2.0) {
         roofFlying_ = false;
         const Vec2 mv = travel(me, zg[0], zg[1]);
@@ -2306,7 +2318,7 @@ Json Brain::act(const Json& obs) {
                 my = mv[1];
                 // Silent walk (< 5.0 m/s step_speed) when safe so we emit zero footsteps!
                 if (!underFire && now_ - lastHurt_ > 6.0) {
-                    const double q = std::min(1.0, 4.6 / walkSpeed);
+                    const double q = std::clamp(cfgStepSoundSpeed_ * 0.92 / walkSpeed, 0.0, 1.0);
                     mx *= q;
                     my *= q;
                 }
@@ -2330,6 +2342,15 @@ Json Brain::act(const Json& obs) {
             }
             if (lz && energy > 25.0) boost = true;
         }
+    }
+
+    if (mode == "fight" && grounded) {
+        const double towardFoe = (mx * (foe->pos[0] - x) + my * (foe->pos[1] - y)) / std::max(1.0, foe->dist);
+        const bool closeWithArc = light && towardFoe > 0.5 && foe->dist > light->range + 3.0 &&
+            foe->dist < 110.0 && energy > 55.0 && foe->engageScore > 40.0;
+        const bool openFromArc = !light && towardFoe < -0.25 && holdsKind(foe->weapons, "lightning") &&
+            foe->dist < 62.0 && energy > 20.0;
+        boost = boost || closeWithArc || openFromArc;
     }
 
     // 5. Fast Physical Unstuck Detector
@@ -2415,6 +2436,18 @@ Json Brain::act(const Json& obs) {
         shootable = false;
     }
 
+    auto aimAfterTick = [&](const Vec2& command) -> Vec2 {
+        return {curAim[0] + std::clamp(angDiff(command[0], curAim[0]), -turnRate * kTickSeconds, turnRate * kTickSeconds),
+                std::clamp(curAim[1] + std::clamp(command[1] - curAim[1], -pitchRate * kTickSeconds, pitchRate * kTickSeconds),
+                           minPitch, maxPitch)};
+    };
+    auto aligned = [](const Vec2& actual, const Vec2& wanted, double yawTolerance, double pitchTolerance) {
+        return std::abs(angDiff(actual[0], wanted[0])) < yawTolerance &&
+               std::abs(actual[1] - wanted[1]) < pitchTolerance;
+    };
+    const bool needsSpeed = boost || jump || mode == "escape" || mode == "unstuck" || mode == "zone" ||
+        mode == "dodge-mortar" || ((mode == "cover" || mode == "flee") && (mx != 0.0 || my != 0.0));
+
     std::array<bool, 2> fire{false, false};
     if (shootable) {
         const double dist = std::hypot(tp[0] - x, tp[1] - y);
@@ -2429,77 +2462,54 @@ Json Brain::act(const Json& obs) {
         const double hy = std::atan2(dp[1] - muzzle[1], dp[0] - muzzle[0]);
         const double hpPitch = std::atan2(dp[2] - muzzle[2], std::hypot(dp[0] - muzzle[0], dp[1] - muzzle[1]));
 
-        aim = gun ? gAim : Vec2{hy, hpPitch};
+        const Vec2 hitscanAim{hy, hpPitch};
+        aim = gunOK ? gAim : hitscanAim;
         haveAim = true;
 
         const double tolY = std::atan2(tr * 0.75, std::max(dist, 1.0));
         const double tolP = std::atan2(th * 0.40, std::max(dist, 1.0));
-        auto slewAligned = [&](double wantY, double wantP) -> bool {
-            const double ey = std::max(0.0, std::abs(angDiff(wantY, curAim[0])) - turnRate * 0.05);
-            const double ep = std::max(0.0, std::abs(wantP - curAim[1]) - pitchRate * 0.05);
-            return ey < tolY && ep < tolP;
-        };
+        const bool gunLoaded = gun && gunOK && gun->ammo > 0.0 && gun->reload <= 0.0;
 
-        for (int i = 0; i < 2; ++i) {
-            const auto& ow = ws[static_cast<std::size_t>(i)];
-            if (!ow) continue;
-            const auto& w = *ow;
-            if (w.kind == "gun") {
-                if (gunOK && w.ammo > 0.0 && w.reload <= 0.0 && slewAligned(gAim[0], gAim[1])) {
-                    fire[static_cast<std::size_t>(i)] = true;
-                }
-            } else if (w.kind == "lightning") {
-                const double cone = radians(w.coneDeg);
-                if (dist < w.range - 1.5 &&
-                    std::abs(angDiff(hy, curAim[0])) < cone * 0.5 - 0.05 &&
-                    energy >= w.energyCost) {
-                    fire[static_cast<std::size_t>(i)] = true;
-                }
-            } else if (w.kind == "laser") {
-                if (!isMech || !target || dist > w.range * 0.97) continue;
-                // Don't start a fresh laser charge (0.5x move speed!) while actively running to cover
-                if (mode == "cover" && (mx != 0.0 || my != 0.0) && w.charge <= 0.0) continue;
-                const double full = w.fullCharge;
-                // Always-on exact physics lethal early release (with cube + cook-off + rear-armor multipliers!)
-                if (w.charge >= w.minCharge && w.charge < full - 0.051) {
-                    double dmg = w.damage * (w.minFrac + (1.0 - w.minFrac) * (w.charge / full)) *
-                        (1.0 + cfgDmgPerCube_ * static_cast<double>(std::min(myCubes, cfgCubeStatCap_)));
-                    if (holdsKind(target->weapons, "mortar")) dmg *= (1.0 + w.cookoff);
-                    if (showsBack(*target, x, y)) dmg *= cfgRearMult_;
-                    if (dmg * 0.80 >= target->hp &&
-                        std::abs(angDiff(hy, curAim[0])) < tolY * 0.9 &&
-                        std::abs(hpPitch - curAim[1]) < tolP) {
-                        aim = {hy, hpPitch};
-                        fire[static_cast<std::size_t>(i)] = false;
-                        continue;
-                    }
-                }
-                if (w.charge < full - 0.051) {
-                    fire[static_cast<std::size_t>(i)] = true;
-                    if (w.charge > full * 0.45) {
-                        aim = {hy, hpPitch};
-                    }
-                } else {
-                    aim = {hy, hpPitch};
-                    const double ey = std::abs(angDiff(hy, curAim[0]));
-                    const double ep = std::abs(hpPitch - curAim[1]);
-                    fire[static_cast<std::size_t>(i)] = !(ey < tolY * 0.9 && ep < tolP);
-                }
-            } else if (w.kind == "mortar") {
-                if (!isMech || w.cooldown > 0.25 || dist < 16.0 || dist > 200.0) continue;
-                const Vec3 tube{muzzle[0], muzzle[1], zf + ownHeight + 0.5};
-                const Vec3 foot{tp[0], tp[1], tp[2] - th * 0.5};
-                if (const auto ma = mortarAim(tube, foot, tv, w.speed, w.gravity, minPitch, maxPitch, false)) {
-                    if (!gun || gun->reload > 0.0 || gun->ammo <= 0.0 || !gunOK) {
-                        aim = *ma;
-                    }
-                    const double ey = std::max(0.0, std::abs(angDiff((*ma)[0], curAim[0])) - turnRate * 0.05);
-                    const double ep = std::max(0.0, std::abs((*ma)[1] - curAim[1]) - pitchRate * 0.05);
-                    if (ey < 0.04 && ep < 0.03) {
-                        fire[static_cast<std::size_t>(i)] = true;
-                    }
-                }
+        std::optional<Vec2> shellAim;
+        if (mortar && isMech && mortar->cooldown <= 0.25 && dist >= 16.0 && dist <= 200.0) {
+            const Vec3 tube{muzzle[0], muzzle[1], zf + ownHeight + 0.5};
+            shellAim = mortarAim(tube, target->pos, tv, mortar->speed, mortar->gravity, minPitch, maxPitch, false);
+            if (shellAim && !gunLoaded) aim = *shellAim;
+        }
+
+        if (light && dist < light->range - 1.5 && energy >= light->energyCost &&
+            std::abs(angDiff(hy, aim[0])) >= radians(light->coneDeg) * 0.5 - 0.05) {
+            aim = hitscanAim;
+        }
+
+        if (laser && isMech && dist <= laser->range * 0.97) {
+            const int slot = findWeaponSlot(ws, "laser");
+            const double nextCharge = laser->charge + kTickSeconds;
+            const bool laserAligned = aligned(aimAfterTick(hitscanAim), hitscanAim, tolY * 0.9, tolP);
+            double damage = laser->damage * (laser->minFrac + (1.0 - laser->minFrac) *
+                std::min(1.0, nextCharge / laser->fullCharge)) * (1.0 + cfgDmgPerCube_ * std::min(myCubes, cfgCubeStatCap_));
+            if (holdsKind(target->weapons, "mortar")) damage *= 1.0 + laser->cookoff;
+            if (showsBack(*target, x, y)) damage *= cfgRearMult_;
+            const bool readyToRelease = laser->charge > 0.0 && nextCharge >= laser->minCharge &&
+                (nextCharge >= laser->fullCharge || damage * 0.80 >= target->hp);
+            if (laser->charge > laser->fullCharge * 0.45 || (laserAligned && readyToRelease)) {
+                aim = hitscanAim;
             }
+            fire[static_cast<std::size_t>(slot)] = !needsSpeed && !(readyToRelease && laserAligned);
+        }
+
+        const Vec2 nextAim = aimAfterTick(aim);
+        if (gunLoaded && aligned(aim, gAim, tolY, tolP) && aligned(nextAim, gAim, tolY, tolP)) {
+            fire[static_cast<std::size_t>(findWeaponSlot(ws, "gun"))] = true;
+        }
+        if (light && dist < light->range - 1.5 && energy >= light->energyCost) {
+            const double halfCone = radians(light->coneDeg) * 0.5 - 0.05;
+            if (std::abs(angDiff(hy, aim[0])) < halfCone && std::abs(angDiff(hy, nextAim[0])) < halfCone) {
+                fire[static_cast<std::size_t>(findWeaponSlot(ws, "lightning"))] = true;
+            }
+        }
+        if (shellAim && aligned(aim, *shellAim, 0.04, 0.03) && aligned(nextAim, *shellAim, 0.04, 0.03)) {
+            fire[static_cast<std::size_t>(findWeaponSlot(ws, "mortar"))] = true;
         }
     }
 
@@ -2512,17 +2522,13 @@ Json Brain::act(const Json& obs) {
                                       minPitch, maxPitch, /*allowHighArc=*/true)) {
             aim = *ma;
             haveAim = true;
-            const double ey = std::max(0.0, std::abs(angDiff((*ma)[0], curAim[0])) - turnRate * 0.05);
-            const double ep = std::max(0.0, std::abs((*ma)[1] - curAim[1]) - pitchRate * 0.05);
-            if (ey < 0.05 && ep < 0.04) {
-                const int mSlot = findWeaponSlot(ws, "mortar");
-                if (mSlot >= 0) fire[static_cast<std::size_t>(mSlot)] = true;
-            }
+            fire.fill(false);
+            fire[static_cast<std::size_t>(findWeaponSlot(ws, "mortar"))] = aligned(aimAfterTick(aim), aim, 0.05, 0.04);
         }
     }
 
     // Behind-wall laser pre-charge ONLY when actively peeking an engaged close foe (never while retreating/escaping!)
-    if (!target && foe && laser && mode == "fight" && !retreat_) {
+    if (!target && foe && laser && mode == "fight" && !retreat_ && !needsSpeed) {
         const int lSlot = findWeaponSlot(ws, "laser");
         if (lSlot >= 0 && laser->cooldown <= 0.05 && foe->dist < std::min(130.0, laser->range) &&
             laser->charge < laser->fullCharge + laser->holdS - 0.35 &&
