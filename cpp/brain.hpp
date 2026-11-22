@@ -202,9 +202,6 @@ private:
     double cfgRegenDelay_ = 5.0;
     double cfgRegenPerS_ = 45.0;
     double cfgEnergyRegen_ = 18.0;
-    double cfgStepSoundSpeed_ = 5.0;
-    double cfgGunSoundRange_ = 320.0;
-    double cfgNpcSoundRange_ = 200.0;
     double cfgMaxRiseSpeed_ = 15.0;
     double cfgNpcRadius_ = 1.8;
     double cfgNpcHeight_ = 3.5;
