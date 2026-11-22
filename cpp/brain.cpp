@@ -1110,6 +1110,118 @@ Vec2 Brain::zoneGoal(const Json& z, double x, double y) const {
     return {nc[0] + dx / d * r, nc[1] + dy / d * r};
 }
 
+std::optional<Brain::ZoneDetour> Brain::zoneDetour(const Json& z, const FireState& state,
+                                                 double speed, double accel, bool inZone) {
+    const Vec3& pos = state.pos;
+    const Vec2 start{pos[0], pos[1]};
+    const ZoneCircle estimated = curZone(z);
+    const Vec2 liveCenter = safeVec2(z, "center", {estimated.x, estimated.y});
+    const ZoneCircle live{liveCenter[0], liveCenter[1], numOr(z, "radius", estimated.r)};
+    const Vec2 center = safeVec2(z, "next_center", {live.x, live.y});
+    const double radius = numOr(z, "next_radius", live.r);
+    const double shrinkStart = numOr(z, "shrink_start", now_);
+    const double shrinkEnd = numOr(z, "shrink_end", now_);
+    const double pad = std::min(radius * 0.5, 8.0);
+    const double safeRadius = radius - pad;
+    const double radialDistance = distanceTo(pos, center);
+    if (safeRadius < nav_.cellStep() || radialDistance <= safeRadius ||
+        nav_.onRoofObst(pos[0], pos[1], pos[2])) return std::nullopt;
+
+    const double directDistance = radialDistance - safeRadius;
+    // During the hold, defer the search if even a long detour has ample time.
+    if (inZone && shrinkStart - now_ > directDistance / speed + 35.0) return std::nullopt;
+
+    const Vec2 radial{center[0] + (pos[0] - center[0]) * safeRadius / radialDistance,
+                      center[1] + (pos[1] - center[1]) * safeRadius / radialDistance};
+    auto walkableFromHere = [&](const Vec2& point) {
+        return nav_.lineWalkable(start[0], start[1], point[0], point[1]);
+    };
+    if (walkableFromHere(radial)) return std::nullopt;
+
+    const bool samePhase = detourPhaseEnd_ == shrinkEnd && detourCircle_.x == center[0] &&
+                           detourCircle_.y == center[1] && detourCircle_.r == radius;
+    constexpr std::size_t segmentCells = 14;
+    const double attachDistance = (segmentCells * std::sqrt(2.0) + 1.0) * nav_.cellStep();
+    auto attach = [&]() {
+        const auto end = std::min(detourIndex_ + 3, detourPath_.size());
+        for (std::size_t i = end; i > detourIndex_; --i) {
+            const Vec2& point = detourPath_[i - 1];
+            const double distance = distanceTo(pos, point);
+            if (distance > 0.5 && distance <= attachDistance && walkableFromHere(point)) {
+                detourIndex_ = i - 1;
+                return true;
+            }
+        }
+        return false;
+    };
+    if (!samePhase || !attach()) {
+        if (samePhase && now_ < detourRetryAt_) return std::nullopt;
+        detourCircle_ = {center[0], center[1], radius};
+        detourPhaseEnd_ = shrinkEnd;
+        detourRetryAt_ = now_ + 1.0;
+        detourIndex_ = 0;
+        detourPath_.clear();
+        const auto [path, reached] = nav_.pathToCircle(start, center, safeRadius, 9000);
+        if (!reached || path.empty()) return std::nullopt;
+        for (std::size_t i = 0;;) {
+            const Vec2 point = nav_.cellPos(path[i]);
+            detourPath_.push_back(point);
+            if (i + 1 == path.size()) break;
+            std::size_t next = std::min(i + segmentCells, path.size() - 1);
+            for (; next > i + 1; --next) {
+                const Vec2 end = nav_.cellPos(path[next]);
+                if (nav_.lineWalkable(point[0], point[1], end[0], end[1])) break;
+            }
+            i = next;
+        }
+        if (!attach()) return std::nullopt;
+    }
+
+    const double motionStart = std::max(now_, shrinkStart);
+    auto exitAt = [&](Vec2 point) {
+        if (std::hypot(point[0] - center[0], point[1] - center[1]) <= safeRadius) return kInf;
+        if (std::hypot(point[0] - live.x, point[1] - live.y) >= live.r - pad) return motionStart;
+        double low = 0.0, high = 1.0;
+        for (int i = 0; i < 14; ++i) {
+            const double f = 0.5 * (low + high);
+            const double dx = point[0] - std::lerp(live.x, center[0], f);
+            const double dy = point[1] - std::lerp(live.y, center[1], f);
+            if (std::hypot(dx, dy) <= std::lerp(live.r, radius, f) - pad) low = f;
+            else high = f;
+        }
+        return std::lerp(motionStart, std::max(motionStart, shrinkEnd), low);
+    };
+
+    double latest = exitAt(start);
+    double elapsed = 0.0;
+    Vec2 from = start;
+    Vec2 velocity{state.vel[0], state.vel[1]};
+    for (std::size_t i = detourIndex_; i < detourPath_.size(); ++i) {
+        const Vec2 to = detourPath_[i];
+        const double distance = std::hypot(to[0] - from[0], to[1] - from[1]);
+        if (distance <= 1e-6) continue;
+        const Vec2 direction{(to[0] - from[0]) / distance, (to[1] - from[1]) / distance};
+        const double initial = std::clamp(velocity[0] * direction[0] + velocity[1] * direction[1], -speed, speed);
+        const double rampDistance = (speed * speed - initial * initial) / (2.0 * accel);
+        auto travelTime = [&](double length) {
+            if (length > rampDistance) return (speed - initial) / accel + (length - rampDistance) / speed;
+            return (std::sqrt(initial * initial + 2.0 * accel * length) - initial) / accel;
+        };
+        // Check exposure along the route. A wall can force an outward leg before safe entry.
+        const int samples = static_cast<int>(std::ceil(distance / (2.0 * nav_.cellStep())));
+        for (int j = 1; j <= samples; ++j) {
+            const double f = static_cast<double>(j) / samples;
+            const Vec2 sample{std::lerp(from[0], to[0], f), std::lerp(from[1], to[1], f)};
+            latest = std::min(latest, exitAt(sample) - elapsed - travelTime(f * distance));
+        }
+        elapsed += travelTime(distance);
+        const double endSpeed = std::min(speed, std::sqrt(initial * initial + 2.0 * accel * distance));
+        velocity = {direction[0] * endSpeed, direction[1] * endSpeed};
+        from = to;
+    }
+    return ZoneDetour{detourPath_[detourIndex_], latest};
+}
+
 bool Brain::runEscape(const Json& me, double& mx, double& my, bool& boost, bool& jump) {
     const Vec3 pos = safeVec3(me, "pos");
     const double x = pos[0], y = pos[1], zf = pos[2];
@@ -2710,7 +2822,8 @@ Brain::ActionChoice Brain::chooseFinishAction(const ProjectionContext& c, Action
     return compareActions(c, actions, false);
 }
 
-Brain::ActionChoice Brain::chooseZoneAction(const ProjectionContext& c, ActionChoice fallback, Vec2 goal) {
+Brain::ActionChoice Brain::chooseZoneAction(const ProjectionContext& c, ActionChoice fallback, Vec2 goal,
+                                            bool followDetour) {
     const Vec3& start = c.fire.pos;
     const auto& circle = c.circles[2];
     const Vec2 center{circle.x, circle.y};
@@ -2744,7 +2857,7 @@ Brain::ActionChoice Brain::chooseZoneAction(const ProjectionContext& c, ActionCh
     const Vec2 route = limitLength(fallback.move, 1.0);
     if (route[0] != 0.0 || route[1] != 0.0) {
         const double leg = std::min(5.0, distanceTo(start, goal));
-        waypoint = Vec2{start[0] + route[0] * leg, start[1] + route[1] * leg};
+        waypoint = followDetour ? goal : Vec2{start[0] + route[0] * leg, start[1] + route[1] * leg};
     } else if (!entry && !c.inZone && distanceTo(start, goal) > 1e-6) {
         // Travel's regular stopping radius can hide a short but blocked path to safety.
         const auto [path, reached] = nav_.path(start[0], start[1], goal[0], goal[1]);
@@ -2776,7 +2889,16 @@ Brain::ActionChoice Brain::chooseZoneAction(const ProjectionContext& c, ActionCh
         const double fraction = std::clamp(distanceTo(start, *entry) / (kDecision * speed), 0.0, 1.0);
         actions.push_back({{{direction[0] * fraction, direction[1] * fraction}, false}, entry, destination});
     }
-    if (entry || c.inZone) actions.push_back({{{}, false}, std::nullopt, destination});
+    if (entry || (c.inZone && !followDetour)) {
+        actions.push_back({{{}, false}, std::nullopt, destination});
+    } else if (followDetour && waypoint) {
+        // A brake near a turn resumes the route on the next decision.
+        const double currentSpeed = std::hypot(c.fire.vel[0], c.fire.vel[1]);
+        const double brakingDistance = currentSpeed * (kDecision + currentSpeed / (2.0 * c.accel));
+        if (distanceTo(start, *waypoint) <= brakingDistance) {
+            actions.push_back({{{}, false}, waypoint, destination});
+        }
+    }
     if (c.dodge[0] != 0.0 || c.dodge[1] != 0.0) {
         const Vec2 intended = waypoint ? fallback.move : toward(start, destination);
         const Vec2 mv = limitLength({0.4 * intended[0] + 0.9 * c.dodge[0], 0.4 * intended[1] + 0.9 * c.dodge[1]}, 1.0);
@@ -2926,9 +3048,13 @@ Json Brain::act(const Json& obs) {
     const Vec2 zg = zoneGoal(z, x, y);
     const double zdist = std::hypot(zg[0] - x, zg[1] - y);
     const double tNeed = zdist * 1.45 / walkSpeed + 4.0;
-    const double deadline = zoneDeadline(z, x, y, 8.0);
-    const bool zoneMust = !inZone || now_ + tNeed + 3.0 >= deadline;
-    const bool zoneShould = now_ + tNeed + 14.0 >= deadline;
+    const auto detour = grounded ? zoneDetour(z, fireState, walkSpeed,
+                            std::max(1.0, numOr(st, "ground_accel", 58.5)), inZone) : std::nullopt;
+    const double latestDeparture = detour ? detour->latestDeparture : zoneDeadline(z, x, y, 8.0) - tNeed;
+    const bool zoneMust = !inZone || now_ + 3.0 >= latestDeparture;
+    const bool zoneShould = now_ + 14.0 >= latestDeparture;
+    const bool hasZoneRoute = detour || zdist > 2.0;
+    const Vec2 zoneWaypoint = detour ? detour->waypoint : zg;
 
     if (runEscape(me, mx, my, boost, jump)) {
         roofFlying_ = false;
@@ -2942,13 +3068,13 @@ Json Brain::act(const Json& obs) {
         roofFlying_ = false;
         boost = energy > 15.0;
         mode = "dodge-mortar";
-    } else if (zoneMust && (!inZone || zdist > 2.0)) {
+    } else if (zoneMust && (!inZone || hasZoneRoute)) {
         roofFlying_ = false;
-        Vec2 mv = travel(me, zg[0], zg[1]);
-        boost = (!inZone || now_ + tNeed >= deadline) && energy > 5.0;
+        Vec2 mv = detour ? toward(pos, zoneWaypoint) : travel(me, zg[0], zg[1]);
+        boost = (!inZone || now_ >= latestDeparture) && energy > 5.0;
         if (grounded) {
             const auto context = projectionContext(obs, me, fireState, ws, target, seen, true);
-            const auto action = chooseZoneAction(context, {mv, boost}, zg);
+            const auto action = chooseZoneAction(context, {mv, boost}, zoneWaypoint, detour.has_value());
             mv = action.move;
             boost = action.boost;
             projectedMove = true;
@@ -3087,9 +3213,9 @@ Json Brain::act(const Json& obs) {
                 mode = "fight:cube";
             }
         }
-    } else if (zoneShould && zdist > 2.0) {
+    } else if (zoneShould && hasZoneRoute) {
         roofFlying_ = false;
-        const Vec2 mv = travel(me, zg[0], zg[1]);
+        const Vec2 mv = detour ? toward(pos, zoneWaypoint) : travel(me, zg[0], zg[1]);
         mx = mv[0];
         my = mv[1];
         mode = "zone";

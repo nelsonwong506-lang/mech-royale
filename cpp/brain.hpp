@@ -170,7 +170,8 @@ private:
                                 bool enteringZone) const;
     ActionChoice chooseFinishAction(const ProjectionContext& context, ActionChoice fallback,
                                     std::optional<Vec2> cover, std::optional<ActionChoice> baselineFight);
-    ActionChoice chooseZoneAction(const ProjectionContext& context, ActionChoice fallback, Vec2 goal);
+    ActionChoice chooseZoneAction(const ProjectionContext& context, ActionChoice fallback, Vec2 goal,
+                                  bool followDetour);
     bool projectMove(const ProjectionContext& context, const Vec3& from, Vec3& to) const;
     bool canFinishWithinProjection(const FireState& state, const Weapons& weapons, const MechTrack& target) const;
 
@@ -219,6 +220,19 @@ private:
     double zoneDeadline(const Json& z, double x, double y, double pad) const;
     double zonePenalty(const Json& z, double x, double y) const;
     Vec2 zoneGoal(const Json& z, double x, double y) const;
+
+    struct ZoneDetour {
+        Vec2 waypoint;
+        double latestDeparture;
+    };
+    std::optional<ZoneDetour> zoneDetour(const Json& z, const FireState& state,
+                                          double speed, double accel, bool inZone);
+
+    ZoneCircle detourCircle_{};
+    double detourPhaseEnd_ = -1.0;
+    double detourRetryAt_ = -1.0;
+    std::vector<Vec2> detourPath_;
+    std::size_t detourIndex_ = 0;
 
     bool runEscape(const Json& me, double& mx, double& my, bool& boost, bool& jump);
     bool dodgeShell(const Json& obs, const Json& me, double& mx, double& my) const;

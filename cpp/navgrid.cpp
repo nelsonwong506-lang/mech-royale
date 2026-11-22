@@ -235,6 +235,18 @@ std::pair<std::vector<int32_t>, bool> NavGrid::path(double sx, double sy, double
     const int s = nearestFree(cell(sx, sy));
     const int g = nearestFree(cell(gx, gy));
     if (s < 0 || g < 0) return {{}, false};
+    return searchPath(s, g, {}, 0.0, maxExpand);
+}
+
+std::pair<std::vector<int32_t>, bool> NavGrid::pathToCircle(Vec2 start, Vec2 center, double radius,
+                                                           int maxExpand) {
+    const int s = nearestFree(cell(start[0], start[1]));
+    if (s < 0) return {{}, false};
+    return searchPath(s, -1, center, radius, maxExpand);
+}
+
+std::pair<std::vector<int32_t>, bool> NavGrid::searchPath(int s, int g, Vec2 center,
+                                                          double radius, int maxExpand) {
     if (s == g) return {{static_cast<int32_t>(s)}, true};
 
     ++gen_;
@@ -242,6 +254,11 @@ std::pair<std::vector<int32_t>, bool> NavGrid::path(double sx, double sy, double
     heap_.clear();
     const int gi = g % nnx_, gj = g / nnx_;
     auto h = [&](int c) -> float {
+        if (g < 0) {
+            const Vec2 point = cellPos(c);
+            return static_cast<float>(1.15 * std::max(0.0, std::hypot(point[0] - center[0],
+                                                                     point[1] - center[1]) - radius));
+        }
         const double dx = std::abs((c % nnx_) - gi);
         const double dy = std::abs((c / nnx_) - gj);
         const double mn = std::min(dx, dy), mx = std::max(dx, dy);
@@ -262,12 +279,12 @@ std::pair<std::vector<int32_t>, bool> NavGrid::path(double sx, double sy, double
         const int c = it.idx;
         if (closed_[static_cast<std::size_t>(c)] == gen) continue;
         closed_[static_cast<std::size_t>(c)] = gen;
-        if (c == g) {
+        const float hc = h(c);
+        if (c == g || (g < 0 && hc == 0.0f)) {
             found = true;
             best = c;
             break;
         }
-        const float hc = h(c);
         if (hc < bestH) {
             best = c;
             bestH = hc;

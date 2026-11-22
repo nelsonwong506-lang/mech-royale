@@ -38,6 +38,8 @@ public:
 
     std::pair<std::vector<int32_t>, bool> path(double sx, double sy, double gx, double gy,
                                                int maxExpand = 22000);
+    std::pair<std::vector<int32_t>, bool> pathToCircle(Vec2 start, Vec2 center, double radius,
+                                                      int maxExpand);
 
     std::optional<Vec2> findCoverBFS(double sx, double sy,
                                      const std::function<bool(double, double)>& isHidden,
@@ -61,6 +63,8 @@ private:
     void ensureMainNear();
     void pushHeap(HeapItem it);
     HeapItem popHeap();
+    std::pair<std::vector<int32_t>, bool> searchPath(int start, int goal, Vec2 center,
+                                                     double radius, int maxExpand);
 
     const Arena& arena_;
     double minX_ = 0.0, minY_ = 0.0;
