@@ -197,11 +197,12 @@ private:
     void projectAction(const ProjectionContext& context, const ProjectedAction& action,
                        Projection& state, bool pursuit, int decision) const;
     ActionChoice compareActions(const ProjectionContext& context, const std::vector<ProjectedAction>& actions,
-                                bool enteringZone) const;
+                                bool enteringZone, bool comparingRecovery = false) const;
     ActionChoice chooseFinishAction(const ProjectionContext& context, ActionChoice fallback,
                                     std::optional<Vec2> cover, std::optional<ActionChoice> baselineFight);
     ActionChoice chooseZoneAction(const ProjectionContext& context, ActionChoice fallback, Vec2 goal,
                                   bool followDetour);
+    std::vector<Vec2> zoneRecoveryRoute(const ProjectionContext& context);
     bool projectMove(const ProjectionContext& context, const Vec3& from, Vec3& to) const;
     bool canFinishWithinProjection(const FireState& state, const Weapons& weapons, const MechTrack& target) const;
 
@@ -264,6 +265,10 @@ private:
     double detourRetryAt_ = -1.0;
     std::vector<Vec2> detourPath_;
     std::size_t detourIndex_ = 0;
+    std::vector<Vec2> recoveryPath_;
+    std::size_t recoveryIndex_ = 0;
+    double recoveryPhaseEnd_ = -1.0;
+    double recoveryRetryAt_ = -1.0;
 
     bool runEscape(const Json& me, double& mx, double& my, bool& boost, bool& jump);
     bool dodgeShell(const Json& obs, const Json& me, double& mx, double& my) const;

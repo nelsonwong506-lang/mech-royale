@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <span>
 #include <string_view>
 
 namespace mr {
@@ -2215,6 +2216,7 @@ struct Brain::ProjectionContext {
     double chargeMove = 0.5;
     double regenPerS = 45.0;
     double zoneDPS = 20.0;
+    double zonePhaseEnd = 0.0;
     double backgroundDPS = 0.0;
     bool inZone = true;
     bool enteringZone = false;
@@ -2227,6 +2229,7 @@ struct Brain::ProjectedAction {
     ActionChoice first;
     std::optional<Vec2> waypoint;
     std::optional<Vec2> goal;
+    std::span<const Vec2> route{};
 };
 
 struct Brain::Projection {
@@ -2244,6 +2247,7 @@ struct Brain::Projection {
     double lastCombat = 0.0;
     double lastEnergyUse = 0.0;
     double stoppedOnWall = 0.0;
+    std::size_t routeIndex = 0;
     bool reachedCover = false;
     bool settled = false;
 };
@@ -2286,8 +2290,13 @@ Brain::ProjectionContext Brain::projectionContext(const Json& obs, const Project
     const auto& zone = obs.contains("zone") && obs["zone"].is_object() ? obs["zone"] : Json::object();
     c.zoneDPS = numOr(zone, "dps", 20.0);
     c.circles[0] = curZone(zone);
+    if (enteringZone && !c.inZone) {
+        const Vec2 live = safeVec2(zone, "center", {c.circles[0].x, c.circles[0].y});
+        c.circles[0] = {live[0], live[1], numOr(zone, "radius", c.circles[0].r)};
+    }
     const double shrinkStart = numOr(zone, "shrink_start", 0.0);
     const double shrinkEnd = numOr(zone, "shrink_end", 0.0);
+    c.zonePhaseEnd = shrinkEnd;
     const auto next = safeVec2(zone, "next_center", {c.circles[0].x, c.circles[0].y});
     const double nextRadius = numOr(zone, "next_radius", c.circles[0].r);
     for (int tick = 1; tick <= kProjectionTicks; ++tick) {
@@ -2583,9 +2592,18 @@ void Brain::projectAction(const ProjectionContext& c, const ProjectedAction& act
     const WeaponInfo* laser = getWeapon(s.weapons, "laser");
     const double chargeFactor = laser && laser->charge > 0.0 ? c.chargeMove : 1.0;
     Vec2 move = action.first.move;
-    if (decision > 0 && action.waypoint) {
-        Vec2 waypoint = *action.waypoint;
-        if (action.goal && distanceTo(fs.pos, waypoint) <= c.walk * kDecision) waypoint = *action.goal;
+    if (decision > 0 && (action.waypoint || !action.route.empty())) {
+        Vec2 waypoint{};
+        if (!action.route.empty()) {
+            if (s.routeIndex + 1 < action.route.size() &&
+                distanceTo(fs.pos, action.route[s.routeIndex]) <= c.walk * kDecision) {
+                ++s.routeIndex;
+            }
+            waypoint = action.route[s.routeIndex];
+        } else {
+            waypoint = *action.waypoint;
+            if (action.goal && distanceTo(fs.pos, waypoint) <= c.walk * kDecision) waypoint = *action.goal;
+        }
         const double distance = distanceTo(fs.pos, waypoint);
         const double speed = (action.first.boost ? c.boost : c.walk) * chargeFactor;
         move = toward(fs.pos, waypoint);
@@ -2815,7 +2833,7 @@ void Brain::projectAction(const ProjectionContext& c, const ProjectedAction& act
 }
 
 Brain::ActionChoice Brain::compareActions(const ProjectionContext& c, const std::vector<ProjectedAction>& actions,
-                                           bool enteringZone) const {
+                                           bool enteringZone, bool comparingRecovery) const {
     if (actions.size() <= 1) return actions.front().first;
     Projection initial;
     initial.fire = c.fire;
@@ -2839,7 +2857,7 @@ Brain::ActionChoice Brain::compareActions(const ProjectionContext& c, const std:
                 settled = settled && prediction.settled;
             }
         }
-        if (settled && decision > 0) break;
+        if (settled && decision > 0 && !comparingRecovery) break;
     }
 
     struct Score {
@@ -2855,12 +2873,20 @@ Brain::ActionChoice Brain::compareActions(const ProjectionContext& c, const std:
         const auto& a = predictions[i][0];
         const auto& b = predictions[i][hasPursuit ? 1 : 0];
         const auto& goal = actions[i].goal;
+        double progress = goal ? -std::max(distanceTo(a.fire.pos, *goal), distanceTo(b.fire.pos, *goal)) : 0.0;
+        if (comparingRecovery) {
+            const ZoneCircle& circle = c.circles.back();
+            auto clearance = [&](const Projection& predicted) {
+                return std::min(1.25, circle.r - distanceTo(predicted.fire.pos, {circle.x, circle.y}));
+            };
+            progress = std::min(clearance(a), clearance(b));
+        }
         return {
             static_cast<int>(a.hp <= 0.0) + static_cast<int>(b.hp <= 0.0),
             std::min(a.deathTime, b.deathTime),
             std::min(a.hp, b.hp),
             enteringZone ? std::max(a.outsideTime, b.outsideTime) : std::max(a.exposedTime, b.exposedTime),
-            goal ? -std::max(distanceTo(a.fire.pos, *goal), distanceTo(b.fire.pos, *goal)) : 0.0,
+            progress,
             std::max(a.stoppedOnWall, b.stoppedOnWall),
             std::min(a.fire.energy, b.fire.energy),
         };
@@ -2950,6 +2976,77 @@ Brain::ActionChoice Brain::chooseFinishAction(const ProjectionContext& c, Action
     return compareActions(c, actions, false);
 }
 
+std::vector<Vec2> Brain::zoneRecoveryRoute(const ProjectionContext& c) {
+    const Vec3& pos = c.fire.pos;
+    const Vec2 initialHeading = toward(pos, {c.circles[0].x, c.circles[0].y});
+    double speed = c.fire.vel[0] * initialHeading[0] + c.fire.vel[1] * initialHeading[1];
+    double distance = 0.0;
+    const WeaponInfo* laser = getWeapon(c.weapons, "laser");
+    const double chargeFactor = laser && laser->charge > 0.0 ? c.chargeMove : 1.0;
+    int arrival = 1;
+    for (; arrival < kProjectionTicks; ++arrival) {
+        const bool boost = c.fire.energy > (arrival - 1) * kTick * c.boostDrain;
+        const double desired = chargeFactor * (boost ? c.boost : c.walk);
+        speed += std::clamp(desired - speed, -c.accel * kTick, c.accel * kTick);
+        distance += speed * kTick;
+        const ZoneCircle& moving = c.circles[arrival];
+        if (distanceTo(pos, {moving.x, moving.y}) - moving.r <= distance) break;
+    }
+    // Aim inside an inset of the circle as it will be just after arrival.
+    const int settlingTicks = static_cast<int>(c.walk / (c.accel * kTick)) + 2;
+    const ZoneCircle& landing = c.circles[std::min(kProjectionTicks, arrival + settlingTicks)];
+    const Vec2 center{landing.x, landing.y};
+    const double radius = landing.r - std::min(1.25, landing.r * 0.5);
+    if (radius <= 0.0) return {};
+    const Vec2 towardCenter = toward(pos, center);
+    const Vec2 entry{center[0] - towardCenter[0] * radius, center[1] - towardCenter[1] * radius};
+
+    auto attachable = [&](const Vec2& point) {
+        if (distanceTo(pos, point) <= 0.45 || !nav_.lineWalkable(pos[0], pos[1], point[0], point[1])) return false;
+        Vec3 end{point[0], point[1], pos[2]};
+        return projectMove(c, pos, end);
+    };
+    if (attachable(entry)) return {entry};
+
+    const bool samePhase = recoveryPhaseEnd_ == c.zonePhaseEnd;
+    auto attachCached = [&]() -> std::vector<Vec2> {
+        const auto end = std::min(recoveryIndex_ + 3, recoveryPath_.size());
+        for (std::size_t i = end; i > recoveryIndex_; --i) {
+            if (attachable(recoveryPath_[i - 1])) {
+                recoveryIndex_ = i - 1;
+                return {recoveryPath_.begin() + recoveryIndex_, recoveryPath_.end()};
+            }
+        }
+        return {};
+    };
+    if (samePhase && !recoveryPath_.empty()) {
+        const Vec2& endpoint = recoveryPath_.back();
+        if (std::hypot(endpoint[0] - center[0], endpoint[1] - center[1]) < landing.r) {
+            if (auto path = attachCached(); !path.empty()) return path;
+        }
+    }
+    if (samePhase && now_ < recoveryRetryAt_) return {};
+    recoveryPhaseEnd_ = c.zonePhaseEnd;
+    recoveryRetryAt_ = now_ + 0.75;
+    recoveryPath_.clear();
+    recoveryIndex_ = 0;
+    const auto [path, reached] = nav_.pathToCircle({pos[0], pos[1]}, center, radius, 5500);
+    if (!reached || path.empty()) return {};
+
+    for (std::size_t i = 0;;) {
+        const Vec2 point = nav_.cellPos(path[i]);
+        recoveryPath_.push_back(point);
+        if (i + 1 == path.size()) break;
+        std::size_t next = std::min(i + 12, path.size() - 1);
+        for (; next > i + 1; --next) {
+            const Vec2 end = nav_.cellPos(path[next]);
+            if (nav_.lineWalkable(point[0], point[1], end[0], end[1])) break;
+        }
+        i = next;
+    }
+    return attachCached();
+}
+
 Brain::ActionChoice Brain::chooseZoneAction(const ProjectionContext& c, ActionChoice fallback, Vec2 goal,
                                             bool followDetour) {
     const Vec3& start = c.fire.pos;
@@ -3033,7 +3130,25 @@ Brain::ActionChoice Brain::chooseZoneAction(const ProjectionContext& c, ActionCh
         actions.push_back({{mv, fallback.boost || (c.dodgeLaser && c.fire.energy > 0.1)},
                            waypoint ? waypoint : entry, destination});
     }
-    return compareActions(c, actions, true);
+    const auto recovery = !c.inZone && !entry ? zoneRecoveryRoute(c) : std::vector<Vec2>{};
+    if (!recovery.empty()) {
+        if (followDetour && detourIndex_ < detourPath_.size()) {
+            for (auto& action : actions) {
+                action.route = std::span<const Vec2>(detourPath_).subspan(detourIndex_);
+            }
+        }
+        const Vec2 direction = toward(start, recovery.front());
+        actions.push_back({{direction, false}, std::nullopt, recovery.back(), recovery});
+        if (c.fire.energy > 0.1) {
+            actions.push_back({{direction, true}, std::nullopt, recovery.back(), recovery});
+        }
+        if (c.dodge != Vec2{}) {
+            const Vec2 mv = limitLength({0.4 * direction[0] + 0.9 * c.dodge[0],
+                                         0.4 * direction[1] + 0.9 * c.dodge[1]}, 1.0);
+            actions.push_back({{mv, fallback.boost}, std::nullopt, recovery.back(), recovery});
+        }
+    }
+    return compareActions(c, actions, true, !recovery.empty());
 }
 
 Json Brain::act(const Json& obs) {
