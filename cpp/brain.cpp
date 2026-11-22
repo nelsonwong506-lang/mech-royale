@@ -1166,9 +1166,13 @@ Vec2 Brain::fightMove(const Json& obs, const Json& me, const std::array<std::opt
     const int alive = intOr(obs, "alive", 16);
     const auto& z = obs.contains("zone") && obs["zone"].is_object() ? obs["zone"] : Json::object();
 
-    // Separate primary-duel weight (never refuses fair 1v1!) vs heavy 3rd-party cover-splitting weight!
+    // Separate primary-duel weight (corner-kiting discipline + alive-scaling + Laser cooldown dip!) vs heavy 3rd-party cover-splitting!
     const double hpFrac = hp / maxHp;
-    const double wPrimary = 0.45 + 0.48 * std::clamp(1.0 - hpFrac, 0.0, 1.0);
+    const WeaponInfo* myLaserW = getWeapon(ws, "laser");
+    const bool laserHot = myLaserW && (myLaserW->charge >= myLaserW->fullCharge * 0.45);
+    const double laserCdDip = (myLaserW && myLaserW->cooldown > 0.40 && myLaserW->charge <= 0.0 && hpFrac < 0.78) ? 0.18 : 0.0;
+    const double wPrimary = 0.50 + 0.45 * std::clamp(1.0 - hpFrac, 0.0, 1.0) +
+                            0.015 * static_cast<double>(std::max(0, alive - 2)) + laserCdDip;
     const double lambdaExtra = 1.55 + 0.05 * static_cast<double>(alive);
 
     // Physical optimal matchup range (accounts for 0.25s bullet-dodge flight time & weapon ranges!)
@@ -1276,9 +1280,9 @@ Vec2 Brain::fightMove(const Json& obs, const Json& me, const std::array<std::opt
             primaryIn *= 1.0 + 0.80 * (58.0 - d) / 58.0;
         }
 
-        // Core physics net combat rate: actively fights 1v1 when weapon ready, splits angles vs 2nd/3rd foes,
-        // automatically hides during reload/cooldown (myBurst==0) or enemy charging laser!
-        const double fireVal = std::min(myBurst, iHaveLight ? 240.0 : 145.0);
+        // Core physics net combat rate: actively fights 1v1 when weapon ready (uncapped peek bonus when Laser is charged!),
+        // splits angles vs 2nd/3rd foes, automatically hides during reload/cooldown (myBurst==0) or enemy charging laser!
+        const double fireVal = std::min(myBurst, iHaveLight ? 240.0 : 145.0) + (los && laserHot ? 140.0 : 0.0);
         double s = fireVal - wPrimary * primaryIn - lambdaExtra * extraIn - laserDanger - r * 0.6;
 
         // 3. Continuous optimal-range & weapon-matchup potential (keeps Gun/Laser at ~85m kiting range,
@@ -1933,13 +1937,17 @@ Json Brain::act(const Json& obs) {
     const bool outgunned = target && holdsKind(target->weapons, "laser") && !laser && target->dist > 55.0 && hpFrac < 0.78;
     const bool swamped = (crowdCount >= 3) || (crowdCount == 2 && hpFrac < 0.65) || outgunned;
     const bool losingTrade = underFire && (ttkDie < 3.0 && ttkDie < ttkBestKill * 0.72);
+    const double naniteBonus = std::clamp((5.0 - cfgRegenDelay_) * 0.08, 0.0, 0.24);
+    const double targetHpFrac = target ? (target->hp / std::max(1.0, target->maxHp)) : 1.0;
+    const bool hpDeficitReset = inZone && target && !pracOn_ && (nav_.exposure(x, y) < 0.72) &&
+        (hpFrac < 0.56 + naniteBonus) && (hpFrac < targetHpFrac - 0.22) && (target->dist > 38.0);
     const bool lowUnderFire = (hpFrac < 0.38 && now_ - lastThreatAt_ < 2.0);
-    if (!retreat_ && !finishing && !late && (lowUnderFire || swamped || losingTrade)) {
+    if (!retreat_ && !finishing && !late && (lowUnderFire || swamped || losingTrade || hpDeficitReset)) {
         retreat_ = true;
         coverAt_ = -1.0;
     }
-    if (retreat_ && (finishing || late || (!swamped && !losingTrade &&
-        (hpFrac > 0.78 || (now_ - lastThreatAt_ > 6.5 && hpFrac > 0.55))))) {
+    if (retreat_ && (finishing || late || (!swamped && !losingTrade && !hpDeficitReset &&
+        (hpFrac > 0.78 || (now_ - lastThreatAt_ > std::max(3.5, cfgRegenDelay_ + 1.5) && hpFrac > 0.55))))) {
         retreat_ = false;
     }
 
@@ -2243,8 +2251,14 @@ Json Brain::act(const Json& obs) {
         shootable = true;
     }
 
-    // Strict 5s regen silence gate for non-lethal / non-self-defense PvE shots
+    // Strict regen silence gate for non-lethal / non-self-defense PvE shots
     if (!isMech && !defendNpc && (retreat_ || regenBreakCost(hpFrac, inZone) > 30.0)) {
+        shootable = false;
+    }
+    // Smart retreat fire discipline: if already escaping with >=1.5s banked toward regen and enemy is >55m & not hitting us,
+    // hold fire instead of resetting our own regen clock with a 45-dmg chip shot!
+    if (isMech && target && retreat_ && !finishing && inZone &&
+        (now_ - lastCombatAt_ >= 1.5) && (now_ - target->hitMe > 2.0) && (target->dist > 55.0)) {
         shootable = false;
     }
 
@@ -2290,8 +2304,8 @@ Json Brain::act(const Json& obs) {
                 }
             } else if (w.kind == "laser") {
                 if (!isMech || !target || dist > w.range * 0.97) continue;
-                // Don't start a fresh laser charge (0.5x move speed!) while actively running to cover at low HP
-                if (mode == "cover" && (mx != 0.0 || my != 0.0) && hpFrac < 0.50 && w.charge <= 0.0) continue;
+                // Don't start a fresh laser charge (0.5x move speed!) while actively running to cover
+                if (mode == "cover" && (mx != 0.0 || my != 0.0) && w.charge <= 0.0) continue;
                 const double full = w.fullCharge;
                 // Always-on exact physics lethal early release (with cube + cook-off + rear-armor multipliers!)
                 if (w.charge >= w.minCharge && w.charge < full - 0.051) {
