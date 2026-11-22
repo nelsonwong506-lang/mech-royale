@@ -49,12 +49,14 @@ struct MechTrack {
     double maxHp = 1400.0;
     int cubes = 0;
     std::vector<std::string> weapons;
+    bool weaponsKnown = false;
     bool charging = false;
     double seen = -100.0;
     double hitMe = -100.0;
     double dist = 0.0;
     bool los = false;
     double closing = 0.0;
+    double currentPressure = 0.0;
     bool engage = false;
     double engageScore = -1e9;
 };
@@ -84,12 +86,14 @@ struct WarEvent {
 };
 
 struct RosterEntry {
+    bool hasGun = false;
     bool hasLaser = false;
     bool hasLightning = false;
     bool hasMortar = false;
     int cubes = 0;
     Vec3 lastPos{};
     double lastSeen = -100.0;
+    double loadoutSeen = -std::numeric_limits<double>::infinity();
     bool dead = false;
 };
 
@@ -232,6 +236,7 @@ private:
                             double myArmor, double myEnergy, double dist,
                             bool aimingAtMe, bool burst) const;
     double attentionWeight(const MechTrack& t, double x, double y) const;
+    double fireCommitment(const MechTrack& t, const Vec3& pos, double towardSpeed, double walkSpeed) const;
     double engageValue(const Json& obs, const Json& me,
                        const std::array<std::optional<WeaponInfo>, 2>& ws,
                        const MechTrack& t, double inDPS, bool late) const;

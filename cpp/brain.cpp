@@ -498,7 +498,7 @@ double Brain::enemyExpectedDPS(const MechTrack& enemy,
     const bool iShortThem = (getWeapon(myWs, "lightning") != nullptr) && dist < 43.5 && myEnergy > 10.0;
 
     double dps = 0.0;
-    const bool hasGun = enemy.weapons.empty() || holdsKind(enemy.weapons, "gun");
+    const bool hasGun = (!enemy.weaponsKnown && enemy.weapons.empty()) || holdsKind(enemy.weapons, "gun");
     if (hasGun && dist < 225.0) {
         dps += 95.0 * gunHitProb(dist);
     }
@@ -530,6 +530,16 @@ double Brain::attentionWeight(const MechTrack& t, double x, double y) const {
     if (off < 0.28) return 0.95;
     if (off < 0.85) return 0.55;
     return 0.25;
+}
+
+double Brain::fireCommitment(const MechTrack& t, const Vec3& pos, double towardSpeed, double walkSpeed) const {
+    const double bearing = std::atan2(pos[1] - t.pos[1], pos[0] - t.pos[0]);
+    const double facing = 0.5 * (1.0 + std::cos(angDiff(t.aim[0], bearing)));
+    const double approach = std::max(0.0, towardSpeed) / (walkSpeed + std::abs(towardSpeed));
+    const double departure = std::max(0.0, -towardSpeed) / (walkSpeed + std::abs(towardSpeed));
+    const double near = (1.0 - departure) / (1.0 + std::pow(t.dist / 32.0, 4.0));
+    const double hit = std::clamp(1.0 - (now_ - t.hitMe) / 4.5, 0.0, 1.0);
+    return 1.0 - (1.0 - facing * facing) * (1.0 - approach) * (1.0 - near) * (1.0 - hit);
 }
 
 double Brain::engageValue(const Json& obs, const Json& me,
@@ -639,6 +649,7 @@ std::optional<double> Brain::bestArmorYaw(const Json& me, const ProjectileRisk& 
 
     for (const MechTrack* t : seen) {
         if (now_ - t->seen > 2.0) continue;
+        if (t->weaponsKnown && t->weapons.empty()) continue;
         const double wAim = attentionWeight(*t, x, y);
         const bool activeThreat = t->engage || (now_ - t->hitMe < 5.0) || (t->dist < 75.0) ||
                                   (t->dist < 175.0 && (wAim >= 0.85 || (t->los && wAim >= 0.55)));
@@ -756,9 +767,12 @@ void Brain::observe(const Json& obs, const Json& me, const std::array<std::optio
             t.maxHp = std::max(1.0, numOr(m, "max_hp", kind == "npc" ? 350.0 : 1400.0));
             t.cubes = intOr(m, "cubes", 0);
             t.charging = boolOr(m, "charging", false);
+            const auto slots = m.find("weapons");
+            const bool observedLoadout = slots != m.end() && slots->is_array();
             t.weapons.clear();
-            if (m.contains("weapons") && m["weapons"].is_array()) {
-                for (const auto& wk : m["weapons"]) {
+            t.weaponsKnown = observedLoadout;
+            if (observedLoadout) {
+                for (const auto& wk : *slots) {
                     if (wk.is_string()) {
                         const auto& s = wk.get_ref<const std::string&>();
                         t.weapons.push_back(s);
@@ -775,11 +789,15 @@ void Brain::observe(const Json& obs, const Json& me, const std::array<std::optio
                 re.lastPos = t.pos;
                 re.lastSeen = now_;
                 re.cubes = std::max(re.cubes, t.cubes);
-                if (!t.weapons.empty()) {
+                if (observedLoadout) {
+                    re.loadoutSeen = now_;
+                    re.hasGun = holdsKind(t.weapons, "gun");
                     re.hasLaser = holdsKind(t.weapons, "laser");
                     re.hasLightning = holdsKind(t.weapons, "lightning");
                     re.hasMortar = holdsKind(t.weapons, "mortar");
                 } else {
+                    t.weaponsKnown = std::isfinite(re.loadoutSeen);
+                    if (re.hasGun) t.weapons.push_back("gun");
                     if (re.hasLaser) t.weapons.push_back("laser");
                     if (re.hasLightning) t.weapons.push_back("lightning");
                     if (re.hasMortar) t.weapons.push_back("mortar");
@@ -884,8 +902,10 @@ void Brain::observe(const Json& obs, const Json& me, const std::array<std::optio
                     pushWar(bp, isL ? 2.2 : 1.5, now_ - age, false);
                     if (by >= 0) {
                         auto& re = roster_[by];
-                        if (isL) re.hasLaser = true;
-                        else if (kind == "lightning") re.hasLightning = true;
+                        if (now_ - age > re.loadoutSeen) {
+                            if (isL) re.hasLaser = true;
+                            else if (kind == "lightning") re.hasLightning = true;
+                        }
                         re.lastPos = {bp[0], bp[1], pos[2]};
                         re.lastSeen = now_ - age;
                     }
@@ -3069,12 +3089,16 @@ Json Brain::act(const Json& obs) {
     seen.reserve(tracks_.size());
     double totalInDPS = 0.0;
     double activeInDPS = 0.0;
-    int crowdCount = 0;
+    double pressure = 0.0;
+    double primaryPressure = 0.0;
+    Vec2 pressureBearing{};
+    const double gunPressureReference = 95.0 * gunHitProb(120.0);
     for (auto& [id, t] : tracks_) {
         (void)id;
         if (now_ - t.seen > 2.5) continue;
         t.engage = false;
         t.engageScore = -1e9;
+        t.currentPressure = 0.0;
         seen.push_back(&t);
         if (t.seen != now_) {
             t.los = false;
@@ -3084,10 +3108,19 @@ Json Brain::act(const Json& obs) {
         const double edps = enemyExpectedDPS(t, ws, myArmor, energy, t.dist, wAim > 0.7, /*burst=*/false);
         if (t.los) {
             totalInDPS += edps * wAim;
-            if (wAim >= 0.55 || t.dist < 65.0) {
-                activeInDPS += edps * wAim;
-            }
-            if (t.dist < 150.0) ++crowdCount;
+            const Vec2 towardUs = toward(t.pos, {x, y});
+            const double towardSpeed = towardUs[0] * t.vel[0] + towardUs[1] * t.vel[1];
+            const double commitment = fireCommitment(t, pos, towardSpeed, walkSpeed);
+            const double anticipatedDistance = std::max(0.0, t.dist - std::max(0.0, towardSpeed) * 0.7);
+            const double anticipatedDPS = enemyExpectedDPS(t, ws, myArmor, energy, anticipatedDistance, true, false);
+            const double incomingDPS = commitment * std::max(edps, anticipatedDPS);
+            if (wAim >= 0.55 || t.dist < 65.0) activeInDPS += edps * wAim;
+            const double contribution = 2.0 * incomingDPS / (gunPressureReference + incomingDPS);
+            t.currentPressure = contribution;
+            pressure += contribution;
+            primaryPressure = std::max(primaryPressure, contribution);
+            pressureBearing[0] -= contribution * towardUs[0];
+            pressureBearing[1] -= contribution * towardUs[1];
         } else if (t.dist < 60.0) {
             totalInDPS += edps * wAim * 0.35;
         }
@@ -3123,8 +3156,42 @@ Json Brain::act(const Json& obs) {
     if (target) {
         stickID_ = target->id;
         stickAt_ = now_;
+        const double scale = scaleOf(target->cubes);
+        const FirePlan shot = planDirectFire(fireState, ws, target, centerOf(*target), target->vel,
+                                             cfgMechRadius_ * scale, cfgMechHeight_ * scale, false);
+        if (shot.fire[0] || shot.fire[1]) {
+            const Vec2 bearing = toward(pos, {target->pos[0], target->pos[1]});
+            const double off = std::abs(angDiff(target->aim[0], std::atan2(-bearing[1], -bearing[0])));
+            const auto& mech = config_.contains("mech") ? config_["mech"] : Json::object();
+            const double timeToTurn = off / std::max(0.1, numOr(mech, "turn_rate", 4.0));
+            const double shotRate = myExpectedDPS(ws, myCubes, energy, *target, target->dist, false, false);
+            const double responseRate = enemyExpectedDPS(*target, ws, myArmor, energy, target->dist, true, false);
+            // A target that survives long enough to turn can add a line of fire after we shoot.
+            const double returnDPS = responseRate * std::exp(-timeToTurn * shotRate / std::max(1.0, target->hp));
+            const double returnPressure = 2.0 * returnDPS / (gunPressureReference + returnDPS);
+            const double added = std::max(0.0, returnPressure - target->currentPressure);
+            pressure += added;
+            primaryPressure = std::max(primaryPressure, returnPressure);
+            pressureBearing[0] += added * bearing[0];
+            pressureBearing[1] += added * bearing[1];
+        }
     }
     MechTrack* foe = target ? target : hidden;
+    auto applyEvasion = [&](ActionChoice preferred) {
+        Vec2 precaution = laserDodge;
+        if (foe) {
+            const Vec2 shotLane = combatRoundDodge(movement, projectiles);
+            precaution[0] += shotLane[0];
+            precaution[1] += shotLane[1];
+        }
+        if (const double length = std::hypot(precaution[0], precaution[1]); length > 0.01) {
+            preferred.move = limitLength({preferred.move[0] * 0.4 + 0.9 * precaution[0] / length,
+                                          preferred.move[1] * 0.4 + 0.9 * precaution[1] / length}, 1.0);
+            preferred.boost = preferred.boost || (energy > 25.0 && std::hypot(laserDodge[0], laserDodge[1]) > 0.01);
+        }
+        return dodgeProjectiles(movement, preferred, projectiles);
+    };
+
 
     const bool underFire = (activeInDPS > 45.0) || (now_ - lastHurt_ < 2.5);
     if (underFire || foe != nullptr) {
@@ -3133,10 +3200,13 @@ Json Brain::act(const Json& obs) {
 
     // 2. Retreat hysteresis sets the default. Finishing competes with that route below.
     const bool outgunned = target && holdsKind(target->weapons, "laser") && !laser && target->dist > 55.0 && hpFrac < 0.78;
-    const int crowdLim = pracOn_ ? 4 : 3;
     const double retreatHP = pracOn_ ? 0.25 : 0.38;
     const double reenterHP = pracOn_ ? 0.52 : 0.78;
-    const bool swamped = (crowdCount >= crowdLim) || (crowdCount == 2 && hpFrac < (pracOn_ ? 0.45 : 0.65)) || outgunned;
+    const double supportingPressure = pressure - primaryPressure;
+    const double spread = (pressure - std::hypot(pressureBearing[0], pressureBearing[1])) * 0.5;
+    const double crossfirePressure = supportingPressure + 0.8 * std::min(spread, supportingPressure);
+    const double pressureBudget = (pracOn_ ? 3.0 : 2.0) * hpFrac * hpFrac;
+    const bool swamped = crossfirePressure >= pressureBudget || outgunned;
     const bool lowUnderFire = (hpFrac < retreatHP && now_ - lastThreatAt_ < 2.0);
     if (!retreat_ && !late && (lowUnderFire || swamped)) {
         retreat_ = true;
@@ -3157,6 +3227,7 @@ Json Brain::act(const Json& obs) {
     std::string mode = "idle";
     MechTrack* farmNpc = nullptr;
     std::optional<Vec3> farmCratePos;
+    std::optional<ActionChoice> checkedMovement;
 
     const Vec2 zg = zoneGoal(z, x, y);
     const double zdist = std::hypot(zg[0] - x, zg[1] - y);
@@ -3303,7 +3374,7 @@ Json Brain::act(const Json& obs) {
                 break;
             }
         }
-        if (crowdCount <= 1 && !enemyCharging && cubeValue(myCubes, hpFrac) >= 50.0) {
+        if (crossfirePressure < 0.5 * hpFrac && !enemyCharging && cubeValue(myCubes, hpFrac) >= 50.0) {
             const ZoneCircle curZ = curZone(z);
             double bestCubeD = pracOn_ ? (hpFrac > 0.50 ? 68.0 : 38.0) : (hpFrac > 0.50 ? 40.0 : 20.0);
             std::optional<Vec3> bc;
@@ -3320,10 +3391,32 @@ Json Brain::act(const Json& obs) {
                 }
             }
             if (bc) {
-                const Vec2 cmv = travel(me, (*bc)[0], (*bc)[1]);
-                mx = cmv[0];
-                my = cmv[1];
-                mode = "fight:cube";
+                if (projectiles.empty()) {
+                    const Vec2 mv = travel(me, (*bc)[0], (*bc)[1]);
+                    mx = mv[0];
+                    my = mv[1];
+                    mode = "fight:cube";
+                } else {
+                    auto originalPath = path_;
+                    const Vec2 originalGoal = pathGoal_;
+                    const double originalTime = pathAt_;
+                    const std::size_t originalIndex = pathI_;
+                    const Vec2 mv = travel(me, (*bc)[0], (*bc)[1]);
+                    const auto pickup = applyEvasion({mv, boost});
+                    const auto fight = applyEvasion({{mx, my}, boost});
+                    const double pickupDamage = forecastProjectileRisk(movement, pickup, projectiles).damage;
+                    const double fightDamage = forecastProjectileRisk(movement, fight, projectiles).damage;
+                    if (pickupDamage <= fightDamage) {
+                        checkedMovement = pickup;
+                        mode = "fight:cube";
+                    } else {
+                        checkedMovement = fight;
+                        path_ = std::move(originalPath);
+                        pathGoal_ = originalGoal;
+                        pathAt_ = originalTime;
+                        pathI_ = originalIndex;
+                    }
+                }
             }
         }
     } else if (zoneShould && hasZoneRoute) {
@@ -3436,19 +3529,7 @@ Json Brain::act(const Json& obs) {
     // Urgent/projected actions already own movement. Ordinary movement is checked before committing it.
     if (!projectedMove && mode != "unstuck" && mode != "escape" && mode != "dodge-mortar" &&
         mode != "roof:jet" && mode != "roof:launch") {
-        Vec2 precaution = laserDodge;
-        if (foe) {
-            const Vec2 shotLane = combatRoundDodge(movement, projectiles);
-            precaution[0] += shotLane[0];
-            precaution[1] += shotLane[1];
-        }
-        ActionChoice preferred{{mx, my}, boost};
-        if (const double length = std::hypot(precaution[0], precaution[1]); length > 0.01) {
-            preferred.move = limitLength({mx * 0.4 + 0.9 * precaution[0] / length,
-                                          my * 0.4 + 0.9 * precaution[1] / length}, 1.0);
-            preferred.boost = boost || (energy > 25.0 && std::hypot(laserDodge[0], laserDodge[1]) > 0.01);
-        }
-        const ActionChoice action = dodgeProjectiles(movement, preferred, projectiles);
+        const ActionChoice action = checkedMovement ? *checkedMovement : applyEvasion({{mx, my}, boost});
         mx = action.move[0];
         my = action.move[1];
         boost = action.boost;
