@@ -174,6 +174,12 @@ Brain::Brain(const Json& hello)
         cfgDebugMaxChars_ = intOr(*dit, "max_text_chars", 0);
     }
     pings_.reserve(64);
+    warEvents_.reserve(64);
+    trapZones_.reserve(16);
+
+    memNX_ = std::max(1, static_cast<int>(std::ceil((arena_.bounds[2] - arena_.bounds[0]) / memCellSize_)));
+    memNY_ = std::max(1, static_cast<int>(std::ceil((arena_.bounds[3] - arena_.bounds[1]) / memCellSize_)));
+    visitedAt_.assign(static_cast<std::size_t>(memNX_ * memNY_), -1e6f);
 }
 
 double Brain::scaleOf(int cubes) const {
@@ -205,6 +211,54 @@ double Brain::soundHeat(double px, double py) const {
         heat += p.weight * std::exp(-age / 5.5) * (1.0 - d / p.radius);
     }
     return heat;
+}
+
+double Brain::warzoneHeat(double px, double py) const {
+    double heat = 0.0;
+    for (const auto& w : warEvents_) {
+        const double age = now_ - w.at;
+        if (age < 0.0 || age > 60.0) continue;
+        const double d = std::hypot(px - w.pos[0], py - w.pos[1]);
+        if (d >= 115.0) continue;
+        heat += w.weight * std::exp(-age / 35.0) * (1.0 - d / 115.0);
+    }
+    return heat;
+}
+
+double Brain::trapPenalty(double px, double py) const {
+    double pen = 0.0;
+    for (const auto& tr : trapZones_) {
+        const double age = now_ - tr.at;
+        if (age < 0.0 || age > 90.0) continue;
+        const double d = std::hypot(px - tr.pos[0], py - tr.pos[1]);
+        if (d >= 35.0) continue;
+        pen += tr.weight * std::exp(-age / 60.0) * (1.0 - d / 35.0) * 28.0;
+    }
+    return pen;
+}
+
+void Brain::markVisited(double px, double py) {
+    const int ix = static_cast<int>((px - arena_.bounds[0]) / memCellSize_);
+    const int iy = static_cast<int>((py - arena_.bounds[1]) / memCellSize_);
+    if (ix < 0 || iy < 0 || ix >= memNX_ || iy >= memNY_) return;
+    visitedAt_[static_cast<std::size_t>(iy * memNX_ + ix)] = static_cast<float>(now_);
+}
+
+double Brain::unvisitedScore(double px, double py) const {
+    const int ix = static_cast<int>((px - arena_.bounds[0]) / memCellSize_);
+    const int iy = static_cast<int>((py - arena_.bounds[1]) / memCellSize_);
+    if (ix < 0 || iy < 0 || ix >= memNX_ || iy >= memNY_) return 0.0;
+    const double last = static_cast<double>(visitedAt_[static_cast<std::size_t>(iy * memNX_ + ix)]);
+    return std::clamp((now_ - last) / 60.0, 0.0, 1.0);
+}
+
+void Brain::recordTrap(double px, double py, double weight) {
+    if (now_ - lastTrapAt_ < 2.5) return;
+    lastTrapAt_ = now_;
+    if (trapZones_.size() >= 16) {
+        trapZones_.erase(trapZones_.begin());
+    }
+    trapZones_.push_back({{px, py}, now_, weight});
 }
 
 double Brain::regenBreakCost(double hpFrac, bool inZone) const {
@@ -651,9 +705,27 @@ void Brain::observe(const Json& obs, const Json& me, const std::array<std::optio
     const Vec3 muzzle{pos[0], pos[1], pos[2] + muzH};
     const int selfId = intOr(me, "id", -1);
 
-    // Decay lobby laser prevalence gently (keep high prior while >4 players remain unseen!)
+    // Layer 1 Map Memory: mark current cell + swept 120-deg FOV cells as explored
+    const Vec2 curAim = safeVec2(me, "aim");
+    markVisited(pos[0], pos[1]);
+    for (double d : {25.0, 55.0}) {
+        for (double off : {-0.7, 0.0, 0.7}) {
+            markVisited(pos[0] + std::cos(curAim[0] + off) * d,
+                        pos[1] + std::sin(curAim[0] + off) * d);
+        }
+    }
+
+    // Decay lobby laser prevalence gently (grounded in persistent roster + high prior while >4 players remain!)
     const int curAlive = intOr(obs, "alive", 16);
-    const double minLaserPrior = (curAlive <= 4) ? 0.15 : 0.62;
+    int knownLasers = 0;
+    for (const auto& [rid, re] : roster_) {
+        (void)rid;
+        if (!re.dead && re.hasLaser && now_ - re.lastSeen < 120.0) ++knownLasers;
+    }
+    const double rosterLaserFloor = (curAlive > 1)
+        ? std::clamp(static_cast<double>(knownLasers) / static_cast<double>(curAlive - 1), 0.0, 1.0)
+        : 0.0;
+    const double minLaserPrior = std::max(rosterLaserFloor, (curAlive <= 4) ? 0.15 : 0.62);
     laserPresence_ = std::max(minLaserPrior, laserPresence_ * 0.997);
 
     if (const auto it = obs.find("mechs"); it != obs.end() && it->is_array()) {
@@ -683,6 +755,23 @@ void Brain::observe(const Json& obs, const Json& me, const std::array<std::optio
                             laserPresence_ = std::min(1.0, laserPresence_ + 0.12);
                         }
                     }
+                }
+            }
+            // Layer 3 Map Memory: persistent opponent roster (never erased!)
+            if (kind == "mech") {
+                auto& re = roster_[id];
+                re.dead = false;
+                re.lastPos = t.pos;
+                re.lastSeen = now_;
+                re.cubes = std::max(re.cubes, t.cubes);
+                if (!t.weapons.empty()) {
+                    re.hasLaser = holdsKind(t.weapons, "laser");
+                    re.hasLightning = holdsKind(t.weapons, "lightning");
+                    re.hasMortar = holdsKind(t.weapons, "mortar");
+                } else {
+                    if (re.hasLaser) t.weapons.push_back("laser");
+                    if (re.hasLightning) t.weapons.push_back("lightning");
+                    if (re.hasMortar) t.weapons.push_back("mortar");
                 }
             }
             t.seen = now_;
@@ -742,16 +831,28 @@ void Brain::observe(const Json& obs, const Json& me, const std::array<std::optio
     updateItems(cubes_, "cubes");
     updateItems(pickups_, "pickups");
 
-    // Expire old threat pings (> 10s)
+    // Expire old threat pings (> 10s), long-term war events (> 60s), and trap zones (> 90s)
     pings_.erase(std::remove_if(pings_.begin(), pings_.end(),
                                 [&](const ThreatPing& p) { return now_ - p.at > 10.0; }),
                  pings_.end());
+    warEvents_.erase(std::remove_if(warEvents_.begin(), warEvents_.end(),
+                                    [&](const WarEvent& w) { return now_ - w.at > 60.0; }),
+                     warEvents_.end());
+    trapZones_.erase(std::remove_if(trapZones_.begin(), trapZones_.end(),
+                                    [&](const TrapZone& tr) { return now_ - tr.at > 90.0; }),
+                     trapZones_.end());
 
     auto pushPing = [&](const ThreatPing& tp) {
         if (pings_.size() >= 48) {
             pings_.erase(pings_.begin());
         }
         pings_.push_back(tp);
+    };
+    auto pushWar = [&](const Vec2& wp, double ww, double at, bool isDeath) {
+        if (warEvents_.size() >= 64) {
+            warEvents_.erase(warEvents_.begin());
+        }
+        warEvents_.push_back({wp, ww, at, isDeath});
     };
 
     // 1. Exact beam origins (laser & lightning arcs from other mechs!)
@@ -767,8 +868,16 @@ void Brain::observe(const Json& obs, const Json& me, const std::array<std::optio
                 if (p0.is_array() && p0.size() >= 2 && p0[0].is_number() && p0[1].is_number()) {
                     const bool isL = (kind == "laser");
                     if (isL) laserPresence_ = std::min(1.0, laserPresence_ + 0.15);
-                    pushPing({{finiteOr(p0[0].get<double>()), finiteOr(p0[1].get<double>())},
-                              isL ? 2.4 : 1.7, now_ - age, 80.0, isL, true});
+                    const Vec2 bp{finiteOr(p0[0].get<double>()), finiteOr(p0[1].get<double>())};
+                    pushPing({bp, isL ? 2.4 : 1.7, now_ - age, 80.0, isL, true});
+                    pushWar(bp, isL ? 2.2 : 1.5, now_ - age, false);
+                    if (by >= 0) {
+                        auto& re = roster_[by];
+                        if (isL) re.hasLaser = true;
+                        else if (kind == "lightning") re.hasLightning = true;
+                        re.lastPos = {bp[0], bp[1], pos[2]};
+                        re.lastSeen = now_ - age;
+                    }
                 }
             }
         }
@@ -789,10 +898,13 @@ void Brain::observe(const Json& obs, const Json& me, const std::array<std::optio
             double w = 0.0;
             double rad = 75.0;
             bool isL = false;
+            double warW = 0.0;
+            bool isDeath = false;
             if (kind == "laser_charge") {
                 w = (distStr == "near") ? 2.6 : 1.8;
                 rad = 70.0;
                 isL = true;
+                warW = 1.6;
                 laserPresence_ = std::min(1.0, laserPresence_ + 0.12);
                 if (distStr != "far") {
                     lastLaserSoundAt_ = now_ - age;
@@ -802,20 +914,27 @@ void Brain::observe(const Json& obs, const Json& me, const std::array<std::optio
                 w = 1.7;
                 rad = 85.0;
                 isL = true;
+                warW = 1.6;
                 laserPresence_ = std::min(1.0, laserPresence_ + 0.08);
             } else if (kind == "death") {
                 w = 1.5;
                 rad = 90.0;
+                warW = 2.8;
+                isDeath = true;
             } else if (kind == "gun" || kind == "lightning" || kind == "mortar" || kind == "explosion") {
                 w = (distStr == "near") ? 1.4 : 0.9;
                 rad = 75.0;
+                warW = (kind == "explosion" || kind == "mortar") ? 1.8 : 0.9;
             } else if ((kind == "boost" || kind == "jet" || kind == "step") && distStr == "near") {
                 w = 0.7;
                 rad = 45.0;
             }
             if (w > 0.0) {
-                pushPing({{pos[0] + std::cos(bearing) * estD, pos[1] + std::sin(bearing) * estD},
-                          w, now_ - age, rad, isL, false});
+                const Vec2 sp{pos[0] + std::cos(bearing) * estD, pos[1] + std::sin(bearing) * estD};
+                pushPing({sp, w, now_ - age, rad, isL, false});
+                if (warW > 0.0 && distStr != "far") {
+                    pushWar(sp, warW, now_ - age, isDeath);
+                }
             }
         }
     }
@@ -851,7 +970,9 @@ void Brain::observe(const Json& obs, const Json& me, const std::array<std::optio
             } else if (type == "kill") {
                 ++kills_;
                 if (e.contains("target") && e["target"].is_number()) {
-                    tracks_.erase(static_cast<int>(e["target"].get<double>()));
+                    const int tid = static_cast<int>(e["target"].get<double>());
+                    tracks_.erase(tid);
+                    roster_[tid].dead = true;
                 }
             }
         }
@@ -872,7 +993,7 @@ void Brain::observe(const Json& obs, const Json& me, const std::array<std::optio
     if (otherDeadTicks_ >= 5) {
         notPractice_ = true;
     }
-    pracOn_ = !notPractice_ && now_ > 50.0;
+    pracOn_ = !notPractice_ && now_ > 45.0;
 
     // 4. Zone phase anchor tracking
     if (const auto zit = obs.find("zone"); zit != obs.end() && zit->is_object()) {
@@ -1166,13 +1287,11 @@ Vec2 Brain::fightMove(const Json& obs, const Json& me, const std::array<std::opt
     const int alive = intOr(obs, "alive", 16);
     const auto& z = obs.contains("zone") && obs["zone"].is_object() ? obs["zone"] : Json::object();
 
-    // Separate primary-duel weight (corner-kiting discipline + alive-scaling + Laser cooldown dip!) vs heavy 3rd-party cover-splitting!
+    // Separate primary-duel weight (never refuses fair 1v1!) vs heavy 3rd-party cover-splitting!
     const double hpFrac = hp / maxHp;
     const WeaponInfo* myLaserW = getWeapon(ws, "laser");
     const bool laserHot = myLaserW && (myLaserW->charge >= myLaserW->fullCharge * 0.45);
-    const double laserCdDip = (myLaserW && myLaserW->cooldown > 0.40 && myLaserW->charge <= 0.0 && hpFrac < 0.78) ? 0.18 : 0.0;
-    const double wPrimary = 0.50 + 0.45 * std::clamp(1.0 - hpFrac, 0.0, 1.0) +
-                            0.015 * static_cast<double>(std::max(0, alive - 2)) + laserCdDip;
+    const double wPrimary = 0.46 + 0.44 * std::clamp(1.0 - hpFrac, 0.0, 1.0);
     const double lambdaExtra = 1.55 + 0.05 * static_cast<double>(alive);
 
     // Physical optimal matchup range (accounts for 0.25s bullet-dodge flight time & weapon ranges!)
@@ -1187,7 +1306,7 @@ Vec2 Brain::fightMove(const Json& obs, const Json& me, const std::array<std::opt
         optRange = pracOn_ ? 115.0 : 88.0;
     }
     if (tg.kind != "npc" && !iHaveLight) {
-        if (holdsKind(tg.weapons, "lightning")) optRange = std::max(optRange, 66.0);
+        if (holdsKind(tg.weapons, "lightning")) optRange = std::max(optRange, 72.0);
         if (holdsKind(tg.weapons, "mortar")) optRange = std::max(optRange, 80.0);
     }
     if (tg.kind != "npc" && tg.hp < 0.35 * tg.maxHp && hpFrac > 0.48 && (pracOn_ || alive <= 2)) {
@@ -1395,7 +1514,9 @@ bool Brain::coverMove(const Json& obs, const Json& me, const std::vector<MechTra
 
     const auto goal = nav_.findCoverBFS(
         x, y, hidden,
-        [&](double cx, double cy) { return zonePenalty(z, cx, cy) + 15.0 * std::min(soundHeat(cx, cy), 2.0); },
+        [&](double cx, double cy) {
+            return zonePenalty(z, cx, cy) + 15.0 * std::min(soundHeat(cx, cy), 2.0) + trapPenalty(cx, cy);
+        },
         threatXY, 50, 350);
     if (!goal) {
         coverOK_ = false;
@@ -1471,9 +1592,11 @@ std::optional<Brain::LootChoice> Brain::chooseLoot(const Json& obs, const Json& 
         if (auto bi = badLoot_.find(id); bi != badLoot_.end() && bi->second > now_) return;
 
         const double d = std::hypot(ipos[0] - x, ipos[1] - y);
-        const double maxLootD = (kind == "pickup" && netGain >= 140.0) ? 220.0
-                              : (kind == "crate" || kind == "npc") ? (pracOn_ ? 160.0 : 125.0)
-                              : (pracOn_ ? 180.0 : 145.0);
+        const bool isNoisy = (kind == "crate" || kind == "npc");
+        const double maxLootD = (kind == "pickup" && netGain >= 140.0) ? 200.0
+                              : (kind == "npc") ? (pracOn_ ? 140.0 : 88.0)
+                              : (kind == "crate") ? (pracOn_ ? 150.0 : 95.0)
+                              : (pracOn_ ? 160.0 : 120.0);
         if (d > maxLootD) return;
         if (std::hypot(ipos[0] - cur.x, ipos[1] - cur.y) > cur.r - 5.5) return;
 
@@ -1511,36 +1634,50 @@ std::optional<Brain::LootChoice> Brain::chooseLoot(const Json& obs, const Json& 
         const double dl = zoneDeadline(z, ipos[0], ipos[1], 6.0);
         if (now_ + totalTime + 4.5 > dl) return;
 
-        // Continuous EnemySafety(pos, pathMidpoint) driven by enemy positions & strength
+        // Continuous EnemySafety(pos, pathMidpoint) — wider awareness (175m) for noisy crates/NPCs that alert hunters!
         const double midX = 0.5 * (x + ipos[0]), midY = 0.5 * (y + ipos[1]);
+        const double threatRad = isNoisy ? 175.0 : 125.0;
         double enemyRisk = 0.0;
         double nearEnemyThreat = 0.0;
         for (const auto& [tid, t] : tracks_) {
             (void)tid;
-            if (now_ - t.seen > 12.0) continue;
+            if (now_ - t.seen > 15.0) continue;
             const double de = std::hypot(t.pos[0] - ipos[0], t.pos[1] - ipos[1]);
             const double dm = std::hypot(t.pos[0] - midX, t.pos[1] - midY);
             const double dMin = std::min(de, dm);
-            if (dMin > 130.0) continue;
+            if (dMin > threatRad) continue;
             const double theirEdge = (t.hp / myHp) * (1.0 + 0.04 * static_cast<double>(t.cubes - myCubes));
             // Unwinnable contest right on the item?
             if (de < d * 0.78 && de < 65.0 && theirEdge > 0.72) {
                 return;
             }
-            const double prox = std::clamp((110.0 - dMin) / 110.0, 0.0, 1.0);
-            const double contrib = prox * prox * std::clamp(theirEdge, 0.45, 2.0) * 1.6;
+            const double prox = std::clamp((threatRad - dMin) / threatRad, 0.0, 1.0);
+            const double contrib = prox * prox * std::clamp(theirEdge, 0.45, 2.0) * (isNoisy ? 2.2 : 1.6);
             enemyRisk += contrib;
             if (dMin < 95.0) nearEnemyThreat += contrib;
         }
+        // Layer 3 Map Memory: long-term roster awareness (15s..45s) for strong foes last seen near this item
+        for (const auto& [rid, re] : roster_) {
+            (void)rid;
+            const double age = now_ - re.lastSeen;
+            if (re.dead || age <= 15.0 || age > 45.0) continue;
+            if (!re.hasLaser && !re.hasLightning && re.cubes < 4) continue;
+            const double dr = std::hypot(re.lastPos[0] - ipos[0], re.lastPos[1] - ipos[1]);
+            if (dr < 95.0) {
+                enemyRisk += 0.45 * std::exp(-(age - 15.0) / 20.0) * (1.0 - dr / 95.0);
+            }
+        }
 
         const double heat = soundHeat(ipos[0], ipos[1]);
-        if (needClimb && (nearEnemyThreat > 0.15 || heat > 0.35)) {
+        const double wHeat = std::min(warzoneHeat(ipos[0], ipos[1]), 2.5);
+        if (needClimb && (nearEnemyThreat > 0.15 || heat > 0.35 || wHeat > 1.2)) {
             return;
         }
         const double expo = nav_.exposure(ipos[0], ipos[1]);
         const double expoRisk = expo * (0.35 + 1.35 * std::clamp(1.0 - hpFrac, 0.0, 1.0));
         const double airRisk = needClimb ? (roofTime * (0.65 * nearEnemyThreat + 0.35 * heat + 0.10)) : 0.0;
-        const double safety = std::exp(-(enemyRisk + 0.65 * heat + expoRisk + airRisk + extraRisk));
+        const double warRisk = (isNoisy ? 0.38 : 0.22) * wHeat;
+        const double safety = std::exp(-(enemyRisk + 0.65 * heat + warRisk + expoRisk + airRisk + extraRisk));
 
         double u = (netGain / (totalTime + 1.8)) * safety;
         if (id == lootID_) u *= 1.25;  // Anti-oscillation hysteresis
@@ -1567,34 +1704,34 @@ std::optional<Brain::LootChoice> Brain::chooseLoot(const Json& obs, const Json& 
         evaluate("cube", c.id, c.pos, cVal, 0.0, 0.0);
     }
 
-    // Unified regen-silence gate (matches shooting gate at line 2157 so movement NEVER deadlocks staring at a crate!)
-    const bool protectRegen = (regenCost > 28.0) || (!pracOn_ && hpFrac < 0.58);
+    // Unified regen-silence & danger gate: never shoot loud crates/NPCs while hurt OR within 6s of recent threat!
+    const bool protectRegen = (regenCost > 28.0) || (!pracOn_ && (hpFrac < 0.70 || now_ - lastThreatAt_ < 6.0));
     // Player-density gunshot reveal cost: shooting crates/NPCs in shrinking circles alerts the entire lobby!
     const double zoneScale = std::max(0.65, cur.r / 150.0);
     const double playerDensity = static_cast<double>(alive) / (zoneScale * zoneScale);
-    const double gearedMult = (!pracOn_ && ws[1].has_value() && myCubes >= 3) ? 1.55 : 1.0;
-    const double densityNoiseCost = pracOn_ ? 0.0 : (11.0 * playerDensity * gearedMult);
+    const double gearedMult = (!pracOn_ && ws[1].has_value() && myCubes >= 3) ? 2.1 : 1.0;
+    const double densityNoiseCost = pracOn_ ? 0.0 : (16.0 * playerDensity * gearedMult);
 
     // 3. Loot crates (1 cube + 50% weapon chance - noise/density/regen opportunity cost)
     if (!protectRegen) {
-        const double crateNoiseCost = 14.0 + densityNoiseCost + regenCost;
+        const double crateNoiseCost = 28.0 + densityNoiseCost + regenCost;
         for (const auto& [cid, c] : crates_) {
             (void)cid;
             const double chp = c.hp > 1.0 ? c.hp : 300.0;
             const double breakT = chp / std::max(50.0, farmDPS) + 0.8;
             const double net = cVal + avgCrateWeaponGain - crateNoiseCost;
-            evaluate("crate", c.id, c.pos, net, breakT, 0.14);
+            evaluate("crate", c.id, c.pos, net, breakT, 0.30);
         }
 
-        // 4. NPC drones (2 cubes - counter-damage & noise/density/regen cost)
+        // 4. NPC drones (2 cubes - counter-damage & loud 200m+320m firefight reveal cost)
         const double twoCubeVal = cubeValue(myCubes, hpFrac) + cubeValue(myCubes + 1, hpFrac);
-        const double npcCounterCost = 24.0 + densityNoiseCost + 95.0 * std::clamp(1.0 - hpFrac, 0.0, 1.0) + regenCost;
+        const double npcCounterCost = 62.0 + densityNoiseCost * 1.4 + 120.0 * std::clamp(1.0 - hpFrac, 0.0, 1.0) + regenCost;
         for (const auto& [nid, n] : npcs_) {
             (void)nid;
             if (now_ - n.seen > 15.0) continue;
-            const double killT = std::max(1.0, n.hp) / std::max(50.0, farmDPS) + 1.2;
+            const double killT = std::max(1.0, n.hp) / std::max(50.0, farmDPS) + 1.5;
             const double net = twoCubeVal - npcCounterCost;
-            evaluate("npc", n.id, n.pos, net, killT, 0.20);
+            evaluate("npc", n.id, n.pos, net, killT, 0.55);
         }
     }
 
@@ -1659,6 +1796,17 @@ double Brain::homeCost(const Json& obs, const Json& me, double px, double py) co
             crowd += std::max(0.0, 80.0 - std::hypot(t.pos[0] - px, t.pos[1] - py)) / 80.0;
         }
     }
+    // Layer 3 Map Memory: gently avoid sectors where strong foes were last seen 20s..50s ago
+    for (const auto& [rid, re] : roster_) {
+        (void)rid;
+        const double age = now_ - re.lastSeen;
+        if (re.dead || age < 20.0 || age > 50.0) continue;
+        if (!re.hasLaser && !re.hasLightning && re.cubes < 4) continue;
+        const double d = std::hypot(re.lastPos[0] - px, re.lastPos[1] - py);
+        if (d < 90.0) {
+            crowd += 0.55 * std::exp(-(age - 20.0) / 25.0) * (90.0 - d) / 90.0;
+        }
+    }
     if (const auto dit = obs.find("drops"); dit != obs.end() && dit->is_array()) {
         for (const auto& dr : *dit) {
             if (!dr.is_object()) continue;
@@ -1668,9 +1816,14 @@ double Brain::homeCost(const Json& obs, const Json& me, double px, double py) co
     }
     const double edge = std::hypot(px - nc[0], py - nc[1]) / std::max(30.0, nr);
     const double heat = std::min(soundHeat(px, py), 2.0);
+    const double wHeat = std::min(warzoneHeat(px, py), 2.5);
+    const double trap = trapPenalty(px, py);
     const double canopy = arena_.canopyConcealment(px, py, arena_.walkRaster(px, py));
+    // Layer 1 Map Memory: early-game gentle preference for unexplored low-exposure cover when missing gear
+    const bool needGear = (intOr(me, "cubes", 0) < 3) && (now_ < 130.0);
+    const double exploreBonus = needGear ? (8.0 * unvisitedScore(px, py)) : 0.0;
     return 120.0 * nav_.exposure(px, py) + 0.25 * std::hypot(px - pos[0], py - pos[1]) +
-           40.0 * crowd + 15.0 * heat + 10.0 * edge - 6.0 * canopy;
+           40.0 * crowd + 15.0 * heat + 18.0 * wHeat + trap + 10.0 * edge - 6.0 * canopy - exploreBonus;
 }
 
 std::optional<Vec2> Brain::findHome(const Json& obs, const Json& me) {
@@ -1678,7 +1831,7 @@ std::optional<Vec2> Brain::findHome(const Json& obs, const Json& me) {
     const Vec2 nc = safeVec2(z, "next_center");
     const double nr = numOr(z, "next_radius", 200.0);
     const bool out = !homeSet_ || std::hypot(homeXY_[0] - nc[0], homeXY_[1] - nc[1]) > nr * 0.8;
-    if (out || now_ - homeAt_ > 10.0) {
+    if (out || now_ - homeAt_ > 15.0) {
         homeAt_ = now_;
         Vec2 best{};
         double bestC = kInf;
@@ -1694,7 +1847,9 @@ std::optional<Vec2> Brain::findHome(const Json& obs, const Json& me) {
                 best = {px, py};
             }
         }
-        if (std::isfinite(bestC) && (out || bestC < homeCost(obs, me, homeXY_[0], homeXY_[1]) - 14.0)) {
+        // Strong hysteresis (-36) when already holding a valid low-exposure home inside next_center
+        // so transient distant gunshots never kick us out of solid cover into open streets!
+        if (std::isfinite(bestC) && (out || bestC < homeCost(obs, me, homeXY_[0], homeXY_[1]) - 36.0)) {
             homeXY_ = best;
             homeSet_ = true;
         }
@@ -1924,7 +2079,6 @@ Json Brain::act(const Json& obs) {
     }
 
     // 2. Clean Physics-Driven Retreat Hysteresis (never retreats from fair full-HP 1v1 or fast lethal finish!)
-    const double ttkDie = hp / std::max(1.0, activeInDPS);
     double ttkBestKill = 99.0;
     if (target) {
         const bool rear = showsBack(*target, x, y);
@@ -1935,19 +2089,17 @@ Json Brain::act(const Json& obs) {
     }
     const bool finishing = target && target->dist < 120.0 && (ttkBestKill < 1.35 || target->hp < 210.0 || target->hp < hp * 0.45);
     const bool outgunned = target && holdsKind(target->weapons, "laser") && !laser && target->dist > 55.0 && hpFrac < 0.78;
-    const bool swamped = (crowdCount >= 3) || (crowdCount == 2 && hpFrac < 0.65) || outgunned;
-    const bool losingTrade = underFire && (ttkDie < 3.0 && ttkDie < ttkBestKill * 0.72);
-    const double naniteBonus = std::clamp((5.0 - cfgRegenDelay_) * 0.08, 0.0, 0.24);
-    const double targetHpFrac = target ? (target->hp / std::max(1.0, target->maxHp)) : 1.0;
-    const bool hpDeficitReset = inZone && target && !pracOn_ && (nav_.exposure(x, y) < 0.72) &&
-        (hpFrac < 0.56 + naniteBonus) && (hpFrac < targetHpFrac - 0.22) && (target->dist > 38.0);
-    const bool lowUnderFire = (hpFrac < 0.38 && now_ - lastThreatAt_ < 2.0);
-    if (!retreat_ && !finishing && !late && (lowUnderFire || swamped || losingTrade || hpDeficitReset)) {
+    const int crowdLim = pracOn_ ? 4 : 3;
+    const double retreatHP = pracOn_ ? 0.25 : 0.38;
+    const double reenterHP = pracOn_ ? 0.52 : 0.78;
+    const bool swamped = (crowdCount >= crowdLim) || (crowdCount == 2 && hpFrac < (pracOn_ ? 0.45 : 0.65)) || outgunned;
+    const bool lowUnderFire = (hpFrac < retreatHP && now_ - lastThreatAt_ < 2.0);
+    if (!retreat_ && !finishing && !late && (lowUnderFire || swamped)) {
         retreat_ = true;
         coverAt_ = -1.0;
     }
-    if (retreat_ && (finishing || late || (!swamped && !losingTrade && !hpDeficitReset &&
-        (hpFrac > 0.78 || (now_ - lastThreatAt_ > std::max(3.5, cfgRegenDelay_ + 1.5) && hpFrac > 0.55))))) {
+    if (retreat_ && (finishing || late || (!swamped &&
+        (hpFrac > reenterHP || (now_ - lastThreatAt_ > std::max(3.5, cfgRegenDelay_ + 1.5) && hpFrac > 0.55))))) {
         retreat_ = false;
     }
 
@@ -1994,6 +2146,7 @@ Json Brain::act(const Json& obs) {
             const Vec2 mv = fightMove(obs, me, ws, *target, seen);
             mx = mv[0];
             my = mv[1];
+            recordTrap(x, y, 2.5);
             mode = "cornered";
         } else {
             const Vec2 mv = travel(me, zg[0], zg[1]);
@@ -2016,6 +2169,11 @@ Json Brain::act(const Json& obs) {
         mx = mv[0];
         my = mv[1];
         if (light && foe->dist > 48.0 && foe->dist < 110.0 && energy > 55.0 && foe->engageScore > 40.0) {
+            boost = true;
+        }
+        // Anti-lightning boost-kite: stay strictly outside enemy's 45m Lightning cone!
+        if (!light && holdsKind(foe->weapons, "lightning") && foe->dist < 62.0 && energy > 20.0 &&
+            (mx != 0.0 || my != 0.0)) {
             boost = true;
         }
         mode = "fight";
@@ -2188,6 +2346,7 @@ Json Brain::act(const Json& obs) {
             stuckSince_ = -1.0;
             path_.clear();
             roofFlying_ = false;
+            recordTrap(x, y, 2.0);
             jump = true;
         }
     } else {
@@ -2253,12 +2412,6 @@ Json Brain::act(const Json& obs) {
 
     // Strict regen silence gate for non-lethal / non-self-defense PvE shots
     if (!isMech && !defendNpc && (retreat_ || regenBreakCost(hpFrac, inZone) > 30.0)) {
-        shootable = false;
-    }
-    // Smart retreat fire discipline: if already escaping with >=1.5s banked toward regen and enemy is >55m & not hitting us,
-    // hold fire instead of resetting our own regen clock with a 45-dmg chip shot!
-    if (isMech && target && retreat_ && !finishing && inZone &&
-        (now_ - lastCombatAt_ >= 1.5) && (now_ - target->hitMe > 2.0) && (target->dist > 55.0)) {
         shootable = false;
     }
 

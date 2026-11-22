@@ -75,6 +75,29 @@ struct ThreatPing {
     bool exact = false;
 };
 
+struct WarEvent {
+    Vec2 pos{};
+    double weight = 1.0;
+    double at = -100.0;
+    bool isDeath = false;
+};
+
+struct RosterEntry {
+    bool hasLaser = false;
+    bool hasLightning = false;
+    bool hasMortar = false;
+    int cubes = 0;
+    Vec3 lastPos{};
+    double lastSeen = -100.0;
+    bool dead = false;
+};
+
+struct TrapZone {
+    Vec2 pos{};
+    double at = -100.0;
+    double weight = 2.0;
+};
+
 struct ZoneCircle {
     double x = 0.0;
     double y = 0.0;
@@ -102,8 +125,13 @@ private:
     Vec3 eyeOf(const MechTrack& t) const;
     bool showsBack(const MechTrack& t, double x, double y) const;
 
-    // Continuous value & risk functions (zero magic thresholds)
+    // Continuous value, risk & map-memory functions (zero magic thresholds)
     double soundHeat(double px, double py) const;
+    double warzoneHeat(double px, double py) const;
+    double trapPenalty(double px, double py) const;
+    void markVisited(double px, double py);
+    double unvisitedScore(double px, double py) const;
+    void recordTrap(double px, double py, double weight);
     double regenBreakCost(double hpFrac, bool inZone) const;
     double cubeValue(int cubes, double hpFrac) const;
     double weaponPower(std::string_view kind, double nextRadius) const;
@@ -188,7 +216,7 @@ private:
     double cfgMortarSplash_ = 7.0;
     int cfgDebugMaxChars_ = 0;
 
-    // Persistent memory maps
+    // Persistent memory maps (4-layer dynamic map memory)
     std::unordered_map<int, MechTrack> tracks_;
     std::unordered_map<int, MechTrack> npcs_;
     std::unordered_map<int, KnownItem> crates_;
@@ -196,6 +224,14 @@ private:
     std::unordered_map<int, KnownItem> pickups_;
     std::unordered_map<int, double> badLoot_;
     std::vector<ThreatPing> pings_;
+    std::vector<WarEvent> warEvents_;
+    std::unordered_map<int, RosterEntry> roster_;
+    std::vector<TrapZone> trapZones_;
+    double lastTrapAt_ = -100.0;
+    double memCellSize_ = 20.0;
+    int memNX_ = 1;
+    int memNY_ = 1;
+    std::vector<float> visitedAt_;
 
     double now_ = 0.0;
     double laserPresence_ = 0.65;  // Realistic OSU lobby prior (lasers spawn at t=0)
