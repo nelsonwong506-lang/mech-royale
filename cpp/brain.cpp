@@ -375,10 +375,6 @@ void Brain::observe(const Json& obs, const Json& me, const std::array<std::optio
                         ni->second.hitMe = now_;
                     }
                 }
-            } else if (type == "effect") {
-                if (e.value("effect", "") == std::string_view("short")) {
-                    shortUntil_ = std::max(shortUntil_, now_ + 2.05);
-                }
             } else if (type == "kill") {
                 ++kills_;
                 if (e.contains("target") && e["target"].is_number()) {
@@ -731,7 +727,7 @@ Vec2 Brain::fightMove(const Json& obs, const Json& me, const std::array<std::opt
                 continue;
             }
         }
-        const double cz = nav_.surfAt(cx, cy);
+        const double cz = arena_.walkRaster(cx, cy);
         const double d = std::hypot(tg.pos[0] - cx, tg.pos[1] - cy);
         double s = -1.1 * std::abs(d - rp) - r * 0.4;
         const bool los = !arena_.blocksLine({cx, cy, cz + mh}, tc);
@@ -743,7 +739,7 @@ Vec2 Brain::fightMove(const Json& obs, const Json& me, const std::array<std::opt
                 const double qa = q * (std::numbers::pi / 8.0);
                 const double qx = cx + std::cos(qa) * 7.0, qy = cy + std::sin(qa) * 7.0;
                 if (nav_.free(qx, qy) &&
-                    (!arena_.blocksLine({qx, qy, nav_.surfAt(qx, qy) + mh}, tc)) != los) {
+                    (!arena_.blocksLine({qx, qy, arena_.walkRaster(qx, qy) + mh}, tc)) != los) {
                     s += 8.0;
                     break;
                 }
@@ -805,7 +801,7 @@ bool Brain::coverMove(const Json& obs, const Json& me, const std::vector<MechTra
     }
 
     auto hidden = [&](double cx, double cy) -> bool {
-        const double cz = nav_.surfAt(cx, cy);
+        const double cz = arena_.walkRaster(cx, cy);
         for (const MechTrack* t : threats) {
             const Vec3 e = eyeOf(*t);
             if (!arena_.blocksLine(e, {cx, cy, cz + ownH}) ||
@@ -1357,9 +1353,7 @@ Json Brain::act(const Json& obs) {
             for (const auto& [cid, c] : cubes_) {
                 (void)cid;
                 const double d = std::hypot(c.pos[0] - x, c.pos[1] - y);
-                if (d < r && std::abs(c.pos[2] - zf) < 4.0 &&
-                    zonePenalty(z, c.pos[0], c.pos[1]) == 0.0 &&
-                    nav_.isMainReachable(c.pos[0], c.pos[1])) {
+                if (d < r) {
                     r = d;
                     bc = c.pos;
                 }
@@ -1578,7 +1572,6 @@ Json Brain::act(const Json& obs) {
                 }
             } else if (w.kind == "laser") {
                 if (!isMech || !target || dist > w.range * 0.97) continue;
-                if (now_ < shortUntil_ && w.charge <= 0.0) continue;
                 const double full = w.fullCharge;
                 if (p_.lethal && w.charge >= w.minCharge && w.charge < full - 0.051) {
                     double dmg = w.damage * (w.minFrac + (1.0 - w.minFrac) * (w.charge / full)) *
@@ -1621,33 +1614,13 @@ Json Brain::act(const Json& obs) {
         }
     }
 
-    // Free opportunistic lightning pass on any close mech right inside our 30-deg cone
-    if (const int lSlot = findWeaponSlot(ws, "lightning"); lSlot >= 0 && !fire[static_cast<std::size_t>(lSlot)]) {
-        const auto& lw = *ws[static_cast<std::size_t>(lSlot)];
-        if (lw.cooldown <= 0.1 && energy >= lw.energyCost + 2.0) {
-            const double halfCone = radians(lw.coneDeg * 0.5) - 0.05;
-            for (const MechTrack* t : seen) {
-                if (t->seen != now_ || !t->los || t->dist >= lw.range - 1.5) continue;
-                const double yaw = std::atan2(t->pos[1] - y, t->pos[0] - x);
-                if (std::abs(angDiff(yaw, curAim[0])) <= halfCone) {
-                    fire[static_cast<std::size_t>(lSlot)] = true;
-                    break;
-                }
-            }
-        }
-    }
-
-    // Behind-wall laser pre-charge (peek mode) + brief 0.35s anti-misfire grace when target flickers behind cover
-    if (!target && now_ >= shortUntil_) {
+    // Behind-wall laser pre-charge (peek mode only, matches Go 6.19)
+    if (!target && foe) {
         for (int i = 0; i < 2; ++i) {
             if (ws[static_cast<std::size_t>(i)] && ws[static_cast<std::size_t>(i)]->kind == "laser") {
                 const auto& lw = *ws[static_cast<std::size_t>(i)];
-                if (foe && lw.cooldown <= 0.05 && foe->dist < lw.range &&
+                if (lw.cooldown <= 0.05 && foe->dist < lw.range &&
                     lw.charge < lw.fullCharge + lw.holdS - 0.35) {
-                    fire[static_cast<std::size_t>(i)] = true;
-                } else if (hidden && lw.charge >= lw.minCharge &&
-                           lw.charge < lw.fullCharge + lw.holdS - 0.35 &&
-                           now_ - hidden->seen <= 0.35 && hidden->dist < lw.range) {
                     fire[static_cast<std::size_t>(i)] = true;
                 }
             }

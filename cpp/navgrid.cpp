@@ -43,7 +43,7 @@ NavGrid::NavGrid(const Arena& arena, double navRadius, double step)
             const std::size_t c = static_cast<std::size_t>(j) * nnx_ + i;
             const auto [z, nonBridgeRoof] = arena_.walkSurfaceInfo(x, y);
             surf_[c] = static_cast<float>(z);
-            const bool standable = !nonBridgeRoof && arena_.standable(x, y, z, navRadius, 9.0, 1.5);
+            const bool standable = !nonBridgeRoof && arena_.standable(x, y, z, navRadius, 9.0, 1.2);
             blocked_[c] = standable ? 0 : 1;
         }
     }

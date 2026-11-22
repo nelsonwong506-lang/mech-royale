@@ -205,7 +205,6 @@ private:
     double loseAt_ = -100.0;
     int stickID_ = -1;
     double stickAt_ = -100.0;
-    double shortUntil_ = -100.0;
 
     // Damage / threat / loot tracking
     double lastHurt_ = -100.0;
