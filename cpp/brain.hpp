@@ -198,7 +198,15 @@ private:
     std::vector<ThreatPing> pings_;
 
     double now_ = 0.0;
-    double laserPresence_ = 0.25;  // Continuous estimate of laser prevalence in lobby [0, 1]
+    double laserPresence_ = 0.65;  // Realistic OSU lobby prior (lasers spawn at t=0)
+
+    // Practice vs FFA auto-detection
+    bool initDone_ = false;
+    bool pracOn_ = false;
+    bool notPractice_ = false;
+    int startAlive_ = 16;
+    int kills_ = 0;
+    int otherDeadTicks_ = 0;
 
     // Path state
     std::vector<int32_t> path_;

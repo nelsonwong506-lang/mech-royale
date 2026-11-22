@@ -264,7 +264,7 @@ double Brain::weaponPower(std::string_view kind, double nextRadius) const {
     if (kind == "mortar") {
         // Offensive value (over-wall indirect fire + beats lightning) minus dynamic laser cook-off risk (+60% dmg!)
         const double offense = 78.0 - 22.0 * smallFrac;
-        const double cookoffRisk = 115.0 * std::clamp(laserPresence_, 0.15, 1.0);
+        const double cookoffRisk = 128.0 * std::clamp(laserPresence_, 0.15, 1.0);
         return offense - cookoffRisk;
     }
     if (kind == "gun") {
@@ -508,8 +508,9 @@ double Brain::engageValue(const Json& obs, const Json& me,
 
     // 5. Distance friction (gentle preference for closer/cleaner finishes)
     const double distCost = 0.22 * t.dist + (t.los ? 0.0 : 28.0);
+    const double pracBonus = pracOn_ ? 55.0 : 0.0;
 
-    return pWin * (lootGain + threatElim) - hpLossCost - thirdParty - regenCost + stick - distCost;
+    return pWin * (lootGain + threatElim) - hpLossCost - thirdParty - regenCost + stick + pracBonus - distCost;
 }
 
 std::optional<double> Brain::bestArmorYaw(const Json& obs, const Json& me,
@@ -621,8 +622,10 @@ void Brain::observe(const Json& obs, const Json& me, const std::array<std::optio
     const Vec3 muzzle{pos[0], pos[1], pos[2] + muzH};
     const int selfId = intOr(me, "id", -1);
 
-    // Decay lobby laser prevalence gently over time
-    laserPresence_ = std::max(0.15, laserPresence_ * 0.997);
+    // Decay lobby laser prevalence gently (keep high prior while >4 players remain unseen!)
+    const int curAlive = intOr(obs, "alive", 16);
+    const double minLaserPrior = (curAlive <= 4) ? 0.15 : 0.62;
+    laserPresence_ = std::max(minLaserPrior, laserPresence_ * 0.997);
 
     if (const auto it = obs.find("mechs"); it != obs.end() && it->is_array()) {
         for (const auto& m : *it) {
@@ -817,12 +820,30 @@ void Brain::observe(const Json& obs, const Json& me, const std::array<std::optio
                 // Dealing damage to ANY target resets the 5s regen clock (protocol.md §7)
                 lastCombatAt_ = now_;
             } else if (type == "kill") {
+                ++kills_;
                 if (e.contains("target") && e["target"].is_number()) {
                     tracks_.erase(static_cast<int>(e["target"].get<double>()));
                 }
             }
         }
     }
+
+    // Automatic Practice (1v15 Squad) vs FFA detection
+    const int alive = intOr(obs, "alive", 16);
+    if (!initDone_) {
+        initDone_ = true;
+        startAlive_ = alive;
+    }
+    const int otherDead = startAlive_ - alive - kills_;
+    if (otherDead > 0) {
+        ++otherDeadTicks_;
+    } else {
+        otherDeadTicks_ = 0;
+    }
+    if (otherDeadTicks_ >= 5) {
+        notPractice_ = true;
+    }
+    pracOn_ = !notPractice_ && now_ > 20.0;
 
     // 4. Zone phase anchor tracking
     if (const auto zit = obs.find("zone"); zit != obs.end() && zit->is_object()) {
@@ -1116,9 +1137,10 @@ Vec2 Brain::fightMove(const Json& obs, const Json& me, const std::array<std::opt
     const int alive = intOr(obs, "alive", 16);
     const auto& z = obs.contains("zone") && obs["zone"].is_object() ? obs["zone"] : Json::object();
 
-    // Dynamic risk-aversion lambda(HP, alive): higher when hurt or when many players remain
-    const double lambda = (0.85 + 0.042 * static_cast<double>(alive)) *
-                          std::pow(maxHp / std::max(hp, 240.0), 0.72);
+    // Separate primary-duel weight (never refuses fair 1v1!) vs heavy 3rd-party cover-splitting weight!
+    const double hpFrac = hp / maxHp;
+    const double wPrimary = 0.45 + 0.48 * std::clamp(1.0 - hpFrac, 0.0, 1.0);
+    const double lambdaExtra = 1.55 + 0.05 * static_cast<double>(alive);
 
     const double bx = tg.pos[0] - x, by = tg.pos[1] - y;
     const double bd = std::hypot(bx, by) + 1e-9;
@@ -1169,9 +1191,11 @@ Vec2 Brain::fightMove(const Json& obs, const Json& me, const std::array<std::opt
         // 1. Instantaneous offensive output at (cx, cy)
         const double myBurst = los ? myExpectedDPS(ws, myCubes, energy, tg, d, rearShot, /*burst=*/true) : 0.0;
 
-        // 2. Instantaneous incoming threat from ALL enemies with LOS to (cx, cy)
+        // 2. Separate primary-target DPS, extra 3rd-party enemy DPS (1vMany cover-splitting!), and charging-laser dodge
         const Vec3 body{cx, cy, cz + ownH * 0.6};
-        double theirBurst = 0.0;
+        double primaryIn = 0.0;
+        double extraIn = 0.0;
+        double laserDanger = 0.0;
         bool tgSeesMe = false;
         for (const MechTrack* e : seen) {
             const double de = std::hypot(e->pos[0] - cx, e->pos[1] - cy);
@@ -1180,24 +1204,36 @@ Vec2 Brain::fightMove(const Json& obs, const Json& me, const std::array<std::opt
             if (arena_.blocksLine(eEye, body)) continue;
             if (e->id == tg.id) tgSeesMe = true;
             const double wAim = attentionWeight(*e, cx, cy);
-            double edps = enemyExpectedDPS(*e, ws, myArmor, energy, de, wAim > 0.7, /*burst=*/true) * wAim;
+            double edps = enemyExpectedDPS(*e, ws, myArmor, energy, de, wAim > 0.7, /*burst=*/false) * wAim;
             // Tree canopy one-way stealth: >45m enemy cannot see us through dense foliage while shots pierce!
-            if (de > 48.0 && arena_.blocksVisionTree(eEye, body)) {
+            const bool canopyHidden = (de > 48.0 && arena_.blocksVisionTree(eEye, body));
+            if (canopyHidden) {
                 edps *= 0.15;
             }
-            theirBurst += edps;
+            if (e->id == tg.id) {
+                primaryIn += edps;
+            } else {
+                extraIn += edps;
+            }
+            if (!canopyHidden && e->charging && wAim > 0.7) {
+                laserDanger += 320.0;
+            }
         }
         if (tg.kind == "npc" && !tgSeesMe && los && d < 85.0) {
-            theirBurst += 14.0 * (1.0 - myArmor);
+            primaryIn += 14.0 * (1.0 - myArmor);
         }
 
-        // Core physics net combat rate (HP/s advantage)
-        double s = myBurst - lambda * theirBurst - r * 0.8;
+        // Core physics net combat rate: actively fights 1v1 when weapon ready, splits angles vs 2nd/3rd foes,
+        // automatically hides during reload/cooldown (myBurst==0) or enemy charging laser!
+        double s = myBurst - wPrimary * primaryIn - lambdaExtra * extraIn - laserDanger - r * 0.8;
 
-        // 3. Soft continuous range shaping (sustained weapon matchup gradient even during cooldown/cover)
+        // 3. Soft continuous range shaping (sustained weapon matchup gradient + finish push in Practice)
         const double mySust = myExpectedDPS(ws, myCubes, energy, tg, d, rearShot, /*burst=*/false);
         const double tgSust = enemyExpectedDPS(tg, ws, myArmor, energy, d, true, /*burst=*/false);
-        s += 0.22 * (mySust - 0.85 * tgSust);
+        s += 0.30 * (mySust - 0.85 * tgSust);
+        if (pracOn_ && tg.hp < 0.38 * tg.maxHp && hpFrac > 0.42 && extraIn < 20.0) {
+            s -= 0.9 * std::abs(d - 22.0);
+        }
 
         // 4. Peek-corner geometry bonus (hug corners where 1 step toggles LOS)
         if (k >= 0 && k < 16) {
@@ -1227,7 +1263,7 @@ Vec2 Brain::fightMove(const Json& obs, const Json& me, const std::array<std::opt
         }
         if (k < 0) {
             // Slight preference to stay tucked if already hidden while cooling down/reloading
-            if (myBurst <= 5.0 && theirBurst <= 1.0) s += 14.0;
+            if (myBurst <= 5.0 && (primaryIn + extraIn) <= 1.0) s += 14.0;
             else s -= 10.0;
         }
         if (s > best) {
@@ -1393,7 +1429,8 @@ std::optional<Brain::LootChoice> Brain::chooseLoot(const Json& obs, const Json& 
             if (dz > 1.5) {
                 needClimb = true;
                 climbEnergy = std::max(0.0, (dz - 2.0) / 0.55);
-                if (dz > 42.0 || climbEnergy + 20.0 > maxEnergy || d > 130.0) return;
+                // Only climb fast, low-energy roofs (<= 18m) so we never hang as a slow airborne laser target!
+                if (dz > 18.0 || climbEnergy + 28.0 > maxEnergy || d > 90.0) return;
                 const auto lOpt = findRoofLaunch(ipos[0], ipos[1], ipos[2], ownH);
                 if (!lOpt) return;
                 launch = *lOpt;
@@ -1434,9 +1471,12 @@ std::optional<Brain::LootChoice> Brain::chooseLoot(const Json& obs, const Json& 
         }
 
         const double heat = soundHeat(ipos[0], ipos[1]);
+        if (needClimb && (nearEnemyThreat > 0.15 || heat > 0.35)) {
+            return;
+        }
         const double expo = nav_.exposure(ipos[0], ipos[1]);
         const double expoRisk = expo * (0.35 + 1.35 * std::clamp(1.0 - hpFrac, 0.0, 1.0));
-        const double airRisk = needClimb ? (roofTime * (0.45 * nearEnemyThreat + 0.25 * heat + 0.07)) : 0.0;
+        const double airRisk = needClimb ? (roofTime * (0.65 * nearEnemyThreat + 0.35 * heat + 0.10)) : 0.0;
         const double safety = std::exp(-(enemyRisk + 0.65 * heat + expoRisk + airRisk + extraRisk));
 
         double u = (netGain / (totalTime + 1.8)) * safety;
@@ -1509,9 +1549,9 @@ std::optional<Brain::LootChoice> Brain::chooseLoot(const Json& obs, const Json& 
                                     cubeValue(myCubes + 2, hpFrac) +
                                     230.0 * std::clamp(1.0 - hpFrac, 0.0, 1.0) +
                                     25.0 * std::clamp(1.0 - energy / maxEnergy, 0.0, 1.0);
-            // Global-visibility contest penalty scales with remaining players and waiting time
-            const double crowdRisk = (holder == selfId ? 0.15 : (0.35 + 0.055 * static_cast<double>(alive))) +
-                                     0.04 * waitLand;
+            // Global-visibility contest penalty scales strongly with remaining players and waiting time
+            const double crowdRisk = (holder == selfId ? 0.15 : (0.55 + 0.08 * static_cast<double>(alive))) +
+                                     0.06 * waitLand;
             evaluate("drop", did, dpos, dropGain, waitLand + remCap, crowdRisk);
         }
     }
@@ -1739,10 +1779,13 @@ Json Brain::act(const Json& obs) {
     const double nextRadius = numOr(z, "next_radius", 380.0);
     const bool late = nextRadius <= 70.0 || alive <= 3;
 
-    // 1. Continuous Physics Target & Threat Evaluation (ZERO fixed engageDist / retreatHP / crowd thresholds!)
+    // 1. Continuous Physics Target & Threat Evaluation
+    //    CRITICAL: Decouple SHOOTING (target) from RETREAT MOVEMENT (retreat_)!
+    //    Legs and torso are independent: even while running to cover, ALWAYS fire back at whoever is shooting us!
     std::vector<MechTrack*> seen;
     seen.reserve(tracks_.size());
     double totalInDPS = 0.0;
+    int crowdCount = 0;
     for (auto& [id, t] : tracks_) {
         (void)id;
         if (now_ - t.seen > 2.5) continue;
@@ -1757,6 +1800,7 @@ Json Brain::act(const Json& obs) {
         const double edps = enemyExpectedDPS(t, ws, myArmor, energy, t.dist, wAim > 0.7, /*burst=*/false);
         if (t.los) {
             totalInDPS += edps * wAim;
+            if (t.dist < 155.0) ++crowdCount;
         } else if (t.dist < 65.0) {
             totalInDPS += edps * wAim * 0.35;
         }
@@ -1764,16 +1808,25 @@ Json Brain::act(const Json& obs) {
 
     MechTrack* target = nullptr;
     MechTrack* hidden = nullptr;
-    double bestEngage = 0.0;  // Only fight when net expected value > 0!
-    double bestHiddenScore = 0.0;
+    double bestTargetScore = -kInf;
+    double bestHiddenScore = -kInf;
+    const double maxTargetDist = pracOn_ ? 200.0 : 235.0;
 
     for (MechTrack* t : seen) {
-        if (t->seen != now_ || t->dist > 250.0) continue;
+        if (t->seen != now_ || t->dist > maxTargetDist) continue;
         t->engageScore = engageValue(obs, me, ws, *t, totalInDPS, late);
-        t->engage = (t->engageScore > 0.0);
+        const double toMe = std::atan2(y - t->pos[1], x - t->pos[0]);
+        const bool aimedAtMe = std::abs(angDiff(t->aim[0], toMe)) < 0.25;
+        // Self-defense / active threat: always eligible to shoot back even if engageScore < 0!
+        const bool selfDefense = (now_ - t->hitMe < 5.0) || (t->dist < 62.0) ||
+            (aimedAtMe && t->charging && t->dist < 140.0) ||
+            (aimedAtMe && t->los && t->dist < 140.0 && hpFrac > 0.45) ||
+            (t->hp < 350.0 && t->dist < 130.0) || late || pracOn_;
+        t->engage = (t->engageScore > 0.0) || selfDefense;
+        if (!t->engage) continue;
         if (t->los) {
-            if (t->engageScore > bestEngage) {
-                bestEngage = t->engageScore;
+            if (t->engageScore > bestTargetScore) {
+                bestTargetScore = t->engageScore;
                 target = t;
             }
         } else if (t->engageScore > bestHiddenScore) {
@@ -1792,21 +1845,28 @@ Json Brain::act(const Json& obs) {
         lastThreatAt_ = now_;
     }
 
-    // 2. Smooth Value-Driven Retreat / Cover Hysteresis (no fixed retreatHP!)
+    // 2. Clean Physics-Driven Retreat Hysteresis (never retreats from fair full-HP 1v1 or fast lethal finish!)
     const double ttkDie = hp / std::max(1.0, totalInDPS);
-    const bool badPosition = underFire && !late &&
-        ((!target && totalInDPS > 45.0) || (target && bestEngage < 12.0 && ttkDie < 4.5));
-    if (!retreat_ && badPosition) {
+    double ttkBestKill = 99.0;
+    if (target) {
+        const bool rear = showsBack(*target, x, y);
+        const double bDps = myExpectedDPS(ws, myCubes, energy, *target, target->dist, rear, /*burst=*/true);
+        const double sDps = myExpectedDPS(ws, myCubes, energy, *target, target->dist, rear, /*burst=*/false);
+        const double fastT = (bDps > 15.0) ? (target->hp / bDps) : 99.0;
+        ttkBestKill = (fastT <= 2.2) ? fastT : (target->hp / std::max(10.0, sDps));
+    }
+    const bool finishing = target && target->dist < 120.0 && (ttkBestKill < 1.35 || target->hp < 210.0 || target->hp < hp * 0.45);
+    const bool outgunned = target && holdsKind(target->weapons, "laser") && !laser && target->dist > 55.0 && hpFrac < 0.78;
+    const bool swamped = (crowdCount >= 3) || (crowdCount == 2 && hpFrac < 0.65) || outgunned;
+    const bool losingTrade = underFire && (ttkDie < 3.0 && ttkDie < ttkBestKill * 0.72);
+    const bool lowUnderFire = (hpFrac < 0.38 && now_ - lastThreatAt_ < 2.0);
+    if (!retreat_ && !finishing && !late && (lowUnderFire || swamped || losingTrade)) {
         retreat_ = true;
         coverAt_ = -1.0;
     }
-    if (retreat_) {
-        const bool strongCounter = target && bestEngage > 45.0 && ttkDie > 3.0;
-        const bool healedUp = hpFrac > 0.78 && !underFire;
-        const bool safeQuiet = now_ - lastThreatAt_ > 6.0 && hpFrac > 0.56;
-        if (strongCounter || healedUp || safeQuiet || late) {
-            retreat_ = false;
-        }
+    if (retreat_ && (finishing || late || (!swamped && !losingTrade &&
+        (hpFrac > 0.78 || (now_ - lastThreatAt_ > 6.5 && hpFrac > 0.55))))) {
+        retreat_ = false;
     }
 
     // 3. Movement Priority Cascade (Zone / Escape / Dodge / Retreat / Fight / Unified Loot / Home)
@@ -1877,24 +1937,36 @@ Json Brain::act(const Json& obs) {
             boost = true;
         }
         mode = "fight";
-        // Safe opportunistic mid-fight cube grab (inside current safe zone & reachable height)
-        const ZoneCircle curZ = curZone(z);
-        double bestCubeD = (hpFrac > 0.50) ? 40.0 : 20.0;
-        std::optional<Vec3> bc;
-        for (const auto& [cid, c] : cubes_) {
-            (void)cid;
-            const double d = std::hypot(c.pos[0] - x, c.pos[1] - y);
-            if (d < bestCubeD && std::abs(c.pos[2] - zf) < 4.0 &&
-                std::hypot(c.pos[0] - curZ.x, c.pos[1] - curZ.y) < curZ.r - 4.0) {
-                bestCubeD = d;
-                bc = c.pos;
+        // Safe opportunistic mid-fight cube grab (only when valuable & not facing charging laser / multi-foe!)
+        bool enemyCharging = false;
+        for (const MechTrack* e : seen) {
+            if (e->seen == now_ && e->los && e->charging) {
+                enemyCharging = true;
+                break;
             }
         }
-        if (bc) {
-            const Vec2 cmv = travel(me, (*bc)[0], (*bc)[1]);
-            mx = cmv[0];
-            my = cmv[1];
-            mode = "fight:cube";
+        if (crowdCount <= 1 && !enemyCharging && cubeValue(myCubes, hpFrac) >= 50.0) {
+            const ZoneCircle curZ = curZone(z);
+            double bestCubeD = pracOn_ ? (hpFrac > 0.50 ? 68.0 : 38.0) : (hpFrac > 0.50 ? 40.0 : 20.0);
+            std::optional<Vec3> bc;
+            for (const auto& [cid, c] : cubes_) {
+                (void)cid;
+                const double d = std::hypot(c.pos[0] - x, c.pos[1] - y);
+                if (d < bestCubeD && std::abs(c.pos[2] - zf) < 4.0 &&
+                    std::hypot(c.pos[0] - curZ.x, c.pos[1] - curZ.y) < curZ.r - 4.0) {
+                    const double dFoe = std::hypot(c.pos[0] - foe->pos[0], c.pos[1] - foe->pos[1]);
+                    if (d < 14.0 || d < dFoe * 0.95) {
+                        bestCubeD = d;
+                        bc = c.pos;
+                    }
+                }
+            }
+            if (bc) {
+                const Vec2 cmv = travel(me, (*bc)[0], (*bc)[1]);
+                mx = cmv[0];
+                my = cmv[1];
+                mode = "fight:cube";
+            }
         }
     } else if (zoneShould && zdist > 2.0) {
         roofFlying_ = false;
@@ -1930,14 +2002,14 @@ Json Brain::act(const Json& obs) {
                     const double dl = std::hypot(dx, dy);
                     if (zf < lc->pos[2] + 1.2) {
                         boost = energy > 1.0;
-                        // Stay over clear launch column until feet clear roof rim, then glide onto roof
-                        if (zf >= lc->pos[2] - 0.8 && dl > 0.5) {
-                            mx = dx / dl;
-                            my = dy / dl;
-                        }
+                        // Strictly clear the roof rim (+1.2m) vertically BEFORE gliding horizontally onto roof!
+                        mx = 0.0;
+                        my = 0.0;
                     } else if (dl > 0.5) {
                         mx = dx / dl;
                         my = dy / dl;
+                        // Feather jetpack while gliding across the gap so gravity doesn't drop us below roof rim
+                        boost = (zf < lc->pos[2] + 2.5 && arena_.topSurface(x, y) < lc->pos[2] - 1.0) && energy > 1.0;
                     }
                     mode = "roof:jet";
                 }
@@ -2144,6 +2216,8 @@ Json Brain::act(const Json& obs) {
                 }
             } else if (w.kind == "laser") {
                 if (!isMech || !target || dist > w.range * 0.97) continue;
+                // Don't start a fresh laser charge (0.5x move speed!) while actively running to cover at low HP
+                if (mode == "cover" && (mx != 0.0 || my != 0.0) && hpFrac < 0.50 && w.charge <= 0.0) continue;
                 const double full = w.fullCharge;
                 // Always-on exact physics lethal early release (with cube + cook-off + rear-armor multipliers!)
                 if (w.charge >= w.minCharge && w.charge < full - 0.051) {
@@ -2206,10 +2280,10 @@ Json Brain::act(const Json& obs) {
         }
     }
 
-    // Behind-wall laser pre-charge when peeking an engaged hidden foe
-    if (!target && foe && laser) {
+    // Behind-wall laser pre-charge ONLY when actively peeking an engaged close foe (never while retreating/escaping!)
+    if (!target && foe && laser && mode == "fight" && !retreat_) {
         const int lSlot = findWeaponSlot(ws, "laser");
-        if (lSlot >= 0 && laser->cooldown <= 0.05 && foe->dist < laser->range &&
+        if (lSlot >= 0 && laser->cooldown <= 0.05 && foe->dist < std::min(130.0, laser->range) &&
             laser->charge < laser->fullCharge + laser->holdS - 0.35 &&
             regenBreakCost(hpFrac, inZone) < 40.0) {
             fire[static_cast<std::size_t>(lSlot)] = true;
