@@ -6,6 +6,7 @@
 
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <random>
 #include <string>
@@ -157,13 +158,38 @@ private:
     struct ProjectionContext;
     struct ProjectedAction;
     struct Projection;
+    struct Projectile {
+        Vec3 pos;
+        Vec3 vel;
+        double radius;
+        double damage;
+    };
+
+    struct ProjectileRisk {
+        double damage = 0.0;
+        double firstHit = std::numeric_limits<double>::infinity();
+        Vec2 side{};
+        double bearing = 0.0;
+    };
 
     FirePlan planDirectFire(const FireState& state, const Weapons& weapons, const MechTrack* target,
                             const Vec3& point, const Vec3& velocity, double radius, double height,
                             bool movingToCover) const;
-    ProjectionContext projectionContext(const Json& obs, const Json& me, const FireState& fire,
-                                        const Weapons& weapons, const MechTrack* target,
-                                        const std::vector<MechTrack*>& seen, bool enteringZone = false) const;
+    ProjectionContext movementContext(const Json& me, const FireState& fire, const Weapons& weapons) const;
+    ProjectionContext projectionContext(const Json& obs, const ProjectionContext& movement,
+                                        const ProjectileRisk& incoming, Vec2 laserDodge,
+                                        const MechTrack* target,
+                                        const std::vector<MechTrack*>& seen,
+                                        const std::vector<Projectile>& projectiles, bool enteringZone = false) const;
+    std::vector<Projectile> nearbyProjectiles(const Json& obs, const ProjectionContext& movement) const;
+    std::optional<double> projectileContact(const Projectile& projectile, double stepStart, const Vec3& before,
+                                            const Vec3& after, double radius, double height) const;
+    ProjectileRisk forecastProjectileRisk(const ProjectionContext& movement, ActionChoice action,
+                                          const std::vector<Projectile>& projectiles) const;
+    ActionChoice dodgeProjectiles(const ProjectionContext& movement, ActionChoice fallback,
+                                  const std::vector<Projectile>& projectiles) const;
+    Vec2 combatRoundDodge(const ProjectionContext& movement, const std::vector<Projectile>& projectiles) const;
+    bool advanceGroundMotion(const ProjectionContext& context, FireState& state, Vec2 move, double speed) const;
     void projectAction(const ProjectionContext& context, const ProjectedAction& action,
                        Projection& state, bool pursuit, int decision) const;
     ActionChoice compareActions(const ProjectionContext& context, const std::vector<ProjectedAction>& actions,
@@ -209,7 +235,7 @@ private:
     double engageValue(const Json& obs, const Json& me,
                        const std::array<std::optional<WeaponInfo>, 2>& ws,
                        const MechTrack& t, double inDPS, bool late) const;
-    std::optional<double> bestArmorYaw(const Json& obs, const Json& me,
+    std::optional<double> bestArmorYaw(const Json& me, const ProjectileRisk& incoming,
                                        const std::array<std::optional<WeaponInfo>, 2>& ws,
                                        const std::vector<MechTrack*>& seen) const;
 
@@ -245,10 +271,10 @@ private:
     bool hideFromBearing(const Json& obs, const Json& me, const std::vector<MechTrack*>& seen, double& mx, double& my);
     std::optional<LootChoice> chooseLoot(const Json& obs, const Json& me,
                                          const std::array<std::optional<WeaponInfo>, 2>& ws,
-                                         double hpFrac, bool inZone);
+                                         double hpFrac, bool inZone, bool incomingRound);
     double homeCost(const Json& obs, const Json& me, double px, double py) const;
     std::optional<Vec2> findHome(const Json& obs, const Json& me);
-    void dodgeBullets(const Json& obs, const Json& me, double& dx, double& dy, bool& enemyLaser) const;
+    Vec2 laserDodgeDirection(const Json& obs, Vec3 pos) const;
 
     Vec2 leadAim(const Vec3& muzzle, const Vec3& tp, const Vec3& tv, double speed, bool grounded) const;
     std::optional<Vec2> mortarAim(const Vec3& tube, const Vec3& foot, const Vec3& tv,

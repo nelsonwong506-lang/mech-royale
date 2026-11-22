@@ -15,6 +15,7 @@ constexpr double kTick = 0.05;
 constexpr double kDecision = 2.0 * kTick;
 constexpr int kProjectionDecisions = 32;
 constexpr int kProjectionTicks = 2 * kProjectionDecisions;
+constexpr int kProjectileTicks = 14;
 
 double angDiff(double a, double b) {
     return std::remainder(a - b, kTau);
@@ -613,7 +614,7 @@ double Brain::engageValue(const Json& obs, const Json& me,
          - hpLossCost - thirdParty - regenCost + stick + pracBonus - distCost;
 }
 
-std::optional<double> Brain::bestArmorYaw(const Json& obs, const Json& me,
+std::optional<double> Brain::bestArmorYaw(const Json& me, const ProjectileRisk& incoming,
                                           const std::array<std::optional<WeaponInfo>, 2>& ws,
                                           const std::vector<MechTrack*>& seen) const {
     const Vec3 pos = safeVec3(me, "pos");
@@ -648,20 +649,7 @@ std::optional<double> Brain::bestArmorYaw(const Json& obs, const Json& me,
         addDir(ang, std::max(15.0, dps * wAim) * losMult);
     }
 
-    if (const auto pit = obs.find("projectiles"); pit != obs.end() && pit->is_array()) {
-        for (const auto& pr : *pit) {
-            if (!pr.is_object()) continue;
-            const Vec3 pp = safeVec3(pr, "pos");
-            const Vec3 pv = safeVec3(pr, "vel");
-            const double dx = x - pp[0], dy = y - pp[1];
-            const double d = std::hypot(dx, dy);
-            if (d > 140.0 || d < 0.5) continue;
-            // Incoming toward us?
-            if (dx * pv[0] + dy * pv[1] > 0.0) {
-                addDir(std::atan2(pp[1] - y, pp[0] - x), 220.0);
-            }
-        }
-    }
+    if (incoming.damage > 0.0) addDir(incoming.bearing, 220.0);
 
     if (now_ - lastHurt_ < 2.5) {
         addDir(hurtBearing_, 180.0);
@@ -1690,7 +1678,7 @@ bool Brain::hideFromBearing(const Json& obs, const Json& me, const std::vector<M
 
 std::optional<Brain::LootChoice> Brain::chooseLoot(const Json& obs, const Json& me,
                                                    const std::array<std::optional<WeaponInfo>, 2>& ws,
-                                                   double hpFrac, bool inZone) {
+                                                   double hpFrac, bool inZone, bool incomingRound) {
     const Vec3 pos = safeVec3(me, "pos");
     const double x = pos[0], y = pos[1], zf = pos[2];
     const auto& z = obs.contains("zone") && obs["zone"].is_object() ? obs["zone"] : Json::object();
@@ -1844,7 +1832,8 @@ std::optional<Brain::LootChoice> Brain::chooseLoot(const Json& obs, const Json& 
     }
 
     // Unified regen-silence & danger gate: never shoot loud crates/NPCs while hurt OR within 6s of recent threat!
-    const bool protectRegen = (regenCost > 28.0) || (!pracOn_ && (hpFrac < 0.70 || now_ - lastThreatAt_ < 6.0));
+    const bool protectRegen = incomingRound || (regenCost > 28.0) ||
+                              (!pracOn_ && (hpFrac < 0.70 || now_ - lastThreatAt_ < 6.0));
     // Player-density gunshot reveal cost: shooting crates/NPCs in shrinking circles alerts the entire lobby!
     const double zoneScale = std::max(0.65, cur.r / 150.0);
     const double playerDensity = static_cast<double>(alive) / (zoneScale * zoneScale);
@@ -1997,60 +1986,21 @@ std::optional<Vec2> Brain::findHome(const Json& obs, const Json& me) {
     return homeXY_;
 }
 
-void Brain::dodgeBullets(const Json& obs, const Json& me, double& dx, double& dy, bool& enemyLaser) const {
-    dx = 0.0;
-    dy = 0.0;
-    enemyLaser = false;
-    const Vec3 pos = safeVec3(me, "pos");
-    const auto& st = me.contains("stats") && me["stats"].is_object() ? me["stats"] : Json::object();
-    const double cx = pos[0], cy = pos[1];
-    const double cz = pos[2] + numOr(st, "height", cfgMechHeight_) * 0.56;
-    const double reach = numOr(st, "radius", cfgMechRadius_) + 1.1;
-
-    if (const auto pit = obs.find("projectiles"); pit != obs.end() && pit->is_array()) {
-        for (const auto& pr : *pit) {
-            if (!pr.is_object() || strOr(pr, "kind") == "mortar") continue;
-            const Vec3 p = safeVec3(pr, "pos");
-            const Vec3 v = safeVec3(pr, "vel");
-            const double v2 = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
-            if (v2 < 1.0) continue;
-            const double tc = ((cx - p[0]) * v[0] + (cy - p[1]) * v[1] + (cz - p[2]) * v[2]) / v2;
-            if (tc <= 0.0 || tc > 0.7) continue;
-            const double mxx = p[0] + v[0] * tc - cx, myy = p[1] + v[1] * tc - cy;
-            if (std::hypot(mxx, myy) < reach) {
-                const double vh = std::hypot(v[0], v[1]);
-                if (vh < 1.0) continue;
-                double px = -v[1] / vh, py = v[0] / vh;
-                if (px * mxx + py * myy > 0.0) {
-                    px = -px;
-                    py = -py;
-                }
-                dx += px;
-                dy += py;
-            }
-        }
-    }
+Vec2 Brain::laserDodgeDirection(const Json& obs, Vec3 pos) const {
+    Vec2 direction{};
     if (const auto mit = obs.find("mechs"); mit != obs.end() && mit->is_array()) {
         for (const auto& m : *mit) {
             if (!m.is_object() || strOr(m, "kind") != "mech" || !boolOr(m, "charging", false)) continue;
             const Vec3 mp = safeVec3(m, "pos");
             const Vec2 maim = safeVec2(m, "aim");
-            const double toMe = std::atan2(cy - mp[1], cx - mp[0]);
+            const double toMe = std::atan2(pos[1] - mp[1], pos[0] - mp[0]);
             if (std::abs(angDiff(maim[0], toMe)) > 0.16) continue;
-            dx += std::cos(toMe + std::numbers::pi * 0.5 * strafe_) * 1.5;
-            dy += std::sin(toMe + std::numbers::pi * 0.5 * strafe_) * 1.5;
-            enemyLaser = true;
+            const double side = toMe + std::numbers::pi * 0.5 * strafe_;
+            direction[0] += 1.5 * std::cos(side);
+            direction[1] += 1.5 * std::sin(side);
         }
     }
-    const double l = std::hypot(dx, dy);
-    if (l > 0.01) {
-        dx /= l;
-        dy /= l;
-    } else {
-        dx = 0.0;
-        dy = 0.0;
-        enemyLaser = false;
-    }
+    return direction;
 }
 
 Vec2 Brain::leadAim(const Vec3& muzzle, const Vec3& tp, const Vec3& tv, double speed, bool grounded) const {
@@ -2219,11 +2169,6 @@ struct Brain::ProjectionContext {
         double damageRate;
         bool chasing;
     };
-    struct Projectile {
-        Vec3 pos;
-        Vec3 vel;
-        double damage;
-    };
 
     FireState fire;
     Weapons weapons;
@@ -2239,6 +2184,8 @@ struct Brain::ProjectionContext {
     double walk = 11.7;
     double boost = 19.5;
     double accel = 58.5;
+    double airAccel = 12.0;
+    double gravity = 22.0;
     double radius = 2.5;
     double stepUp = 1.2;
     double maxSlope = 50.0;
@@ -2251,6 +2198,7 @@ struct Brain::ProjectionContext {
     double backgroundDPS = 0.0;
     bool inZone = true;
     bool enteringZone = false;
+    bool grounded = true;
     Vec2 dodge{};
     bool dodgeLaser = false;
 };
@@ -2280,23 +2228,23 @@ struct Brain::Projection {
     bool settled = false;
 };
 
-Brain::ProjectionContext Brain::projectionContext(const Json& obs, const Json& me, const FireState& fire,
-                                                  const Weapons& weapons, const MechTrack* target,
-                                                  const std::vector<MechTrack*>& seen, bool enteringZone) const {
+Brain::ProjectionContext Brain::movementContext(const Json& me, const FireState& fire,
+                                                const Weapons& weapons) const {
     ProjectionContext c;
     c.fire = fire;
     c.weapons = weapons;
-    c.target = target;
-    c.enteringZone = enteringZone;
     c.hp = numOr(me, "hp", 1400.0);
     c.maxHp = numOr(me, "max_hp", 1400.0);
     c.maxEnergy = numOr(me, "max_energy", 100.0);
     c.inZone = boolOr(me, "in_zone", true);
+    c.grounded = boolOr(me, "grounded", true);
     const auto& st = me.contains("stats") && me["stats"].is_object() ? me["stats"] : Json::object();
     c.armor = numOr(st, "armor", 0.0);
     c.walk = std::max(1.0, numOr(st, "walk_speed", 11.7));
     c.boost = std::max(c.walk, numOr(st, "boost_speed", 19.5));
     c.accel = std::max(1.0, numOr(st, "ground_accel", 58.5));
+    c.airAccel = std::max(1.0, numOr(st, "air_accel", 12.0));
+    c.gravity = numOr(st, "gravity", 22.0);
     c.radius = numOr(st, "radius", cfgMechRadius_);
     c.stepUp = numOr(st, "step_up", 1.2);
     c.maxSlope = numOr(st, "max_slope_deg", 50.0);
@@ -2305,7 +2253,16 @@ Brain::ProjectionContext Brain::projectionContext(const Json& obs, const Json& m
     c.energyDelay = numOr(st, "energy_regen_delay", 0.6);
     c.chargeMove = std::clamp(numOr(st, "charge_move_mult", 0.5), 0.1, 1.0);
     c.regenPerS = numOr(st, "regen_per_s", cfgRegenPerS_);
+    return c;
+}
 
+Brain::ProjectionContext Brain::projectionContext(const Json& obs, const ProjectionContext& movement,
+                                                  const ProjectileRisk& incoming, Vec2 laserDodge,
+                                                  const MechTrack* target, const std::vector<MechTrack*>& seen,
+                                                  const std::vector<Projectile>& projectiles, bool enteringZone) const {
+    ProjectionContext c = movement;
+    c.target = target;
+    c.enteringZone = enteringZone;
     const auto& zone = obs.contains("zone") && obs["zone"].is_object() ? obs["zone"] : Json::object();
     c.zoneDPS = numOr(zone, "dps", 20.0);
     c.circles[0] = curZone(zone);
@@ -2323,8 +2280,11 @@ Brain::ProjectionContext Brain::projectionContext(const Json& obs, const Json& m
             c.circles[tick] = zoneAt(zone, now_ + tick * kTick);
         }
     }
-    dodgeBullets(obs, me, c.dodge[0], c.dodge[1], c.dodgeLaser);
+    c.dodgeLaser = std::hypot(laserDodge[0], laserDodge[1]) > 0.01;
+    c.dodge = limitLength({incoming.side[0] + laserDodge[0], incoming.side[1] + laserDodge[1]}, 1.0);
 
+    const FireState& fire = c.fire;
+    const Weapons& weapons = c.weapons;
     for (const MechTrack* enemy : seen) {
         const double dist = distanceTo(fire.pos, {enemy->pos[0], enemy->pos[1]});
         const double attention = attentionWeight(*enemy, fire.pos[0], fire.pos[1]);
@@ -2345,22 +2305,8 @@ Brain::ProjectionContext Brain::projectionContext(const Json& obs, const Json& m
     }
     if (c.threats.size() > 4) c.threats.resize(4);
 
-    if (const auto it = obs.find("projectiles"); it != obs.end() && it->is_array()) {
-        for (const auto& item : *it) {
-            const std::string kind = strOr(item, "kind");
-            if (kind != "gun" && kind != "npc") continue;
-            const Vec3 pos = safeVec3(item, "pos"), vel = safeVec3(item, "vel");
-            const double speed2 = vel[0] * vel[0] + vel[1] * vel[1];
-            if (speed2 <= 1.0) continue;
-            const double dx = fire.pos[0] - pos[0], dy = fire.pos[1] - pos[1];
-            const double t = (dx * vel[0] + dy * vel[1]) / speed2;
-            // A projectile can only intersect the portion of the map we can reach before it passes.
-            if (t < 0.0 || t > 0.8 ||
-                std::hypot(dx - t * vel[0], dy - t * vel[1]) > c.radius + t * c.boost) continue;
-            c.projectiles.push_back({pos, vel, kind == "npc" ? 25.0 : 45.0});
-            if (c.projectiles.size() == 8) break;
-        }
-    }
+    constexpr std::size_t projectionLimit = 8;
+    c.projectiles.assign(projectiles.begin(), projectiles.begin() + std::min(projectiles.size(), projectionLimit));
     if (getWeapon(weapons, "lightning") && target) {
         for (const char* field : {"mechs", "crates"}) {
             if (const auto it = obs.find(field); it != obs.end() && it->is_array()) {
@@ -2381,6 +2327,201 @@ bool Brain::projectMove(const ProjectionContext& c, const Vec3& from, Vec3& to) 
     if (!nav_.inBounds(to[0], to[1])) return false;
     to[2] = arena_.surface(to[0], to[1], from[2] + c.stepUp + 1e-6);
     return arena_.walkSegment(from, to, c.radius, c.fire.height, c.stepUp, c.maxSlope);
+}
+
+bool Brain::advanceGroundMotion(const ProjectionContext& c, FireState& state, Vec2 move, double speed) const {
+    const Vec2 change = limitLength({move[0] * speed - state.vel[0], move[1] * speed - state.vel[1]}, c.accel * kTick);
+    state.vel[0] += change[0];
+    state.vel[1] += change[1];
+    const Vec3 start = state.pos;
+    Vec3 next{start[0] + state.vel[0] * kTick, start[1] + state.vel[1] * kTick, start[2]};
+    if (next == start || projectMove(c, start, next)) {
+        state.pos = next;
+        return true;
+    }
+    Vec3 slideX{next[0], start[1], start[2]};
+    Vec3 slideY{start[0], next[1], start[2]};
+    const bool canSlideX = slideX[0] != start[0] && projectMove(c, start, slideX);
+    const bool canSlideY = slideY[1] != start[1] && projectMove(c, start, slideY);
+    if (canSlideX && (!canSlideY || std::abs(state.vel[0]) >= std::abs(state.vel[1]))) {
+        state.pos = slideX;
+        state.vel[1] = 0.0;
+        return true;
+    }
+    if (canSlideY) {
+        state.pos = slideY;
+        state.vel[0] = 0.0;
+        return true;
+    }
+    state.vel[0] = state.vel[1] = 0.0;
+    return false;
+}
+
+std::vector<Brain::Projectile> Brain::nearbyProjectiles(const Json& obs, const ProjectionContext& c) const {
+    const auto it = obs.find("projectiles");
+    if (it == obs.end() || !it->is_array() || it->empty()) return {};
+    constexpr double horizon = kProjectileTicks * kTick;
+    const double reach = c.radius + horizon * std::max(c.boost, std::hypot(c.fire.vel[0], c.fire.vel[1]));
+    const auto prop = config_.find("projectile");
+    const double gunRadius = prop != config_.end() ? numOr(*prop, "gun_radius", 0.3) : 0.3;
+    const double npcRadius = prop != config_.end() ? numOr(*prop, "npc_radius", 0.3) : 0.3;
+    std::vector<Projectile> rounds;
+    for (const auto& item : *it) {
+        const std::string kind = strOr(item, "kind");
+        if (kind != "gun" && kind != "npc") continue;
+        const Vec3 p = safeVec3(item, "pos");
+        const Vec3 v = safeVec3(item, "vel");
+        const double speed2 = v[0] * v[0] + v[1] * v[1];
+        const double dx = c.fire.pos[0] - p[0], dy = c.fire.pos[1] - p[1];
+        const double t = speed2 > 1e-9 ? std::clamp((dx * v[0] + dy * v[1]) / speed2, 0.0, horizon) : 0.0;
+        const double radius = kind == "npc" ? npcRadius : gunRadius;
+        if (std::hypot(dx - t * v[0], dy - t * v[1]) <= reach + radius) {
+            rounds.push_back({p, v, radius, kind == "npc" ? 25.0 : 45.0});
+        }
+    }
+    return rounds;
+}
+
+std::optional<double> Brain::projectileContact(const Projectile& p, double stepStart, const Vec3& before,
+                                                const Vec3& after, double radius, double height) const {
+    // Move into the mech's frame, then intersect the horizontal disk and vertical span.
+    const double x = p.pos[0] + p.vel[0] * stepStart - before[0];
+    const double y = p.pos[1] + p.vel[1] * stepStart - before[1];
+    const double z = p.pos[2] + p.vel[2] * stepStart - before[2];
+    const double dx = p.vel[0] * kTick - (after[0] - before[0]);
+    const double dy = p.vel[1] * kTick - (after[1] - before[1]);
+    const double dz = p.vel[2] * kTick - (after[2] - before[2]);
+    const double reach = radius + p.radius;
+    const double a = dx * dx + dy * dy;
+    const double b = x * dx + y * dy;
+    const double c = x * x + y * y - reach * reach;
+    double low = 0.0, high = 1.0;
+    if (a > 1e-9) {
+        const double disc = b * b - a * c;
+        if (disc < 0.0) return std::nullopt;
+        const double root = std::sqrt(disc);
+        low = std::max(low, (-b - root) / a);
+        high = std::min(high, (-b + root) / a);
+    } else if (c > 0.0) {
+        return std::nullopt;
+    }
+    if (std::abs(dz) > 1e-9) {
+        const double bottom = (-p.radius - z) / dz;
+        const double top = (height + p.radius - z) / dz;
+        low = std::max(low, std::min(bottom, top));
+        high = std::min(high, std::max(bottom, top));
+    } else if (z < -p.radius || z > height + p.radius) {
+        return std::nullopt;
+    }
+    if (low > high) return std::nullopt;
+    const double time = stepStart + low * kTick;
+    const Vec3 impact{p.pos[0] + p.vel[0] * time, p.pos[1] + p.vel[1] * time, p.pos[2] + p.vel[2] * time};
+    if (arena_.blocksLine(p.pos, impact)) return std::nullopt;
+    return time;
+}
+
+Brain::ProjectileRisk Brain::forecastProjectileRisk(const ProjectionContext& c, ActionChoice action,
+                                                    const std::vector<Projectile>& rounds) const {
+    ProjectileRisk outcome;
+    if (rounds.empty()) return outcome;
+    FireState state = c.fire;
+    const WeaponInfo* laser = getWeapon(c.weapons, "laser");
+    const double chargeFactor = laser && laser->charge > 0.0 ? c.chargeMove : 1.0;
+    std::vector<std::uint8_t> hit(rounds.size());
+    for (int tick = 0; tick < kProjectileTicks; ++tick) {
+        const Vec3 start = state.pos;
+        const bool boosting = c.grounded && action.boost && state.energy > 0.1 && action.move != Vec2{};
+        const double speed = (boosting ? c.boost : c.walk) * chargeFactor;
+        if (c.grounded) {
+            advanceGroundMotion(c, state, action.move, speed);
+            if (boosting) state.energy -= c.boostDrain * kTick;
+        } else {
+            const Vec2 change = limitLength({action.move[0] * speed - state.vel[0],
+                                            action.move[1] * speed - state.vel[1]}, c.airAccel * kTick);
+            state.vel[0] += change[0];
+            state.vel[1] += change[1];
+            state.vel[2] -= c.gravity * kTick;
+            for (int axis = 0; axis < 3; ++axis) state.pos[axis] += state.vel[axis] * kTick;
+            const double ground = arena_.surface(state.pos[0], state.pos[1], start[2]);
+            if (state.pos[2] < ground) {
+                state.pos[2] = ground;
+                state.vel[2] = 0.0;
+            }
+        }
+        for (std::size_t i = 0; i < rounds.size(); ++i) {
+            if (hit[i]) continue;
+            const auto& p = rounds[i];
+            const auto time = projectileContact(p, tick * kTick, start, state.pos, c.radius, state.height);
+            if (!time) continue;
+            hit[i] = true;
+            outcome.damage += p.damage;
+            if (*time >= outcome.firstHit) continue;
+            outcome.firstHit = *time;
+            outcome.bearing = std::atan2(p.pos[1] - state.pos[1], p.pos[0] - state.pos[0]);
+            const double fraction = (*time - tick * kTick) / kTick;
+            const double x = p.pos[0] + p.vel[0] * *time - std::lerp(start[0], state.pos[0], fraction);
+            const double y = p.pos[1] + p.vel[1] * *time - std::lerp(start[1], state.pos[1], fraction);
+            const double length = std::hypot(p.vel[0], p.vel[1]);
+            Vec2 side = length > 1e-9 ? Vec2{-p.vel[1] / length, p.vel[0] / length} : Vec2{1.0, 0.0};
+            if (side[0] * x + side[1] * y > 0.0) side = {-side[0], -side[1]};
+            outcome.side = side;
+        }
+    }
+    return outcome;
+}
+
+Brain::ActionChoice Brain::dodgeProjectiles(const ProjectionContext& movement, ActionChoice fallback,
+                                            const std::vector<Projectile>& projectiles) const {
+    const auto incoming = forecastProjectileRisk(movement, fallback, projectiles);
+    if (incoming.damage <= 0.0) return fallback;
+    ActionChoice best = fallback;
+    double bestDamage = incoming.damage;
+    const Vec2 side = incoming.side;
+    const Vec2 other{-side[0], -side[1]};
+    for (bool boost : {fallback.boost, !fallback.boost}) {
+        if (boost && (!movement.grounded || movement.fire.energy <= 0.1)) continue;
+        for (const Vec2& direction : {limitLength({0.4 * fallback.move[0] + 0.9 * side[0],
+                                                   0.4 * fallback.move[1] + 0.9 * side[1]}, 1.0),
+                                      limitLength({0.4 * fallback.move[0] + 0.9 * other[0],
+                                                   0.4 * fallback.move[1] + 0.9 * other[1]}, 1.0),
+                                      side, other, Vec2{}}) {
+            const ActionChoice action{direction, boost};
+            const auto risk = forecastProjectileRisk(movement, action, projectiles);
+            if (risk.damage < bestDamage) {
+                bestDamage = risk.damage;
+                best = action;
+                if (bestDamage <= 0.0) return best;
+            }
+        }
+    }
+    return best;
+}
+
+Vec2 Brain::combatRoundDodge(const ProjectionContext& c, const std::vector<Projectile>& rounds) const {
+    // While dueling, leave a decision's worth of lateral clearance for follow-up fire.
+    const Vec3& feet = c.fire.pos;
+    const double reach = c.radius + c.walk * kDecision;
+    Vec2 result{};
+    for (const auto& p : rounds) {
+        const double x = feet[0] - p.pos[0], y = feet[1] - p.pos[1];
+        const double z = feet[2] + c.fire.height * 0.56 - p.pos[2];
+        const double horizontal2 = p.vel[0] * p.vel[0] + p.vel[1] * p.vel[1];
+        if (horizontal2 < 1.0) continue;
+        const double speed2 = horizontal2 + p.vel[2] * p.vel[2];
+        const double t = (x * p.vel[0] + y * p.vel[1] + z * p.vel[2]) / speed2;
+        if (t <= 0.0 || t > kProjectileTicks * kTick) continue;
+        const double dx = p.vel[0] * t - x, dy = p.vel[1] * t - y;
+        if (std::hypot(dx, dy) >= reach) continue;
+        const Vec3 intercept{p.pos[0] + p.vel[0] * t, p.pos[1] + p.vel[1] * t, p.pos[2] + p.vel[2] * t};
+        if (intercept[2] < feet[2] - p.radius || intercept[2] > feet[2] + c.fire.height + p.radius ||
+            arena_.blocksLine(p.pos, intercept)) continue;
+        const double speed = std::sqrt(horizontal2);
+        const Vec2 side{-p.vel[1] / speed, p.vel[0] / speed};
+        const double sign = side[0] * dx + side[1] * dy > 0.0 ? -1.0 : 1.0;
+        result[0] += sign * side[0];
+        result[1] += sign * side[1];
+    }
+    return result;
 }
 
 bool Brain::canFinishWithinProjection(const FireState& fs, const Weapons& weapons,
@@ -2538,29 +2679,8 @@ void Brain::projectAction(const ProjectionContext& c, const ProjectedAction& act
         const bool boosting = action.first.boost && fs.energy > 0.1 && (move[0] != 0.0 || move[1] != 0.0);
         const double speed = (boosting ? c.boost : c.walk) *
                              ((laser && laser->charge > 0.0) ? c.chargeMove : 1.0);
-        const Vec2 dv = limitLength({move[0] * speed - fs.vel[0], move[1] * speed - fs.vel[1]}, c.accel * kTick);
-        fs.vel[0] += dv[0];
-        fs.vel[1] += dv[1];
         const Vec3 before = fs.pos;
-        Vec3 next{fs.pos[0] + fs.vel[0] * kTick, fs.pos[1] + fs.vel[1] * kTick, fs.pos[2]};
-        if (next != before && !projectMove(c, before, next)) {
-            Vec3 slideX{next[0], before[1], before[2]};
-            Vec3 slideY{before[0], next[1], before[2]};
-            const bool canSlideX = slideX[0] != before[0] && projectMove(c, before, slideX);
-            const bool canSlideY = slideY[1] != before[1] && projectMove(c, before, slideY);
-            if (canSlideX && (!canSlideY || std::abs(fs.vel[0]) >= std::abs(fs.vel[1]))) {
-                next = slideX;
-                fs.vel[1] = 0.0;
-            } else if (canSlideY) {
-                next = slideY;
-                fs.vel[0] = 0.0;
-            } else {
-                next = before;
-                fs.vel[0] = fs.vel[1] = 0.0;
-                s.stoppedOnWall += kTick;
-            }
-        }
-        fs.pos = next;
+        if (!advanceGroundMotion(c, fs, move, speed)) s.stoppedOnWall += kTick;
         if (boosting) {
             fs.energy = std::max(0.0, fs.energy - c.boostDrain * kTick);
             s.lastEnergyUse = now_ + time;
@@ -2576,20 +2696,8 @@ void Brain::projectAction(const ProjectionContext& c, const ProjectedAction& act
         for (std::size_t i = 0; i < c.projectiles.size(); ++i) {
             if (s.incomingHit[i]) continue;
             const auto& p = c.projectiles[i];
-            const double x = p.pos[0] + p.vel[0] * (time - kTick) - before[0];
-            const double y = p.pos[1] + p.vel[1] * (time - kTick) - before[1];
-            const double dx = p.vel[0] * kTick - (next[0] - before[0]);
-            const double dy = p.vel[1] * kTick - (next[1] - before[1]);
-            const double length2 = dx * dx + dy * dy;
-            if (length2 < 1e-6) continue;
-            const double closest = std::clamp(-(x * dx + y * dy) / length2, 0.0, 1.0);
-            if (std::hypot(x + dx * closest, y + dy * closest) > c.radius + 0.3) continue;
-            const double impactTime = time - kTick + kTick * closest;
-            const Vec3 impact{p.pos[0] + p.vel[0] * impactTime, p.pos[1] + p.vel[1] * impactTime,
-                              p.pos[2] + p.vel[2] * impactTime};
-            const double floor = before[2] + (next[2] - before[2]) * closest;
-            if (impact[2] < floor - 0.3 || impact[2] > floor + fs.height + 0.3) continue;
-            if (!arena_.blocksLine(p.pos, impact)) damage += p.damage * std::clamp(1.0 - c.armor, 0.25, 1.0);
+            if (!projectileContact(p, time - kTick, before, fs.pos, c.radius, fs.height)) continue;
+            damage += p.damage * std::clamp(1.0 - c.armor, 0.25, 1.0);
             s.incomingHit[i] = true;
         }
         s.hp -= damage;
@@ -2941,6 +3049,11 @@ Json Brain::act(const Json& obs) {
     const FireState fireState{pos, vel, curAim, turnRate, pitchRate, minPitch,
                               maxPitch, ownMuzzleH, ownHeight, energy, myCubes};
 
+    const auto movement = movementContext(me, fireState, ws);
+    const auto projectiles = nearbyProjectiles(obs, movement);
+    const auto incoming = forecastProjectileRisk(movement, {}, projectiles);
+    const Vec2 laserDodge = laserDodgeDirection(obs, pos);
+
     const WeaponInfo* gun = getWeapon(ws, "gun");
     const WeaponInfo* light = getWeapon(ws, "lightning");
     const WeaponInfo* laser = getWeapon(ws, "laser");
@@ -3073,7 +3186,7 @@ Json Brain::act(const Json& obs) {
         Vec2 mv = detour ? toward(pos, zoneWaypoint) : travel(me, zg[0], zg[1]);
         boost = (!inZone || now_ >= latestDeparture) && energy > 5.0;
         if (grounded) {
-            const auto context = projectionContext(obs, me, fireState, ws, target, seen, true);
+            const auto context = projectionContext(obs, movement, incoming, laserDodge, target, seen, projectiles, true);
             const auto action = chooseZoneAction(context, {mv, boost}, zoneWaypoint, detour.has_value());
             mv = action.move;
             boost = action.boost;
@@ -3140,7 +3253,7 @@ Json Brain::act(const Json& obs) {
             mode = "flee";
         }
         if (planFinish) {
-            const auto context = projectionContext(obs, me, fireState, ws, target, seen);
+            const auto context = projectionContext(obs, movement, incoming, laserDodge, target, seen, projectiles);
             const auto action = chooseFinishAction(context, {{mx, my}, boost}, cover, baselineFight);
             mx = action.move[0];
             my = action.move[1];
@@ -3220,7 +3333,7 @@ Json Brain::act(const Json& obs) {
         my = mv[1];
         mode = "zone";
     } else {
-        if (const auto lc = chooseLoot(obs, me, ws, hpFrac, inZone)) {
+        if (const auto lc = chooseLoot(obs, me, ws, hpFrac, inZone, incoming.damage > 0.0)) {
             mode = "loot:" + lc->kind;
             if (lc->isRoof && zf < lc->pos[2] - 1.5) {
                 // Rooftop jet-climb controller
@@ -3320,21 +3433,25 @@ Json Brain::act(const Json& obs) {
         }
     }
 
-    // 4. Additive 3D Incoming Bullet & Charging-Laser Dodge Overlay
-    if (!projectedMove && mode != "unstuck" && mode != "escape" && mode != "roof:jet" && mode != "roof:launch") {
-        double ddx = 0.0, ddy = 0.0;
-        bool lz = false;
-        dodgeBullets(obs, me, ddx, ddy, lz);
-        if (ddx != 0.0 || ddy != 0.0) {
-            mx = mx * 0.4 + ddx * 0.9;
-            my = my * 0.4 + ddy * 0.9;
-            const double l = std::hypot(mx, my);
-            if (l > 1.0) {
-                mx /= l;
-                my /= l;
-            }
-            if (lz && energy > 25.0) boost = true;
+    // Urgent/projected actions already own movement. Ordinary movement is checked before committing it.
+    if (!projectedMove && mode != "unstuck" && mode != "escape" && mode != "dodge-mortar" &&
+        mode != "roof:jet" && mode != "roof:launch") {
+        Vec2 precaution = laserDodge;
+        if (foe) {
+            const Vec2 shotLane = combatRoundDodge(movement, projectiles);
+            precaution[0] += shotLane[0];
+            precaution[1] += shotLane[1];
         }
+        ActionChoice preferred{{mx, my}, boost};
+        if (const double length = std::hypot(precaution[0], precaution[1]); length > 0.01) {
+            preferred.move = limitLength({mx * 0.4 + 0.9 * precaution[0] / length,
+                                          my * 0.4 + 0.9 * precaution[1] / length}, 1.0);
+            preferred.boost = boost || (energy > 25.0 && std::hypot(laserDodge[0], laserDodge[1]) > 0.01);
+        }
+        const ActionChoice action = dodgeProjectiles(movement, preferred, projectiles);
+        mx = action.move[0];
+        my = action.move[1];
+        boost = action.boost;
     }
 
     // 5. Fast Physical Unstuck Detector
@@ -3461,7 +3578,7 @@ Json Brain::act(const Json& obs) {
 
     // 7. Multi-Threat 180-deg Optimal Front-Armor Yaw OR Active Vision Scanning
     if (!haveAim) {
-        if (const auto armorYaw = bestArmorYaw(obs, me, ws, seen)) {
+        if (const auto armorYaw = bestArmorYaw(me, incoming, ws, seen)) {
             aim[0] = *armorYaw;
         } else if (mx != 0.0 || my != 0.0) {
             aim[0] = std::atan2(my, mx) + 1.15 * std::sin(now_ * 1.3);
