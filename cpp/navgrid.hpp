@@ -31,18 +31,19 @@ public:
 
     int nearestFree(int c) const;
     bool offMain(double x, double y) const;
+    bool reachable(double x, double y) const;
     bool isMainReachable(double x, double y) const;
     bool canStep(int a, int b, bool diag) const;
     bool lineWalkable(double x0, double y0, double x1, double y1) const;
 
     std::pair<std::vector<int32_t>, bool> path(double sx, double sy, double gx, double gy,
-                                               int maxExpand = 22000, float extraRadius = 0.0f);
+                                               int maxExpand = 22000);
 
     std::optional<Vec2> findCoverBFS(double sx, double sy,
                                      const std::function<bool(double, double)>& isHidden,
                                      const std::function<double(double, double)>& zonePenaltyFn,
                                      const std::vector<Vec2>& threatPositions,
-                                     int maxSteps = 55, int maxChecks = 480);
+                                     int maxSteps = 50, int maxChecks = 350);
 
     std::optional<EscapeRoute> escapePlan(double x, double y);
     double exposure(double x, double y) const;

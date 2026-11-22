@@ -107,13 +107,13 @@ BrainParams Brain::squadParams(BrainParams p) {
     p.peek = false;
     p.laserFirst = true;
     p.noMortar = true;
-    p.laserRange = 110.0;
+    p.laserRange = 120.0;
     p.lootRadius = 150.0;
     p.crateUntil = 1e9;
     p.stick = 200.0;
     p.hpW = 0.18;
     p.lowBonus = 200.0;
-    p.maxTarget = 240.0;
+    p.maxTarget = 200.0;
     p.loseRule = true;
     p.fightLoot = 70.0;
     p.farmHP = 0.50;
@@ -400,13 +400,10 @@ void Brain::observe(const Json& obs, const Json& me, const std::array<std::optio
     } else {
         otherDeadTicks_ = 0;
     }
-    if (!confirmedPractice_ && otherDeadTicks_ >= 5) {
+    if (otherDeadTicks_ >= 5) {
         notPractice_ = true;
     }
-    if (!notPractice_ && now_ > 45.0 && otherDead == 0) {
-        confirmedPractice_ = true;
-    }
-    const bool prac = !notPractice_ && (confirmedPractice_ || now_ > 20.0);
+    const bool prac = !notPractice_ && now_ > 20.0;
     if (prac != pracOn_) {
         pracOn_ = prac;
         p_ = prac ? squadParams(baseP_) : baseP_;
@@ -613,18 +610,14 @@ Vec2 Brain::travel(const Json& me, double gx, double gy) {
         return {(tx - x) / l, (ty - y) / l};
     };
 
-    const auto& st = me.contains("stats") && me["stats"].is_object() ? me["stats"] : Json::object();
-    const double myRad = finiteOr(st.value("radius", cfgMechRadius_), cfgMechRadius_);
-    const float extraR = static_cast<float>(std::max(0.0, myRad - 2.6));
-
     if (nav_.onRoofObst(x, y, pos[2])) {
         return unit(gx, gy);
     }
-    if (d < 45.0 && extraR < 0.8f && nav_.lineWalkable(x, y, gx, gy)) {
+    if (d < 45.0 && nav_.lineWalkable(x, y, gx, gy)) {
         return unit(gx, gy);
     }
     if (path_.empty() || std::hypot(gx - pathGoal_[0], gy - pathGoal_[1]) > 5.0 || now_ - pathAt_ > 2.5) {
-        auto [p, reached] = nav_.path(x, y, gx, gy, 22000, extraR);
+        auto [p, reached] = nav_.path(x, y, gx, gy, 22000);
         (void)reached;
         path_ = std::move(p);
         pathGoal_ = {gx, gy};
@@ -848,7 +841,7 @@ bool Brain::coverMove(const Json& obs, const Json& me, const std::vector<MechTra
     for (const MechTrack* t : threats) threatXY.push_back({t->pos[0], t->pos[1]});
 
     const auto goal = nav_.findCoverBFS(
-        x, y, hidden, [&](double cx, double cy) { return zonePenalty(z, cx, cy); }, threatXY, 55, 480);
+        x, y, hidden, [&](double cx, double cy) { return zonePenalty(z, cx, cy); }, threatXY, 50, 350);
     if (!goal) {
         coverOK_ = false;
         return false;
@@ -1028,7 +1021,7 @@ std::optional<Vec2> Brain::findHome(const Json& obs, const Json& me) {
             const double a = u01(rng_) * kTau;
             const double r = std::sqrt(u01(rng_)) * nr * 0.7;
             const double px = nc[0] + std::cos(a) * r, py = nc[1] + std::sin(a) * r;
-            if (!nav_.inBounds(px, py) || !nav_.isMainReachable(px, py)) continue;
+            if (!nav_.inBounds(px, py) || !nav_.reachable(px, py)) continue;
             const double c = homeCost(obs, me, px, py);
             if (c < bestC) {
                 bestC = c;
@@ -1484,7 +1477,7 @@ Json Brain::act(const Json& obs) {
     }
 
     // 6. Combat Aiming, Half-Tick Slew Prediction, Laser Mastery & Firing
-    const Vec3 muzzle{x + vel[0] * kLat, y + vel[1] * kLat, zf + ownMuzzleH + vel[2] * 0.05};
+    const Vec3 muzzle{x + vel[0] * kLat, y + vel[1] * kLat, zf + ownMuzzleH};
     Vec2 aim{curAim[0], 0.0};
     bool haveAim = false;
     Vec3 tp{}, tv{};

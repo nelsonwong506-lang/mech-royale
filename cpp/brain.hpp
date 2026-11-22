@@ -238,7 +238,6 @@ private:
     // Practice vs FFA auto-detection
     bool initDone_ = false;
     bool pracOn_ = false;
-    bool confirmedPractice_ = false;
     bool notPractice_ = false;
     int startAlive_ = 16;
     int kills_ = 0;

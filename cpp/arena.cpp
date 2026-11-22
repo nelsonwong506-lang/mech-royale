@@ -305,7 +305,161 @@ Arena::Arena(const std::string& mapDir, const std::vector<std::string>& files) {
     }
 
     loadTrees(world);
-    buildRooftopGraph();
+    buildFlatPrismGrid();
+    buildRaster();
+}
+
+void Arena::buildFlatPrismGrid() {
+    const double terrainMaxX = terrainOrigin_[0] + (terrainWidth_ - 1) * terrainStep_;
+    const double terrainMaxY = terrainOrigin_[1] + (terrainHeight_ - 1) * terrainStep_;
+    gridMinX_ = std::min(bounds[0], terrainOrigin_[0]) - kGridStep;
+    gridMinY_ = std::min(bounds[1], terrainOrigin_[1]) - kGridStep;
+    const double gridMaxX = std::max(bounds[2], terrainMaxX) + kGridStep;
+    const double gridMaxY = std::max(bounds[3], terrainMaxY) + kGridStep;
+    gridNX_ = std::max(1, static_cast<int>(std::ceil((gridMaxX - gridMinX_) / kGridStep)) + 1);
+    gridNY_ = std::max(1, static_cast<int>(std::ceil((gridMaxY - gridMinY_) / kGridStep)) + 1);
+    prismGrid_.assign(static_cast<std::size_t>(gridNX_) * static_cast<std::size_t>(gridNY_), {});
+
+    for (std::size_t idx = 0; idx < prisms_.size(); ++idx) {
+        const auto& p = prisms_[idx];
+        const int x0 = std::clamp(gridX(p.bounds[0]), 0, gridNX_ - 1);
+        const int x1 = std::clamp(gridX(p.bounds[2]), 0, gridNX_ - 1);
+        const int y0 = std::clamp(gridY(p.bounds[1]), 0, gridNY_ - 1);
+        const int y1 = std::clamp(gridY(p.bounds[3]), 0, gridNY_ - 1);
+        for (int gy = y0; gy <= y1; ++gy) {
+            for (int gx = x0; gx <= x1; ++gx) {
+                prismGrid_[static_cast<std::size_t>(gy) * gridNX_ + gx].push_back(idx);
+            }
+        }
+    }
+}
+
+void Arena::buildRaster() {
+    const std::size_t n = static_cast<std::size_t>(terrainWidth_) * static_cast<std::size_t>(terrainHeight_);
+    rasterTop_.resize(n);
+    rasterWalk_.resize(n);
+    rasterObst_.assign(n, 0);
+    hasSlab_.assign(n, 0);
+    slabs_.clear();
+
+    for (std::size_t i = 0; i < n; ++i) {
+        const float g = static_cast<float>(terrain_[i] * terrainScale_);
+        rasterTop_[i] = g;
+        rasterWalk_[i] = g;
+    }
+
+    struct Interval {
+        float base;
+        float top;
+        bool bridge;
+        std::int32_t next;
+    };
+    std::vector<std::int32_t> head(n, -1);
+    std::vector<Interval> pool;
+    pool.reserve(n / 2);
+
+    std::vector<double> xs;
+    xs.reserve(32);
+
+    auto collectCrossings = [&](const Ring& ring, double y) {
+        for (const auto& e : ring) {
+            const double y0 = e.y;
+            const double y1 = e.y + e.dy;
+            if ((y0 <= y) != (y1 <= y)) {
+                xs.push_back(e.x + (y - y0) / e.dy * e.dx);
+            }
+        }
+    };
+
+    const double invStep = 1.0 / terrainStep_;
+    for (const auto& p : prisms_) {
+        const int j0 = std::max(0, static_cast<int>(std::ceil((p.bounds[1] - terrainOrigin_[1]) * invStep)));
+        const int j1 = std::min(terrainHeight_ - 1,
+                                static_cast<int>(std::floor((p.bounds[3] - terrainOrigin_[1]) * invStep)));
+        const float pBase = static_cast<float>(p.base);
+        const float pTop = static_cast<float>(p.top);
+        for (int j = j0; j <= j1; ++j) {
+            const double y = terrainOrigin_[1] + j * terrainStep_ + 1e-4;
+            xs.clear();
+            collectCrossings(p.outer, y);
+            for (const auto& h : p.holes) {
+                collectCrossings(h, y);
+            }
+            std::sort(xs.begin(), xs.end());
+            for (std::size_t k = 0; k + 1 < xs.size(); k += 2) {
+                const int i0 = std::max(0, static_cast<int>(std::ceil((xs[k] - terrainOrigin_[0]) * invStep)));
+                const int i1 = std::min(terrainWidth_ - 1,
+                                        static_cast<int>(std::floor((xs[k + 1] - terrainOrigin_[0]) * invStep)));
+                const std::size_t rowOff = static_cast<std::size_t>(j) * terrainWidth_;
+                for (int i = i0; i <= i1; ++i) {
+                    const std::size_t idx = rowOff + static_cast<std::size_t>(i);
+                    const auto nodeIdx = static_cast<std::int32_t>(pool.size());
+                    pool.push_back({pBase, pTop, p.isBridge, head[idx]});
+                    head[idx] = nodeIdx;
+                }
+            }
+        }
+    }
+
+    std::vector<Interval> cellIvs;
+    cellIvs.reserve(8);
+    for (std::size_t idx = 0; idx < n; ++idx) {
+        if (head[idx] < 0) continue;
+        cellIvs.clear();
+        for (std::int32_t cur = head[idx]; cur >= 0; cur = pool[static_cast<std::size_t>(cur)].next) {
+            cellIvs.push_back(pool[static_cast<std::size_t>(cur)]);
+        }
+        std::sort(cellIvs.begin(), cellIvs.end(), [](const Interval& a, const Interval& b) {
+            return a.base < b.base;
+        });
+        const float g = rasterTop_[idx];
+        float top = g;
+        float deck = -1e9f;
+        bool low = false;
+        for (const auto& iv : cellIvs) {
+            if (iv.top <= top) continue;
+            if (iv.base <= top + 1.5f) {
+                top = iv.top;
+                continue;
+            }
+            slabs_[static_cast<std::int32_t>(idx)].push_back({iv.base, iv.top});
+            hasSlab_[idx] = 1;
+            if (iv.base - top < 10.5f) {
+                if (iv.bridge && iv.top - g < 6.5f) {
+                    deck = iv.top;
+                } else {
+                    low = true;
+                }
+            }
+        }
+        rasterTop_[idx] = top;
+        rasterWalk_[idx] = std::max(top, deck);
+        rasterObst_[idx] = (top - g > 1.2f || low) ? 1 : 0;
+    }
+}
+
+int Arena::rasterIndex(double x, double y) const {
+    const int i = std::clamp(static_cast<int>(std::llround((x - terrainOrigin_[0]) / terrainStep_)),
+                             0, terrainWidth_ - 1);
+    const int j = std::clamp(static_cast<int>(std::llround((y - terrainOrigin_[1]) / terrainStep_)),
+                             0, terrainHeight_ - 1);
+    return j * terrainWidth_ + i;
+}
+
+int Arena::gridX(double x) const {
+    return static_cast<int>(std::floor((x - gridMinX_) / kGridStep));
+}
+
+int Arena::gridY(double y) const {
+    return static_cast<int>(std::floor((y - gridMinY_) / kGridStep));
+}
+
+const std::vector<std::size_t>* Arena::prismCell(int gx, int gy) const {
+    if (gx < 0 || gy < 0 || gx >= gridNX_ || gy >= gridNY_) {
+        return nullptr;
+    }
+    const auto& vec = prismGrid_[static_cast<std::size_t>(gy) * gridNX_ + gx];
+    return vec.empty() ? nullptr : &vec;
 }
 
 void Arena::loadTrees(const Json& world) {
@@ -628,11 +782,10 @@ std::pair<double, bool> Arena::walkSurfaceInfo(double x, double y) const {
     const double g = ground(x, y);
     double z = g;
     int topId = -1;
-    const auto cell = bins_.find(binKey(bin(x), bin(y)));
-    if (cell != bins_.end()) {
+    if (const auto* cell = prismCell(gridX(x), gridY(y))) {
         for (int pass = 0; pass < 8; ++pass) {
             bool moved = false;
-            for (auto index : cell->second) {
+            for (auto index : *cell) {
                 const auto& prism = prisms_[index];
                 if (prism.top <= z) continue;
                 if (!(prism.base <= z + 1.5 || (prism.isBridge && prism.top - g < 6.5))) continue;
@@ -652,11 +805,10 @@ std::pair<double, bool> Arena::walkSurfaceInfo(double x, double y) const {
 double Arena::topSurface(double x, double y) const {
     const double g = ground(x, y);
     double z = g;
-    const auto cell = bins_.find(binKey(bin(x), bin(y)));
-    if (cell != bins_.end()) {
+    if (const auto* cell = prismCell(gridX(x), gridY(y))) {
         for (int pass = 0; pass < 8; ++pass) {
             bool moved = false;
-            for (auto index : cell->second) {
+            for (auto index : *cell) {
                 const auto& prism = prisms_[index];
                 if (prism.top <= z || prism.base > z + 1.5) continue;
                 if (prism.contains(x, y)) {
@@ -674,9 +826,8 @@ bool Arena::isSolidPoint(double x, double y, double z) const {
     if (z < ground(x, y)) {
         return true;
     }
-    const auto cell = bins_.find(binKey(bin(x), bin(y)));
-    if (cell != bins_.end()) {
-        for (auto index : cell->second) {
+    if (const auto* cell = prismCell(gridX(x), gridY(y))) {
+        for (auto index : *cell) {
             const auto& prism = prisms_[index];
             if (z > prism.base && z < prism.top && prism.contains(x, y)) {
                 return true;
@@ -686,10 +837,75 @@ bool Arena::isSolidPoint(double x, double y, double z) const {
     return false;
 }
 
+bool Arena::solidRaster(double x, double y, double z) const {
+    if (terrainStep_ > 2.0) {
+        return isSolidPoint(x, y, z);
+    }
+    const int idx = rasterIndex(x, y);
+    if (z < static_cast<double>(rasterTop_[static_cast<std::size_t>(idx)]) - 0.05) {
+        return true;
+    }
+    if (hasSlab_[static_cast<std::size_t>(idx)]) {
+        if (const auto it = slabs_.find(idx); it != slabs_.end()) {
+            for (const auto& s : it->second) {
+                if (z > static_cast<double>(s.base) && z < static_cast<double>(s.top)) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+bool Arena::isObstRaster(double x, double y) const {
+    if (terrainStep_ > 2.0) {
+        return topSurface(x, y) - ground(x, y) > 1.2;
+    }
+    return rasterObst_[static_cast<std::size_t>(rasterIndex(x, y))] != 0;
+}
+
+double Arena::walkRaster(double x, double y) const {
+    if (terrainStep_ > 2.0) {
+        return walkSurfaceInfo(x, y).first;
+    }
+    return static_cast<double>(rasterWalk_[static_cast<std::size_t>(rasterIndex(x, y))]);
+}
+
+bool Arena::standable(double x, double y, double z, double radius, double height, double stepUp) const {
+    if (x < bounds[0] + radius || x > bounds[2] - radius ||
+        y < bounds[1] + radius || y > bounds[3] - radius) {
+        return false;
+    }
+    const double lo = z + stepUp;
+    const double hi = z + height;
+    const double r2 = radius * radius;
+    const int x0 = std::max(0, gridX(x - radius));
+    const int x1 = std::min(gridNX_ - 1, gridX(x + radius));
+    const int y0 = std::max(0, gridY(y - radius));
+    const int y1 = std::min(gridNY_ - 1, gridY(y + radius));
+    for (int gy = y0; gy <= y1; ++gy) {
+        for (int gx = x0; gx <= x1; ++gx) {
+            const auto& cell = prismGrid_[static_cast<std::size_t>(gy) * gridNX_ + gx];
+            for (auto index : cell) {
+                const auto& prism = prisms_[index];
+                if (prism.top <= lo || prism.base >= hi) continue;
+                if (x + radius < prism.bounds[0] || x - radius > prism.bounds[2] ||
+                    y + radius < prism.bounds[1] || y - radius > prism.bounds[3]) {
+                    continue;
+                }
+                if (ringNearPoint(prism.outer, x, y, r2)) return false;
+                for (const auto& hole : prism.holes) {
+                    if (ringNearPoint(hole, x, y, r2)) return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
 double Arena::surfaceAboveTerrain(double x, double y, double maxZ, double support) const {
-    const auto cell = bins_.find(binKey(bin(x), bin(y)));
-    if (cell != bins_.end()) {
-        for (auto index : cell->second) {
+    if (const auto* cell = prismCell(gridX(x), gridY(y))) {
+        for (auto index : *cell) {
             const auto& prism = prisms_[index];
             if (support < prism.top && prism.top <= maxZ && prism.contains(x, y)) {
                 support = prism.top;
@@ -708,15 +924,14 @@ bool Arena::prismClear(double x, double y, double z, double radius, double heigh
         || !inRange(y, bounds[1] + radius, bounds[3] - radius)) {
         return false;
     }
-    const int firstX = bin(x - radius), lastX = bin(x + radius);
-    const int firstY = bin(y - radius), lastY = bin(y + radius);
-    for (int bx = firstX; bx <= lastX; ++bx) {
-        for (int by = firstY; by <= lastY; ++by) {
-            const auto cell = bins_.find(binKey(bx, by));
-            if (cell == bins_.end()) {
-                continue;
-            }
-            for (auto index : cell->second) {
+    const int x0 = std::max(0, gridX(x - radius));
+    const int x1 = std::min(gridNX_ - 1, gridX(x + radius));
+    const int y0 = std::max(0, gridY(y - radius));
+    const int y1 = std::min(gridNY_ - 1, gridY(y + radius));
+    for (int gy = y0; gy <= y1; ++gy) {
+        for (int gx = x0; gx <= x1; ++gx) {
+            const auto& cell = prismGrid_[static_cast<std::size_t>(gy) * gridNX_ + gx];
+            for (auto index : cell) {
                 const auto& prism = prisms_[index];
                 if (z + stepUp + supportEpsilon < prism.top
                     && z + height > prism.base && prism.touches(x, y, radius)) {
@@ -798,28 +1013,27 @@ bool Arena::flightSegment(const Vec3& start, const Vec3& end, double radius, dou
 }
 
 bool Arena::blocksPrismLine(const Vec3& start, const Vec3& end) const {
-    int bx = bin(start[0]), by = bin(start[1]);
-    const int endBx = bin(end[0]), endBy = bin(end[1]);
+    int gx = gridX(start[0]), gy = gridY(start[1]);
+    const int endGx = gridX(end[0]), endGy = gridY(end[1]);
     const double dx = end[0] - start[0], dy = end[1] - start[1];
     const int stepX = dx > 0.0 ? 1 : (dx < 0.0 ? -1 : 0);
     const int stepY = dy > 0.0 ? 1 : (dy < 0.0 ? -1 : 0);
     constexpr double inf = std::numeric_limits<double>::infinity();
-    const double tDeltaX = stepX != 0 ? std::abs(binSize / dx) : inf;
-    const double tDeltaY = stepY != 0 ? std::abs(binSize / dy) : inf;
+    const double tDeltaX = stepX != 0 ? std::abs(kGridStep / dx) : inf;
+    const double tDeltaY = stepY != 0 ? std::abs(kGridStep / dy) : inf;
     double tMaxX = stepX != 0
-        ? (((stepX > 0 ? bx + 1 : bx) * binSize) - start[0]) / dx
+        ? ((gridMinX_ + (stepX > 0 ? gx + 1 : gx) * kGridStep) - start[0]) / dx
         : inf;
     double tMaxY = stepY != 0
-        ? (((stepY > 0 ? by + 1 : by) * binSize) - start[1]) / dy
+        ? ((gridMinY_ + (stepY > 0 ? gy + 1 : gy) * kGridStep) - start[1]) / dy
         : inf;
-    const int maxSteps = std::abs(endBx - bx) + std::abs(endBy - by) + 2;
+    const int maxSteps = std::abs(endGx - gx) + std::abs(endGy - gy) + 2;
 
-    std::array<std::size_t, 32> checked{};
+    std::array<std::size_t, 64> checked{};
     std::size_t checkedCount = 0;
     for (int step = 0; step < maxSteps; ++step) {
-        const auto cell = bins_.find(binKey(bx, by));
-        if (cell != bins_.end()) {
-            for (const auto index : cell->second) {
+        if (const auto* cell = prismCell(gx, gy)) {
+            for (const auto index : *cell) {
                 bool seen = false;
                 for (std::size_t k = 0; k < checkedCount; ++k) {
                     if (checked[k] == index) {
@@ -838,14 +1052,14 @@ bool Arena::blocksPrismLine(const Vec3& start, const Vec3& end) const {
                 }
             }
         }
-        if (bx == endBx && by == endBy) {
+        if (gx == endGx && gy == endGy) {
             break;
         }
         if (tMaxX < tMaxY) {
-            bx += stepX;
+            gx += stepX;
             tMaxX += tDeltaX;
         } else {
-            by += stepY;
+            gy += stepY;
             tMaxY += tDeltaY;
         }
     }

@@ -16,9 +16,12 @@ constexpr std::array<std::array<int, 2>, 8> kNbrs{{
 }  // namespace
 
 NavGrid::NavGrid(const Arena& arena, double navRadius, double step)
-    : arena_(arena), minX_(arena.bounds[0]), minY_(arena.bounds[1]), ns_(step) {
-    nnx_ = std::max(1, static_cast<int>(std::ceil((arena.bounds[2] - arena.bounds[0]) / ns_)) + 1);
-    nny_ = std::max(1, static_cast<int>(std::ceil((arena.bounds[3] - arena.bounds[1]) / ns_)) + 1);
+    : arena_(arena), minX_(arena.terrainOrigin()[0]), minY_(arena.terrainOrigin()[1]), ns_(step) {
+    // Same lattice as the terrain raster (every 2nd terrain sample), covering the full terrain extent.
+    const double spanX = (arena.terrainNX() - 1) * arena.terrainStep();
+    const double spanY = (arena.terrainNY() - 1) * arena.terrainStep();
+    nnx_ = std::max(1, static_cast<int>(std::floor(spanX / ns_)) + 1);
+    nny_ = std::max(1, static_cast<int>(std::floor(spanY / ns_)) + 1);
     const std::size_t n = static_cast<std::size_t>(nnx_) * static_cast<std::size_t>(nny_);
 
     blocked_.assign(n, 0);
@@ -32,7 +35,7 @@ NavGrid::NavGrid(const Arena& arena, double navRadius, double step)
     heap_.reserve(4096);
     queue_.reserve(n);
 
-    // 1. Rasterize walkability at 2m resolution (mark non-bridge roofs & prism-colliding cells blocked).
+    // 1. Rasterize walkability at 2m resolution (mark non-bridge roofs & wall-colliding cells blocked).
     for (int j = 0; j < nny_; ++j) {
         const double y = minY_ + j * ns_;
         for (int i = 0; i < nnx_; ++i) {
@@ -40,9 +43,7 @@ NavGrid::NavGrid(const Arena& arena, double navRadius, double step)
             const std::size_t c = static_cast<std::size_t>(j) * nnx_ + i;
             const auto [z, nonBridgeRoof] = arena_.walkSurfaceInfo(x, y);
             surf_[c] = static_cast<float>(z);
-            const bool inMargin = x >= arena_.bounds[0] + navRadius && x <= arena_.bounds[2] - navRadius &&
-                                  y >= arena_.bounds[1] + navRadius && y <= arena_.bounds[3] - navRadius;
-            const bool standable = inMargin && !nonBridgeRoof && arena_.prismClear(x, y, z, navRadius, 9.0, 1.2);
+            const bool standable = !nonBridgeRoof && arena_.standable(x, y, z, navRadius, 9.0, 1.5);
             blocked_[c] = standable ? 0 : 1;
         }
     }
@@ -127,7 +128,7 @@ bool NavGrid::free(double x, double y) const {
 }
 
 bool NavGrid::onRoofObst(double x, double y, double z) const {
-    return z - arena_.ground(x, y) > 3.0 && blocked_[static_cast<std::size_t>(cell(x, y))] != 0;
+    return z - arena_.ground(x, y) > 3.0 && arena_.isObstRaster(x, y);
 }
 
 int NavGrid::nearestFree(int c) const {
@@ -161,6 +162,11 @@ int NavGrid::nearestFree(int c) const {
 bool NavGrid::offMain(double x, double y) const {
     const int c = nearestFree(cell(x, y));
     return c < 0 || comp_[static_cast<std::size_t>(c)] != mainComp_;
+}
+
+bool NavGrid::reachable(double x, double y) const {
+    const int c = cell(x, y);
+    return !blocked_[static_cast<std::size_t>(c)] && comp_[static_cast<std::size_t>(c)] == mainComp_;
 }
 
 bool NavGrid::isMainReachable(double x, double y) const {
@@ -225,7 +231,7 @@ NavGrid::HeapItem NavGrid::popHeap() {
 }
 
 std::pair<std::vector<int32_t>, bool> NavGrid::path(double sx, double sy, double gx, double gy,
-                                                    int maxExpand, float extraRadius) {
+                                                    int maxExpand) {
     const int s = nearestFree(cell(sx, sy));
     const int g = nearestFree(cell(gx, gy));
     if (s < 0 || g < 0) return {{}, false};
@@ -282,10 +288,8 @@ std::pair<std::vector<int32_t>, bool> NavGrid::path(double sx, double sy, double
                 step *= 1.4142f;
             }
             const float cl = clearance_[static_cast<std::size_t>(nb)];
-            if (extraRadius > 0.2f && cl <= extraRadius) {
-                step *= 8.0f;
-            } else if (cl < 4.0f + extraRadius) {
-                step *= 1.0f + (4.0f + extraRadius - cl) * 0.15f;
+            if (cl < 4.0f) {
+                step *= 1.0f + (4.0f - cl) * 0.15f;
             }
             const float ng = g_[static_cast<std::size_t>(c)] + step;
             if (stamp_[static_cast<std::size_t>(nb)] != gen || ng < g_[static_cast<std::size_t>(nb)]) {
@@ -380,7 +384,7 @@ void NavGrid::ensureMainNear() {
     }
     for (std::size_t h = 0; h < queue_.size(); ++h) {
         const int c = queue_[h];
-        if (depth[static_cast<std::size_t>(c)] >= 24) continue;
+        if (depth[static_cast<std::size_t>(c)] >= 20) continue;
         const int ci = c % nnx_, cj = c / nnx_;
         for (int k = 0; k < 8; ++k) {
             const int i = ci + kNbrs[k][0], j = cj + kNbrs[k][1];
@@ -409,7 +413,7 @@ std::optional<EscapeRoute> NavGrid::escapePlan(double x, double y) {
 
     int best = -1;
     double bestS = std::numeric_limits<double>::infinity();
-    for (std::size_t h = 0; h < queue_.size() && h < 45000; ++h) {
+    for (std::size_t h = 0; h < queue_.size() && h < 60000; ++h) {
         const int c = queue_[h];
         const int ci = c % nnx_, cj = c / nnx_;
         const int m = mainNear_[static_cast<std::size_t>(c)];
@@ -441,10 +445,10 @@ std::optional<EscapeRoute> NavGrid::escapePlan(double x, double y) {
     Vec2 land = cellPos(mainNear_[static_cast<std::size_t>(best)]);
     const double d = distanceXY(launch, land);
     if (d > 0.1) {
-        // Push landing 2m deeper into MainComp so we don't catch the building lip!
-        const Vec2 probe{land[0] + (land[0] - launch[0]) / d * 2.0,
-                         land[1] + (land[1] - launch[1]) / d * 2.0};
-        if (inBounds(probe[0], probe[1]) && free(probe[0], probe[1])) {
+        // Push landing 5m deeper into MainComp so we don't catch the building lip (matches Go 6.19)
+        const Vec2 probe{land[0] + (land[0] - launch[0]) / d * 5.0,
+                         land[1] + (land[1] - launch[1]) / d * 5.0};
+        if (inBounds(probe[0], probe[1]) && reachable(probe[0], probe[1])) {
             land = probe;
         }
     }
@@ -452,23 +456,19 @@ std::optional<EscapeRoute> NavGrid::escapePlan(double x, double y) {
 }
 
 double NavGrid::exposure(double x, double y) const {
-    const double z = surfAt(x, y) + 6.0;
-    double openSum = 0.0;
-    constexpr int kRays = 8;
-    for (int r = 0; r < kRays; ++r) {
-        const double ang = r * (2.0 * std::numbers::pi / kRays);
-        const double ux = std::cos(ang), uy = std::sin(ang);
-        double clearDist = 100.0;
-        for (const double dist : {15.0, 35.0, 60.0, 95.0}) {
-            const Vec3 end{x + ux * dist, y + uy * dist, z};
-            if (arena_.blocksPrismLine({x, y, z}, end)) {
-                clearDist = dist;
-                break;
-            }
+    const double z = arena_.walkRaster(x, y) + 7.0;
+    double total = 0.0;
+    for (int k = 0; k < 24; ++k) {
+        const double a = k * std::numbers::pi / 12.0;
+        const double c = std::cos(a), s = std::sin(a);
+        double d = 2.5;
+        for (; d < 200.0; d += 2.5) {
+            const double px = x + c * d, py = y + s * d;
+            if (!inBounds(px, py) || arena_.solidRaster(px, py, z)) break;
         }
-        openSum += clearDist / 100.0;
+        total += d;
     }
-    return openSum / kRays;
+    return total / (24.0 * 200.0);
 }
 
 }  // namespace mr

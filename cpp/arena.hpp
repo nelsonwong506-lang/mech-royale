@@ -44,11 +44,21 @@ public:
 
     std::array<double, 4> bounds;  // min X, min Y, max X, max Y
 
+    Vec2 terrainOrigin() const { return terrainOrigin_; }
+    int terrainNX() const { return terrainWidth_; }
+    int terrainNY() const { return terrainHeight_; }
+    double terrainStep() const { return terrainStep_; }
+
     double ground(double x, double y) const;
     double surface(double x, double y, double maxZ = std::numeric_limits<double>::infinity()) const;
     std::pair<double, bool> walkSurfaceInfo(double x, double y) const;
     double topSurface(double x, double y) const;
     bool isSolidPoint(double x, double y, double z) const;
+    bool solidRaster(double x, double y, double z) const;
+    bool isObstRaster(double x, double y) const;
+    double walkRaster(double x, double y) const;
+    bool standable(double x, double y, double z, double radius,
+                   double height = 9.0, double stepUp = 1.5) const;
     bool bodyClear(double x, double y, double z, double radius, double height) const;
     bool prismClear(double x, double y, double z, double radius, double height, double stepUp = 0) const;
     bool walkSegment(const Vec3& start, const Vec3& end, double radius, double height,
@@ -120,6 +130,18 @@ private:
     double surfaceAboveTerrain(double x, double y, double maxZ, double terrainZ) const;
     void loadTrees(const Json& world);
     void buildRooftopGraph();
+    void buildFlatPrismGrid();
+    void buildRaster();
+
+    struct Slab {
+        float base;
+        float top;
+    };
+
+    int rasterIndex(double x, double y) const;
+    int gridX(double x) const;
+    int gridY(double y) const;
+    const std::vector<std::size_t>* prismCell(int gx, int gy) const;
 
     Vec2 terrainOrigin_;
     int terrainWidth_, terrainHeight_;
@@ -128,6 +150,19 @@ private:
     std::vector<std::int16_t> terrain_;
     std::vector<Prism> prisms_;
     std::unordered_map<std::uint64_t, std::vector<std::size_t>> bins_;
+
+    // Flat 16m spatial grid for O(1) prism queries & raycasts
+    static constexpr double kGridStep = 16.0;
+    double gridMinX_ = 0.0, gridMinY_ = 0.0;
+    int gridNX_ = 0, gridNY_ = 0;
+    std::vector<std::vector<std::size_t>> prismGrid_;
+
+    // 1m pre-rasterized building/terrain height & overhang tables (O(1) solidRaster/isObstRaster)
+    std::vector<float> rasterTop_;
+    std::vector<float> rasterWalk_;
+    std::vector<std::uint8_t> rasterObst_;
+    std::vector<std::uint8_t> hasSlab_;
+    std::unordered_map<std::int32_t, std::vector<Slab>> slabs_;
 
     double canopyBlockDist_ = 3.96;
     std::vector<Tree> trees_;
